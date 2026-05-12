@@ -1,8 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -43,6 +45,188 @@ func TestVideoSourceKeepsDirectStreamForMp4(t *testing.T) {
 
 	if got != "/p/stream/drive-1/file-1" {
 		t.Fatalf("video source = %q, want direct stream route", got)
+	}
+}
+
+func TestVideoSourceUsesLocalUploadRoute(t *testing.T) {
+	v := &catalog.Video{
+		ID:      "video-1",
+		DriveID: localUploadDriveID,
+		FileID:  "upload-1.mp4",
+		Ext:     "mp4",
+	}
+
+	got := videoSource(v)
+
+	if got != "/p/upload/video-1" {
+		t.Fatalf("video source = %q, want local upload route", got)
+	}
+}
+
+func TestHandleUploadVideoSavesFileVideoTagsAndQueuesPreview(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	var queued *catalog.Video
+	server := &Server{
+		Catalog:  cat,
+		LocalDir: t.TempDir(),
+		OnVideoUploaded: func(v *catalog.Video) {
+			queued = v
+		},
+	}
+	req := multipartUploadRequest(t, map[string]string{
+		"title": "用户上传标题",
+		"tags":  "奶子,AV,女大",
+	}, "clip.mp4", "video-bytes")
+	rr := httptest.NewRecorder()
+
+	server.handleUploadVideo(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var dto VideoDTO
+	if err := json.NewDecoder(rr.Body).Decode(&dto); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if dto.ID == "" {
+		t.Fatal("response video id is empty")
+	}
+	got, err := cat.GetVideo(ctx, dto.ID)
+	if err != nil {
+		t.Fatalf("get uploaded video: %v", err)
+	}
+	if got.DriveID != localUploadDriveID {
+		t.Fatalf("drive id = %q, want %q", got.DriveID, localUploadDriveID)
+	}
+	if got.Title != "用户上传标题" {
+		t.Fatalf("title = %q, want submitted title", got.Title)
+	}
+	if !sameStringSet(got.Tags, []string{"奶子", "AV", "女大"}) {
+		t.Fatalf("tags = %#v, want selected tags", got.Tags)
+	}
+	if got.PreviewStatus != "pending" {
+		t.Fatalf("preview status = %q, want pending", got.PreviewStatus)
+	}
+	path := filepath.Join(server.localUploadDir(), got.FileID)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read uploaded file: %v", err)
+	}
+	if string(data) != "video-bytes" {
+		t.Fatalf("uploaded file content = %q, want original bytes", string(data))
+	}
+	if queued == nil || queued.ID != got.ID {
+		t.Fatalf("queued video = %#v, want uploaded video", queued)
+	}
+}
+
+func TestHandleUploadVideoDefaultsBlankTitleToTimestamp(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	server := &Server{Catalog: cat, LocalDir: t.TempDir()}
+	req := multipartUploadRequest(t, map[string]string{"title": "  "}, "clip.mp4", "video-bytes")
+	rr := httptest.NewRecorder()
+
+	server.handleUploadVideo(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var dto VideoDTO
+	if err := json.NewDecoder(rr.Body).Decode(&dto); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	got, err := cat.GetVideo(ctx, dto.ID)
+	if err != nil {
+		t.Fatalf("get uploaded video: %v", err)
+	}
+	if got.Title == "" || !strings.HasPrefix(got.Title, "upload-") {
+		t.Fatalf("title = %q, want upload timestamp fallback", got.Title)
+	}
+}
+
+func TestHandleUploadVideoRejectsUnsupportedTag(t *testing.T) {
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	server := &Server{Catalog: cat, LocalDir: t.TempDir()}
+	req := multipartUploadRequest(t, map[string]string{"tags": "奶子,后入"}, "clip.mp4", "video-bytes")
+	rr := httptest.NewRecorder()
+
+	server.handleUploadVideo(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandleUploadedVideoServesLocalUploadFile(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	root := t.TempDir()
+	localDir := filepath.Join(root, "previews")
+	uploadDir := filepath.Join(root, "uploads")
+	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
+		t.Fatalf("mkdir uploads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(uploadDir, "upload-1.mp4"), []byte("video-bytes"), 0o644); err != nil {
+		t.Fatalf("write upload: %v", err)
+	}
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:          "video-1",
+		DriveID:     localUploadDriveID,
+		FileID:      "upload-1.mp4",
+		Title:       "Uploaded",
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	server := &Server{Catalog: cat, LocalDir: localDir}
+	req := requestWithRouteParam(http.MethodGet, "/p/upload/video-1", "videoID", "video-1", strings.NewReader(``))
+	rr := httptest.NewRecorder()
+
+	server.handleUploadedVideo(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if rr.Body.String() != "video-bytes" {
+		t.Fatalf("body = %q, want uploaded bytes", rr.Body.String())
 	}
 }
 
@@ -367,10 +551,55 @@ func containsString(list []string, value string) bool {
 	return false
 }
 
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, value := range a {
+		seen[value]++
+	}
+	for _, value := range b {
+		if seen[value] == 0 {
+			return false
+		}
+		seen[value]--
+	}
+	return true
+}
+
 func requestWithVideoID(method, target, videoID string, body *strings.Reader) *http.Request {
+	return requestWithRouteParam(method, target, "id", videoID, body)
+}
+
+func requestWithRouteParam(method, target, key, value string, body *strings.Reader) *http.Request {
 	req := httptest.NewRequest(method, target, body)
 	rctx := chi.NewRouteContext()
-	rctx.URLParams.Add("id", videoID)
+	rctx.URLParams.Add(key, value)
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	return req
+}
+
+func multipartUploadRequest(t *testing.T, fields map[string]string, fileName, fileContent string) *http.Request {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for key, value := range fields {
+		if err := writer.WriteField(key, value); err != nil {
+			t.Fatalf("write field %s: %v", key, err)
+		}
+	}
+	part, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		t.Fatalf("create file part: %v", err)
+	}
+	if _, err := part.Write([]byte(fileContent)); err != nil {
+		t.Fatalf("write file part: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/upload", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
 	return req
 }

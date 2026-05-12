@@ -46,6 +46,24 @@ export function hideVideo(id: string): Promise<{ ok: boolean }> {
   );
 }
 
+export type UploadVideoInput = {
+  file: File;
+  title: string;
+  tags: string[];
+};
+
+export function uploadVideo(input: UploadVideoInput): Promise<VideoItem> {
+  const body = new FormData();
+  body.append("file", input.file);
+  if (input.title.trim()) {
+    body.append("title", input.title.trim());
+  }
+  for (const tag of input.tags) {
+    body.append("tags", tag);
+  }
+  return apiForm<VideoItem>("/api/upload", body);
+}
+
 export type TagItem = { id: string; label: string; count?: number };
 
 export function fetchTags(): Promise<TagItem[]> {
@@ -63,6 +81,16 @@ async function apiJSON<T>(path: string, init: RequestInit): Promise<T> {
     credentials: "include",
     headers: { "Content-Type": "application/json" },
     ...init,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function apiForm<T>(path: string, body: FormData): Promise<T> {
+  const res = await fetch(path, {
+    method: "POST",
+    credentials: "include",
+    body,
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();

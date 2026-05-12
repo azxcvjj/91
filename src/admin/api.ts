@@ -99,6 +99,13 @@ export function rescan(id: string) {
   );
 }
 
+export function regenFailedPreviews(id: string) {
+  return request<{ ok: boolean }>(
+    `/drives/${encodeURIComponent(id)}/previews/failed/regenerate`,
+    { method: "POST" }
+  );
+}
+
 // ---------- Videos ----------
 
 export type AdminVideo = {

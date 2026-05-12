@@ -115,7 +115,6 @@ func (d *Driver) List(ctx context.Context, dirID string) ([]drives.Entry, error)
 			if first {
 				req.SetQueryParams(map[string]string{
 					"$top":    "1000",
-					"$expand": "thumbnails($select=medium)",
 					"$select": "id,name,size,fileSystemInfo,content.downloadUrl,file,parentReference,folder",
 				})
 			}
@@ -404,19 +403,14 @@ func itemToEntry(item graphItem, fallbackParentID string) drives.Entry {
 	if mimeType == "" && !isDir {
 		mimeType = guessMime(item.Name)
 	}
-	thumb := ""
-	if len(item.Thumbnails) > 0 {
-		thumb = item.Thumbnails[0].Medium.URL
-	}
 	return drives.Entry{
-		ID:           item.ID,
-		Name:         item.Name,
-		Size:         item.Size,
-		IsDir:        isDir,
-		ParentID:     parentID,
-		MimeType:     mimeType,
-		ModTime:      mod,
-		ThumbnailURL: thumb,
+		ID:       item.ID,
+		Name:     item.Name,
+		Size:     item.Size,
+		IsDir:    isDir,
+		ParentID: parentID,
+		MimeType: mimeType,
+		ModTime:  mod,
 	}
 }
 

@@ -42,6 +42,9 @@ func (c *Catalog) migrate(ctx context.Context) error {
 	if err := c.addColumnIfMissing(ctx, "videos", "content_hash", "TEXT DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := c.addColumnIfMissing(ctx, "videos", "file_name", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
 	if err := c.addColumnIfMissing(ctx, "videos", "hidden", "INTEGER DEFAULT 0"); err != nil {
 		return err
 	}
@@ -49,6 +52,9 @@ func (c *Catalog) migrate(ctx context.Context) error {
 		return err
 	}
 	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_hidden ON videos(hidden)`); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_file_name_size ON videos(file_name, size_bytes)`); err != nil {
 		return err
 	}
 	if err := c.seedSystemTags(ctx); err != nil {
@@ -61,6 +67,12 @@ func (c *Catalog) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := c.createCollectionTagsFromCategories(ctx); err != nil {
+		return err
+	}
+	if err := c.clearVolatileOneDriveThumbnails(ctx); err != nil {
+		return err
+	}
+	if err := c.hideZeroSizeVideosFromKnownDrives(ctx); err != nil {
 		return err
 	}
 	return nil
@@ -86,6 +98,32 @@ func (c *Catalog) addColumnIfMissing(ctx context.Context, table, column, definit
 		}
 	}
 	_, err = c.db.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+column+` `+definition)
+	return err
+}
+
+func (c *Catalog) clearVolatileOneDriveThumbnails(ctx context.Context) error {
+	_, err := c.db.ExecContext(ctx, `
+UPDATE videos
+   SET thumbnail_url = '',
+       updated_at = ?
+ WHERE lower(COALESCE(thumbnail_url, '')) LIKE 'https://%mediap.svc.ms/transform/thumbnail%'
+`, time.Now().UnixMilli())
+	return err
+}
+
+func (c *Catalog) hideZeroSizeVideosFromKnownDrives(ctx context.Context) error {
+	_, err := c.db.ExecContext(ctx, `
+UPDATE videos
+   SET hidden = 1,
+       updated_at = ?
+ WHERE COALESCE(size_bytes, 0) <= 0
+   AND COALESCE(hidden, 0) = 0
+   AND EXISTS (
+	 SELECT 1
+	   FROM drives
+	  WHERE drives.id = videos.drive_id
+   )
+`, time.Now().UnixMilli())
 	return err
 }
 

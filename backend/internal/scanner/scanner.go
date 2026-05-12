@@ -85,6 +85,9 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, depth int, st
 		if !s.Exts[ext] {
 			continue
 		}
+		if e.Size <= 0 {
+			continue
+		}
 
 		id := s.Drive.Kind() + "-" + s.Drive.ID() + "-" + e.ID
 		parsed := Parse(e.Name)
@@ -101,24 +104,28 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, depth int, st
 
 		existing, _ := s.Catalog.GetVideo(ctx, id)
 		if existing != nil {
+			patch := catalog.VideoMetaPatch{}
 			if e.Hash != "" && existing.ContentHash == "" {
-				_ = s.Catalog.UpdateVideoMeta(ctx, id, catalog.VideoMetaPatch{ContentHash: e.Hash})
+				patch.ContentHash = e.Hash
 				existing.ContentHash = e.Hash
 			}
-			if dup := s.findDuplicateByHash(ctx, e.Hash, id); dup != nil {
-				s.backfillDuplicateThumbnail(ctx, dup, e.ThumbnailURL)
-				continue
+			if e.Name != "" && existing.FileName == "" {
+				patch.FileName = e.Name
+				existing.FileName = e.Name
 			}
 			// 已存在但轻量元数据空缺时，顺便补齐。
-			patch := catalog.VideoMetaPatch{}
 			if existing.Category == "" && dirName != "" {
 				patch.Category = dirName
 			}
 			if existing.ThumbnailURL == "" && e.ThumbnailURL != "" {
 				patch.ThumbnailURL = e.ThumbnailURL
 			}
-			if patch.Category != "" || patch.ThumbnailURL != "" {
+			if patch.Category != "" || patch.ThumbnailURL != "" || patch.ContentHash != "" || patch.FileName != "" {
 				_ = s.Catalog.UpdateVideoMeta(ctx, id, patch)
+			}
+			if dup := s.findDuplicate(ctx, e.Hash, e.Name, e.Size, id); dup != nil {
+				s.backfillDuplicateThumbnail(ctx, dup, e.ThumbnailURL)
+				continue
 			}
 			if !sameTags(existing.Tags, tags) {
 				_ = s.Catalog.SetAutoVideoTags(ctx, id, tags)
@@ -126,7 +133,7 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, depth int, st
 			continue
 		}
 
-		if dup := s.findDuplicateByHash(ctx, e.Hash, id); dup != nil {
+		if dup := s.findDuplicate(ctx, e.Hash, e.Name, e.Size, id); dup != nil {
 			s.backfillDuplicateThumbnail(ctx, dup, e.ThumbnailURL)
 			continue
 		}
@@ -136,6 +143,7 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, depth int, st
 			ID:            id,
 			DriveID:       s.Drive.ID(),
 			FileID:        e.ID,
+			FileName:      e.Name,
 			ContentHash:   e.Hash,
 			ParentID:      e.ParentID,
 			Title:         parsed.Title,
@@ -163,11 +171,29 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, depth int, st
 	return nil
 }
 
+func (s *Scanner) findDuplicate(ctx context.Context, hash, fileName string, size int64, currentID string) *catalog.Video {
+	if dup := s.findDuplicateByHash(ctx, hash, currentID); dup != nil {
+		return dup
+	}
+	return s.findDuplicateByFileSignature(ctx, fileName, size, currentID)
+}
+
 func (s *Scanner) findDuplicateByHash(ctx context.Context, hash, currentID string) *catalog.Video {
 	if hash == "" {
 		return nil
 	}
 	dup, err := s.Catalog.FindVideoByContentHash(ctx, hash)
+	if err != nil || dup == nil || dup.ID == currentID {
+		return nil
+	}
+	return dup
+}
+
+func (s *Scanner) findDuplicateByFileSignature(ctx context.Context, fileName string, size int64, currentID string) *catalog.Video {
+	if fileName == "" || size <= 0 {
+		return nil
+	}
+	dup, err := s.Catalog.FindVideoByFileSignature(ctx, fileName, size)
 	if err != nil || dup == nil || dup.ID == currentID {
 		return nil
 	}

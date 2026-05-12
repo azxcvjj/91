@@ -16,11 +16,12 @@ type AdminServer struct {
 	Catalog *catalog.Catalog
 	Auth    *auth.Authenticator
 	// Hooks：外层注入实际执行者
-	OnDriveSaved       func(driveID string) error
-	OnDriveRemoved     func(driveID string)
-	OnScanRequested    func(driveID string)
-	OnRegenPreview     func(videoID string)
-	OnRegenAllPreviews func()
+	OnDriveSaved          func(driveID string) error
+	OnDriveRemoved        func(driveID string)
+	OnScanRequested       func(driveID string)
+	OnRegenPreview        func(videoID string)
+	OnRegenAllPreviews    func()
+	OnRegenFailedPreviews func(driveID string)
 	// Preview 开关读写
 	GetPreviewEnabled func() bool
 	SetPreviewEnabled func(enabled bool) error
@@ -42,6 +43,7 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Post("/drives", a.handleUpsertDrive)
 			r.Delete("/drives/{id}", a.handleDeleteDrive)
 			r.Post("/drives/{id}/rescan", a.handleRescan)
+			r.Post("/drives/{id}/previews/failed/regenerate", a.handleRegenFailedPreviews)
 
 			// 视频
 			r.Get("/videos", a.handleAdminListVideos)
@@ -341,6 +343,14 @@ func (a *AdminServer) handleRegenPreview(w http.ResponseWriter, r *http.Request)
 func (a *AdminServer) handleRegenAllPreviews(w http.ResponseWriter, r *http.Request) {
 	if a.OnRegenAllPreviews != nil {
 		a.OnRegenAllPreviews()
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
+}
+
+func (a *AdminServer) handleRegenFailedPreviews(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if a.OnRegenFailedPreviews != nil {
+		a.OnRegenFailedPreviews(id)
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
 }

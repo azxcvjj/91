@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS videos (
     id               TEXT PRIMARY KEY,          -- <drive>-<fileID> 拼接的稳定 ID
     drive_id         TEXT NOT NULL,
     file_id          TEXT NOT NULL,
+    file_name        TEXT DEFAULT '',           -- 网盘侧原始文件名，用于同名同大小去重
     content_hash     TEXT DEFAULT '',
     parent_id        TEXT,
     title            TEXT NOT NULL,

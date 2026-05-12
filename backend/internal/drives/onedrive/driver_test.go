@@ -154,7 +154,7 @@ func TestListFollowsPaginationAndMapsEntries(t *testing.T) {
 	if !got[0].IsDir || got[0].ID != "folder-id" || got[0].ParentID != "root" {
 		t.Fatalf("folder entry = %#v", got[0])
 	}
-	if got[1].IsDir || got[1].MimeType != "video/mp4" || got[1].ThumbnailURL != "https://thumb.example/demo.jpg" {
+	if got[1].IsDir || got[1].MimeType != "video/mp4" || got[1].ThumbnailURL != "" {
 		t.Fatalf("file entry = %#v", got[1])
 	}
 	if got[1].ModTime.IsZero() {

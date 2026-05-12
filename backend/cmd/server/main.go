@@ -21,6 +21,7 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/drives/localupload"
 	"github.com/video-site/backend/internal/drives/onedrive"
 	"github.com/video-site/backend/internal/drives/p115"
 	"github.com/video-site/backend/internal/drives/pikpak"
@@ -68,6 +69,9 @@ func main() {
 	defer cancel()
 
 	app.loadPreviewEnabled(ctx)
+	if err := app.attachLocalUpload(ctx); err != nil {
+		log.Printf("[local-upload] attach failed: %v", err)
+	}
 
 	existing, err := cat.ListDrives(ctx)
 	if err != nil {
@@ -89,7 +93,11 @@ func main() {
 		Catalog:    cat,
 		Proxy:      app.proxy,
 		LocalDir:   cfg.Storage.LocalPreviewDir,
+		UploadDir:  app.localUploadDir(),
 		FFmpegPath: cfg.Preview.FFmpegPath,
+		OnVideoUploaded: func(v *catalog.Video) {
+			app.enqueueUploadedVideo(ctx, v)
+		},
 	}
 
 	adminServer := &api.AdminServer{
@@ -113,6 +121,9 @@ func main() {
 		},
 		OnRegenAllPreviews: func() {
 			go app.regenAllPreviews(ctx)
+		},
+		OnRegenFailedPreviews: func(driveID string) {
+			go app.regenFailedPreviews(ctx, driveID)
 		},
 		GetPreviewEnabled: func() bool { return app.PreviewEnabled() },
 		SetPreviewEnabled: func(enabled bool) error {
@@ -335,6 +346,37 @@ func (a *App) attachDrive(ctx context.Context, d *catalog.Drive) error {
 	return nil
 }
 
+func (a *App) attachLocalUpload(ctx context.Context) error {
+	drv := localupload.New(a.localUploadDir())
+	if err := drv.Init(ctx); err != nil {
+		return err
+	}
+	a.registry.Set(drv.ID(), drv)
+
+	gen := preview.New(preview.Config{
+		FFmpegPath:      a.cfg.Preview.FFmpegPath,
+		FFprobePath:     a.cfg.Preview.FFprobePath,
+		DurationSeconds: a.cfg.Preview.DurationSeconds,
+		Width:           a.cfg.Preview.Width,
+		Segments:        a.cfg.Preview.Segments,
+		LocalDir:        a.cfg.Storage.LocalPreviewDir,
+		RemoteDir:       "",
+	})
+	worker := preview.NewWorker(gen, a.cat, drv, "")
+	thumbWorker := preview.NewThumbWorker(gen, a.cat, drv)
+
+	workerCtx, cancel := context.WithCancel(ctx)
+	go worker.Run(workerCtx)
+	go thumbWorker.Run(workerCtx)
+
+	a.registerPreviewWorkers(ctx, drv.ID(), worker, thumbWorker, cancel)
+	return nil
+}
+
+func (a *App) localUploadDir() string {
+	return filepath.Join(filepath.Dir(a.cfg.Storage.LocalPreviewDir), "uploads")
+}
+
 func (a *App) registerPreviewWorkers(ctx context.Context, driveID string, worker *preview.Worker, thumbWorker *preview.ThumbWorker, cancel context.CancelFunc) {
 	a.mu.Lock()
 	if a.cancels == nil {
@@ -472,6 +514,24 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 	}
 }
 
+func (a *App) enqueueUploadedVideo(ctx context.Context, v *catalog.Video) {
+	if v == nil {
+		return
+	}
+	a.mu.Lock()
+	worker := a.workers[v.DriveID]
+	thumbWorker := a.thumbWorkers[v.DriveID]
+	previewEnabled := a.previewEnabled
+	a.mu.Unlock()
+
+	if thumbWorker != nil && v.ThumbnailURL == "" {
+		thumbWorker.Enqueue(v)
+	}
+	if previewEnabled && worker != nil {
+		worker.Enqueue(v)
+	}
+}
+
 func (a *App) regenPreview(ctx context.Context, videoID string) {
 	v, err := a.cat.GetVideo(ctx, videoID)
 	if err != nil {
@@ -513,29 +573,101 @@ func (a *App) regenAllPreviews(ctx context.Context) {
 	log.Printf("[preview] enqueued all visible videos for regen queued=%d", queued)
 }
 
-func (a *App) scanLoop(ctx context.Context) {
-	// 启动后立刻扫一次
-	a.scanAllOnce(ctx)
+func (a *App) regenFailedPreviews(ctx context.Context, driveID string) {
+	items, err := a.cat.ListVideosByPreviewStatus(ctx, driveID, "failed", 0)
+	if err != nil {
+		log.Printf("[preview] list failed videos for regen drive=%s: %v", driveID, err)
+		return
+	}
+	a.mu.Lock()
+	worker := a.workers[driveID]
+	a.mu.Unlock()
+	if worker == nil {
+		log.Printf("[preview] regen failed drive=%s skipped: worker not found", driveID)
+		return
+	}
+	log.Printf("[preview] enqueue failed videos for regen drive=%s count=%d", driveID, len(items))
+	queued := 0
+	for _, v := range items {
+		if err := ctx.Err(); err != nil {
+			log.Printf("[preview] enqueue failed canceled drive=%s queued=%d: %v", driveID, queued, err)
+			return
+		}
+		if err := a.cat.UpdatePreview(ctx, v.ID, "", "", "pending"); err != nil {
+			log.Printf("[preview] reset failed video %s drive=%s: %v", v.ID, driveID, err)
+			continue
+		}
+		v.PreviewFileID = ""
+		v.PreviewLocal = ""
+		v.PreviewStatus = "pending"
+		if !worker.EnqueueBlocking(ctx, v) {
+			log.Printf("[preview] enqueue failed canceled drive=%s queued=%d", driveID, queued)
+			return
+		}
+		queued++
+	}
+	log.Printf("[preview] enqueued failed videos for regen drive=%s queued=%d", driveID, queued)
+}
 
+func (a *App) scanLoop(ctx context.Context) {
 	if a.cfg.Scanner.IntervalSeconds <= 0 {
 		return
 	}
-	ticker := time.NewTicker(time.Duration(a.cfg.Scanner.IntervalSeconds) * time.Second)
+	interval := time.Duration(a.cfg.Scanner.IntervalSeconds) * time.Second
+	var lastScheduledScan time.Time
+	if a.scanAllOnceIfDue(ctx, time.Now(), lastScheduledScan, interval) {
+		lastScheduledScan = time.Now()
+	}
+
+	checkEvery := interval
+	if checkEvery > time.Minute {
+		checkEvery = time.Minute
+	}
+	ticker := time.NewTicker(checkEvery)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			a.scanAllOnce(ctx)
+		case now := <-ticker.C:
+			if a.scanAllOnceIfDue(ctx, now, lastScheduledScan, interval) {
+				lastScheduledScan = now
+			}
 		}
 	}
 }
 
+func (a *App) scanAllOnceIfDue(ctx context.Context, now, lastScheduledScan time.Time, interval time.Duration) bool {
+	if !scheduledScanDue(now, lastScheduledScan, interval) {
+		return false
+	}
+	a.scanAllOnce(ctx)
+	return true
+}
+
+func scheduledScanDue(now, lastScheduledScan time.Time, interval time.Duration) bool {
+	if interval <= 0 || !scheduledScanAllowed(now) {
+		return false
+	}
+	return lastScheduledScan.IsZero() || now.Sub(lastScheduledScan) >= interval
+}
+
+func scheduledScanAllowed(now time.Time) bool {
+	hour := now.Hour()
+	return hour >= 2 && hour < 7
+}
+
 func (a *App) scanAllOnce(ctx context.Context) {
 	for _, d := range a.registry.All() {
+		if !shouldScanDrive(d) {
+			continue
+		}
 		a.runScan(ctx, d.ID())
 	}
+}
+
+func shouldScanDrive(d drives.Drive) bool {
+	return d != nil && d.ID() != localupload.DriveID
 }
 
 // ---------- middleware ----------

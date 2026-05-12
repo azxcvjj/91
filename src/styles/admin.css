@@ -266,6 +266,13 @@
   color: var(--color-danger);
 }
 
+.admin-teaser-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 150px;
+}
+
 .admin-table {
   width: 100%;
   border-collapse: collapse;

@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+
 	"github.com/video-site/backend/internal/catalog"
 )
 
@@ -372,5 +374,28 @@ func TestHandleRegenAllPreviewsInvokesHook(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("regen all previews hook was not called")
+	}
+}
+
+func TestHandleRegenFailedPreviewsInvokesHookWithDriveID(t *testing.T) {
+	calledWith := ""
+	server := &AdminServer{
+		OnRegenFailedPreviews: func(driveID string) {
+			calledWith = driveID
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives/PikPak/previews/failed/regenerate", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "PikPak")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+	server.handleRegenFailedPreviews(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if calledWith != "PikPak" {
+		t.Fatalf("hook called with %q, want PikPak", calledWith)
 	}
 }

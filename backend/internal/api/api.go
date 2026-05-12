@@ -2,10 +2,13 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -14,19 +17,42 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/video-site/backend/internal/auth"
 	"github.com/video-site/backend/internal/catalog"
+	"github.com/video-site/backend/internal/drives/localupload"
 	"github.com/video-site/backend/internal/proxy"
 )
 
+const localUploadDriveID = localupload.DriveID
+
+var allowedUploadExtensions = map[string]struct{}{
+	".avi":  {},
+	".mkv":  {},
+	".mov":  {},
+	".mp4":  {},
+	".webm": {},
+}
+
+var allowedUploadTags = map[string]struct{}{
+	"奶子": {},
+	"臀":  {},
+	"口角": {},
+	"女大": {},
+	"人妻": {},
+	"AV": {},
+}
+
 type Server struct {
-	Catalog    *catalog.Catalog
-	Proxy      *proxy.Proxy
-	LocalDir   string
-	FFmpegPath string
+	Catalog         *catalog.Catalog
+	Proxy           *proxy.Proxy
+	LocalDir        string
+	UploadDir       string
+	FFmpegPath      string
+	OnVideoUploaded func(*catalog.Video)
 
 	transcodeMu   sync.Mutex
 	transcodeJobs map[string]bool
@@ -93,10 +119,12 @@ func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
 		r.Put("/api/video/{id}/tags", s.handleUpdateVideoTags)
 		r.Post("/api/video/{id}/like", s.handleLike)
 		r.Post("/api/video/{id}/hide", s.handleHideVideo)
+		r.Post("/api/upload", s.handleUploadVideo)
 		r.Get("/api/tags", s.handleTags)
 
 		// 代理路由同样需要鉴权，防止绕过
 		r.Get("/p/stream/{driveID}/{fileID}", s.handleStream)
+		r.Get("/p/upload/{videoID}", s.handleUploadedVideo)
 		r.Get("/p/transcode/{videoID}/status", s.handleTranscodeStatus)
 		r.Post("/p/transcode/{videoID}/start", s.handleTranscodeStart)
 		r.Get("/p/transcode/{videoID}", s.handleTranscode)
@@ -249,10 +277,135 @@ func (s *Server) handleHideVideo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+func (s *Server) handleUploadVideo(w http.ResponseWriter, r *http.Request) {
+	if s.LocalDir == "" {
+		writeErr(w, http.StatusInternalServerError, errors.New("local storage is not configured"))
+		return
+	}
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, errors.New("video file is required"))
+		return
+	}
+	defer file.Close()
+
+	originalName := filepath.Base(strings.TrimSpace(header.Filename))
+	ext := strings.ToLower(filepath.Ext(originalName))
+	if _, ok := allowedUploadExtensions[ext]; !ok {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("unsupported video extension: %s", ext))
+		return
+	}
+
+	tags, err := parseUploadTags(uploadTagValues(r))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	now := time.Now()
+	title := strings.TrimSpace(r.FormValue("title"))
+	if title == "" {
+		title = "upload-" + now.Format("20060102150405")
+	}
+
+	uploadID, err := newUploadID(now)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	storedName := uploadID + ext
+	dst, err := s.localUploadFilePath(storedName)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	size, copyErr := io.Copy(out, file)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(dst)
+		writeErr(w, http.StatusInternalServerError, copyErr)
+		return
+	}
+	if closeErr != nil {
+		_ = os.Remove(dst)
+		writeErr(w, http.StatusInternalServerError, closeErr)
+		return
+	}
+	if size <= 0 {
+		_ = os.Remove(dst)
+		writeErr(w, http.StatusBadRequest, errors.New("uploaded video is empty"))
+		return
+	}
+
+	video := &catalog.Video{
+		ID:            localUploadDriveID + "-" + uploadID,
+		DriveID:       localUploadDriveID,
+		FileID:        storedName,
+		FileName:      originalName,
+		Title:         title,
+		Author:        "用户上传",
+		Tags:          tags,
+		Size:          size,
+		Ext:           strings.TrimPrefix(ext, "."),
+		PreviewStatus: "pending",
+		PublishedAt:   now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	if err := s.Catalog.UpsertVideo(r.Context(), video); err != nil {
+		_ = os.Remove(dst)
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if s.OnVideoUploaded != nil {
+		s.OnVideoUploaded(video)
+	}
+	writeJSON(w, http.StatusCreated, mapVideo(video))
+}
+
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	driveID := chi.URLParam(r, "driveID")
 	fileID := chi.URLParam(r, "fileID")
 	s.Proxy.ServeStream(w, r, driveID, fileID)
+}
+
+func (s *Server) handleUploadedVideo(w http.ResponseWriter, r *http.Request) {
+	videoID := chi.URLParam(r, "videoID")
+	v, err := s.Catalog.GetVideo(r.Context(), videoID)
+	if err != nil || v.Hidden || v.DriveID != localUploadDriveID {
+		http.NotFound(w, r)
+		return
+	}
+	path, err := s.localUploadFilePath(v.FileID)
+	if err != nil {
+		http.Error(w, "invalid upload file", http.StatusForbidden)
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Size() == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	http.ServeFile(w, r, path)
 }
 
 func (s *Server) handleTranscode(w http.ResponseWriter, r *http.Request) {
@@ -465,6 +618,12 @@ func thumbnailURL(v *catalog.Video) string {
 }
 
 func videoSource(v *catalog.Video) string {
+	if v.DriveID == localUploadDriveID {
+		if needsBrowserTranscode(v.Ext) {
+			return "/p/transcode/" + v.ID
+		}
+		return "/p/upload/" + v.ID
+	}
 	if needsBrowserTranscode(v.Ext) {
 		return "/p/transcode/" + v.ID
 	}
@@ -544,6 +703,92 @@ func (s *Server) transcodePath(videoID string) string {
 
 func (s *Server) transcodeTempPath(videoID string) string {
 	return filepath.Join(s.LocalDir, "transcodes", videoID+".tmp.mp4")
+}
+
+func (s *Server) localUploadFilePath(fileID string) (string, error) {
+	if strings.TrimSpace(fileID) == "" || filepath.Base(fileID) != fileID {
+		return "", errors.New("invalid upload file id")
+	}
+	root := s.localUploadDir()
+	if root == "" {
+		return "", errors.New("local upload storage is not configured")
+	}
+	path := filepath.Join(root, fileID)
+	cleanRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	cleanPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if cleanPath != cleanRoot && !strings.HasPrefix(cleanPath, cleanRoot+string(os.PathSeparator)) {
+		return "", errors.New("invalid upload file id")
+	}
+	return cleanPath, nil
+}
+
+func (s *Server) localUploadDir() string {
+	if s.UploadDir != "" {
+		return s.UploadDir
+	}
+	if s.LocalDir == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(s.LocalDir), "uploads")
+}
+
+func uploadTagValues(r *http.Request) []string {
+	if r.MultipartForm == nil {
+		return nil
+	}
+	values := append([]string{}, r.MultipartForm.Value["tags"]...)
+	values = append(values, r.MultipartForm.Value["tag"]...)
+	return values
+}
+
+func parseUploadTags(values []string) ([]string, error) {
+	seen := make(map[string]struct{})
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		for _, label := range splitUploadTags(value) {
+			if _, ok := allowedUploadTags[label]; !ok {
+				return nil, fmt.Errorf("unsupported upload tag: %s", label)
+			}
+			if _, ok := seen[label]; ok {
+				continue
+			}
+			seen[label] = struct{}{}
+			out = append(out, label)
+		}
+	}
+	return out, nil
+}
+
+func splitUploadTags(value string) []string {
+	fields := strings.FieldsFunc(value, func(r rune) bool {
+		switch r {
+		case ',', '，', ';', '；', '\n', '\r', '\t', ' ':
+			return true
+		default:
+			return false
+		}
+	})
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		if label := strings.TrimSpace(field); label != "" {
+			out = append(out, label)
+		}
+	}
+	return out
+}
+
+func newUploadID(now time.Time) (string, error) {
+	var suffix [6]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("upload-%d-%s", now.UnixNano(), hex.EncodeToString(suffix[:])), nil
 }
 
 func mapVideos(vs []*catalog.Video) []VideoDTO {

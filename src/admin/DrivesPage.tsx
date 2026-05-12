@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Plus, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
 import * as api from "./api";
 import { useToast } from "./ToastContext";
 import { Modal } from "./Modal";
@@ -38,6 +38,7 @@ export function DrivesPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [form, setForm] = useState<FormState>(emptyForm);
   const [saving, setSaving] = useState(false);
+  const [regenFailedId, setRegenFailedId] = useState("");
   const { show } = useToast();
 
   async function refresh() {
@@ -123,6 +124,19 @@ export function DrivesPage() {
     }
   }
 
+  async function handleRegenFailed(d: api.AdminDrive) {
+    setRegenFailedId(d.id);
+    try {
+      await api.regenFailedPreviews(d.id);
+      show("已触发失败 teaser 重新生成", "success");
+      refresh();
+    } catch (e) {
+      show(e instanceof Error ? e.message : "触发失败", "error");
+    } finally {
+      setRegenFailedId("");
+    }
+  }
+
   return (
     <section>
       <header className="admin-page__header">
@@ -147,6 +161,7 @@ export function DrivesPage() {
               <th>ID</th>
               <th>状态</th>
               <th>扫描根</th>
+              <th>Teaser</th>
               <th className="is-actions">操作</th>
             </tr>
           </thead>
@@ -162,9 +177,20 @@ export function DrivesPage() {
                 <td style={{ fontFamily: "ui-monospace", fontSize: 12 }}>
                   {d.scanRootId || d.rootId}
                 </td>
+                <td>
+                  <TeaserCounts drive={d} />
+                </td>
                 <td className="is-actions">
                   <button className="admin-btn" onClick={() => handleRescan(d)}>
                     <RefreshCw size={13} /> 重扫
+                  </button>{" "}
+                  <button
+                    className="admin-btn"
+                    disabled={(d.teaserFailedCount ?? 0) <= 0 || regenFailedId === d.id}
+                    onClick={() => handleRegenFailed(d)}
+                  >
+                    <RotateCcw size={13} />
+                    {regenFailedId === d.id ? "触发中..." : "重新生成失败 teaser"}
                   </button>{" "}
                   <button className="admin-btn" onClick={() => openEdit(d)}>
                     编辑
@@ -201,6 +227,22 @@ export function DrivesPage() {
         <DriveForm form={form} onChange={setForm} isEdit={!!list.find((x) => x.id === form.id)} />
       </Modal>
     </section>
+  );
+}
+
+function TeaserCounts({ drive }: { drive: api.AdminDrive }) {
+  return (
+    <div className="admin-teaser-counts">
+      <span className="admin-drive-teaser__metric is-ready">
+        就绪 {drive.teaserReadyCount ?? 0}
+      </span>
+      <span className="admin-drive-teaser__metric is-pending">
+        待生成 {drive.teaserPendingCount ?? 0}
+      </span>
+      <span className="admin-drive-teaser__metric is-failed">
+        失败 {drive.teaserFailedCount ?? 0}
+      </span>
+    </div>
   );
 }
 

@@ -44,6 +44,7 @@ type Video struct {
 	ID              string    `json:"id"`
 	DriveID         string    `json:"driveId"`
 	FileID          string    `json:"fileId"`
+	FileName        string    `json:"fileName"`
 	ContentHash     string    `json:"contentHash"`
 	ParentID        string    `json:"parentId"`
 	Title           string    `json:"title"`
@@ -84,19 +85,23 @@ func (c *Catalog) UpsertVideo(ctx context.Context, v *Video) error {
 
 	_, err := c.db.ExecContext(ctx, `
 INSERT INTO videos (
-  id, drive_id, file_id, content_hash, parent_id, title, author, tags,
+  id, drive_id, file_id, file_name, content_hash, parent_id, title, author, tags,
   duration_seconds, size_bytes, ext, quality, thumbnail_url,
   preview_file_id, preview_local, preview_status,
   views, favorites, comments, likes, dislikes,
   category, hidden, badges, description, published_at, created_at, updated_at
 ) VALUES (
-  ?, ?, ?, ?, ?, ?, ?, ?,
+  ?, ?, ?, ?, ?, ?, ?, ?, ?,
   ?, ?, ?, ?, ?,
   ?, ?, ?,
   ?, ?, ?, ?, ?,
   ?, ?, ?, ?, ?, ?, ?
 )
 ON CONFLICT(id) DO UPDATE SET
+  file_name       = CASE
+                      WHEN excluded.file_name != '' THEN excluded.file_name
+                      ELSE videos.file_name
+                    END,
   title           = excluded.title,
   author          = excluded.author,
   tags            = excluded.tags,
@@ -114,7 +119,7 @@ ON CONFLICT(id) DO UPDATE SET
   description     = excluded.description,
   updated_at      = excluded.updated_at
 `,
-		v.ID, v.DriveID, v.FileID, v.ContentHash, v.ParentID, v.Title, v.Author, string(tagsJSON),
+		v.ID, v.DriveID, v.FileID, v.FileName, v.ContentHash, v.ParentID, v.Title, v.Author, string(tagsJSON),
 		v.DurationSeconds, v.Size, v.Ext, v.Quality, v.ThumbnailURL,
 		v.PreviewFileID, v.PreviewLocal, nullableStatus(v.PreviewStatus),
 		v.Views, v.Favorites, v.Comments, v.Likes, v.Dislikes,
@@ -185,6 +190,7 @@ type VideoMetaPatch struct {
 	DurationSeconds int
 	Category        string
 	ContentHash     string
+	FileName        string
 	Tags            []string
 	TagsSet         bool
 }
@@ -207,6 +213,10 @@ func (c *Catalog) UpdateVideoMeta(ctx context.Context, id string, p VideoMetaPat
 	if p.ContentHash != "" {
 		parts = append(parts, "content_hash = ?")
 		args = append(args, normalizeContentHash(p.ContentHash))
+	}
+	if p.FileName != "" {
+		parts = append(parts, "file_name = ?")
+		args = append(args, p.FileName)
 	}
 	if p.TagsSet {
 		tagsJSON, _ := json.Marshal(p.Tags)
@@ -355,6 +365,19 @@ func (c *Catalog) FindVideoByContentHash(ctx context.Context, hash string) (*Vid
 		 WHERE content_hash = ?
 		 ORDER BY created_at ASC, id ASC
 		 LIMIT 1`, hash)
+	return scanVideo(row)
+}
+
+func (c *Catalog) FindVideoByFileSignature(ctx context.Context, fileName string, size int64) (*Video, error) {
+	if fileName == "" || size <= 0 {
+		return nil, sql.ErrNoRows
+	}
+	row := c.db.QueryRowContext(ctx,
+		`SELECT `+allVideoCols+`
+		 FROM videos
+		 WHERE file_name = ? AND size_bytes = ?
+		 ORDER BY created_at ASC, id ASC
+		 LIMIT 1`, fileName, size)
 	return scanVideo(row)
 }
 
@@ -612,7 +635,7 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.upd
 // ---------- helpers ----------
 
 const allVideoCols = `
-id, drive_id, file_id, COALESCE(content_hash, ''), COALESCE(parent_id, ''), title, COALESCE(author, ''), COALESCE(tags, '[]'),
+id, drive_id, file_id, COALESCE(file_name, ''), COALESCE(content_hash, ''), COALESCE(parent_id, ''), title, COALESCE(author, ''), COALESCE(tags, '[]'),
 duration_seconds, size_bytes, COALESCE(ext, ''), COALESCE(quality, ''), COALESCE(thumbnail_url, ''),
 COALESCE(preview_file_id, ''), COALESCE(preview_local, ''), COALESCE(preview_status, 'pending'),
 views, favorites, comments, likes, dislikes,
@@ -620,17 +643,31 @@ COALESCE(category, ''), COALESCE(hidden, 0), COALESCE(badges, '[]'), COALESCE(de
 published_at, created_at, updated_at
 `
 
-const uniqueVideoWhereSQL = `(COALESCE(videos.content_hash, '') = ''
-	OR NOT EXISTS (
-		SELECT 1
-		FROM videos AS dup
-		WHERE dup.content_hash = videos.content_hash
-		  AND COALESCE(dup.content_hash, '') != ''
-		  AND (
-			dup.created_at < videos.created_at
-			OR (dup.created_at = videos.created_at AND dup.id < videos.id)
-		  )
-	))`
+const uniqueVideoWhereSQL = `((COALESCE(videos.content_hash, '') = ''
+		OR NOT EXISTS (
+			SELECT 1
+			FROM videos AS dup
+			WHERE dup.content_hash = videos.content_hash
+			  AND COALESCE(dup.content_hash, '') != ''
+			  AND (
+				dup.created_at < videos.created_at
+				OR (dup.created_at = videos.created_at AND dup.id < videos.id)
+			  )
+		))
+	AND (COALESCE(videos.file_name, '') = ''
+		OR videos.size_bytes <= 0
+		OR NOT EXISTS (
+			SELECT 1
+			FROM videos AS dup
+			WHERE dup.file_name = videos.file_name
+			  AND dup.size_bytes = videos.size_bytes
+			  AND COALESCE(dup.file_name, '') != ''
+			  AND dup.size_bytes > 0
+			  AND (
+				dup.created_at < videos.created_at
+				OR (dup.created_at = videos.created_at AND dup.id < videos.id)
+			  )
+		)))`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -642,7 +679,7 @@ func scanVideo(row rowScanner) (*Video, error) {
 	var publishedAt, createdAt, updatedAt int64
 	var hidden int
 	err := row.Scan(
-		&v.ID, &v.DriveID, &v.FileID, &v.ContentHash, &v.ParentID, &v.Title, &v.Author, &tagsJSON,
+		&v.ID, &v.DriveID, &v.FileID, &v.FileName, &v.ContentHash, &v.ParentID, &v.Title, &v.Author, &tagsJSON,
 		&v.DurationSeconds, &v.Size, &v.Ext, &v.Quality, &v.ThumbnailURL,
 		&v.PreviewFileID, &v.PreviewLocal, &v.PreviewStatus,
 		&v.Views, &v.Favorites, &v.Comments, &v.Likes, &v.Dislikes,

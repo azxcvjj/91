@@ -661,36 +661,71 @@ func (w *ThumbWorker) process(ctx context.Context, v *catalog.Video) {
 	}
 	link, err := w.Drive.StreamURL(ctx, v.FileID)
 	if err != nil {
-		if w.pauseForRateLimit(err, "streamURL", v.Title) {
-			return
-		}
-		log.Printf("[thumb] streamURL %s: %v", v.Title, err)
-		return
-	}
-
-	duration := float64(v.DurationSeconds)
-	if duration <= 0 {
-		if dur, err := w.Gen.Probe(ctx, link); err == nil && dur > 0 {
-			duration = dur
-			_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
-				DurationSeconds: int(dur),
-			})
-		} else if err != nil && w.pauseForRateLimit(err, "probe", v.Title) {
+		if localLink, ok := localPreviewLink(v); ok {
+			link = localLink
+		} else {
+			if w.pauseForRateLimit(err, "streamURL", v.Title) {
+				return
+			}
+			log.Printf("[thumb] streamURL %s: %v", v.Title, err)
 			return
 		}
 	}
 
-	if _, err := w.Gen.GenerateThumbnail(ctx, link, v.ID, duration); err != nil {
+	if err := w.generateThumbnailFromLink(ctx, v, link); err != nil {
+		if localLink, ok := localPreviewLink(v); ok && link.URL != localLink.URL {
+			if localErr := w.generateThumbnailFromLink(ctx, v, localLink); localErr == nil {
+				return
+			}
+		}
 		if w.pauseForRateLimit(err, "generate", v.Title) {
 			return
 		}
 		log.Printf("[thumb] generate %s: %v", v.Title, err)
 		return
 	}
+}
+
+func (w *ThumbWorker) generateThumbnailFromLink(ctx context.Context, v *catalog.Video, link *drives.StreamLink) error {
+	duration := thumbnailDurationHint(v, link)
+	if duration <= 0 {
+		if dur, err := w.Gen.Probe(ctx, link); err == nil && dur > 0 {
+			duration = dur
+			_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
+				DurationSeconds: int(dur),
+			})
+		} else if err != nil {
+			return err
+		}
+	}
+
+	if _, err := w.Gen.GenerateThumbnail(ctx, link, v.ID, duration); err != nil {
+		return err
+	}
 	_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
 		ThumbnailURL: "/p/thumb/" + v.ID,
 	})
 	log.Printf("[thumb] ready %s", v.Title)
+	return nil
+}
+
+func thumbnailDurationHint(v *catalog.Video, link *drives.StreamLink) float64 {
+	if link != nil && v.PreviewLocal != "" && filepath.Clean(link.URL) == filepath.Clean(v.PreviewLocal) {
+		return 0
+	}
+	return float64(v.DurationSeconds)
+}
+
+func localPreviewLink(v *catalog.Video) (*drives.StreamLink, bool) {
+	if v.PreviewLocal == "" {
+		return nil, false
+	}
+	clean := filepath.Clean(v.PreviewLocal)
+	info, err := os.Stat(clean)
+	if err != nil || info.IsDir() || info.Size() == 0 {
+		return nil, false
+	}
+	return &drives.StreamLink{URL: clean}, true
 }
 
 func (w *Worker) process(ctx context.Context, v *catalog.Video) {

@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 import HomePage from "@/pages/HomePage";
 import ListingPage from "@/pages/ListingPage";
+import UploadPage from "@/pages/UploadPage";
 import VideoDetailPage from "@/pages/VideoDetailPage";
 import { AdminLayout } from "@/admin/AdminLayout";
 import { LoginPage } from "@/admin/LoginPage";
@@ -28,6 +29,14 @@ export default function App() {
         element={
           <RequireAuth>
             <ListingPage />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/upload"
+        element={
+          <RequireAuth>
+            <UploadPage />
           </RequireAuth>
         }
       />

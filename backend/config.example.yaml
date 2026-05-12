@@ -16,7 +16,7 @@ storage:
   local_preview_dir: "./data/previews"
 
 scanner:
-  # 扫描间隔（秒），0 表示只启动时扫一次
+  # 自动扫盘最小间隔（秒）；只在每天 02:00-07:00 触发，0 表示仅允许管理员手动重扫
   interval_seconds: 21600
   # 单次扫描每家网盘目录递归层数上限
   max_depth: 5

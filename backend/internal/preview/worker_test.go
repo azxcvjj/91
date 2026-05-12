@@ -47,6 +47,36 @@ func TestThumbWorkerUpdatesThumbnailWithoutChangingPreviewStatus(t *testing.T) {
 	}
 }
 
+func TestThumbWorkerFallsBackToLocalPreviewWhenDriveStreamFails(t *testing.T) {
+	ctx := context.Background()
+	cat, video := seedPreviewTestVideo(t, "thumb-worker-local-preview")
+	localPreview := filepath.Join(t.TempDir(), "preview.mp4")
+	if err := os.WriteFile(localPreview, []byte("preview"), 0o644); err != nil {
+		t.Fatalf("write local preview: %v", err)
+	}
+	video.PreviewLocal = localPreview
+	if err := cat.UpsertVideo(ctx, video); err != nil {
+		t.Fatalf("update video: %v", err)
+	}
+
+	gen := &fakeThumbGenerator{}
+	drv := &previewFakeDrive{streamErr: errors.New("remote unavailable")}
+	worker := NewThumbWorker(gen, cat, drv)
+
+	worker.process(ctx, video)
+
+	got, err := cat.GetVideo(ctx, video.ID)
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.ThumbnailURL != "/p/thumb/"+video.ID {
+		t.Fatalf("thumbnail = %q, want generated thumb URL", got.ThumbnailURL)
+	}
+	if gen.thumbnailURL != localPreview {
+		t.Fatalf("thumbnail source = %q, want local preview %q", gen.thumbnailURL, localPreview)
+	}
+}
+
 func TestPreviewWorkerGeneratesTeaserWithoutReplacingExistingThumbnail(t *testing.T) {
 	ctx := context.Background()
 	cat, video := seedPreviewTestVideo(t, "preview-worker-video")
@@ -187,15 +217,19 @@ func seedPreviewTestVideo(t *testing.T, id string) (*catalog.Catalog, *catalog.V
 type fakeThumbGenerator struct {
 	thumbnailVideoID  string
 	thumbnailDuration float64
+	thumbnailURL      string
 }
 
 func (g *fakeThumbGenerator) Probe(context.Context, *drives.StreamLink) (float64, error) {
 	return 42, nil
 }
 
-func (g *fakeThumbGenerator) GenerateThumbnail(_ context.Context, _ *drives.StreamLink, videoID string, duration float64) (string, error) {
+func (g *fakeThumbGenerator) GenerateThumbnail(_ context.Context, link *drives.StreamLink, videoID string, duration float64) (string, error) {
 	g.thumbnailVideoID = videoID
 	g.thumbnailDuration = duration
+	if link != nil {
+		g.thumbnailURL = link.URL
+	}
 	return "/tmp/" + videoID + ".jpg", nil
 }
 
@@ -226,6 +260,7 @@ func (g *fakeTeaserGenerator) MoveToLocal(_ string, videoID string) (string, err
 
 type previewFakeDrive struct {
 	streamFileID string
+	streamErr    error
 }
 
 func (d *previewFakeDrive) Kind() string { return "fake" }
@@ -241,6 +276,9 @@ func (d *previewFakeDrive) Stat(context.Context, string) (*drives.Entry, error) 
 }
 func (d *previewFakeDrive) StreamURL(_ context.Context, fileID string) (*drives.StreamLink, error) {
 	d.streamFileID = fileID
+	if d.streamErr != nil {
+		return nil, d.streamErr
+	}
 	return &drives.StreamLink{URL: "https://video.example/clip.mp4"}, nil
 }
 func (d *previewFakeDrive) Upload(context.Context, string, string, io.Reader, int64) (string, error) {

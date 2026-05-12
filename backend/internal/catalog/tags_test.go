@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 )
@@ -66,6 +67,66 @@ func TestCreateTagAndClassifyAddsTagToMatchingExistingVideos(t *testing.T) {
 	}
 	if len(other.Tags) != 0 {
 		t.Fatalf("non-matching tags = %#v, want none", other.Tags)
+	}
+}
+
+func TestOpenMigratesLegacyVideosWithoutFileName(t *testing.T) {
+	path := t.TempDir() + "/catalog.db"
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	if _, err := db.Exec(`
+CREATE TABLE videos (
+	id               TEXT PRIMARY KEY,
+	drive_id         TEXT NOT NULL,
+	file_id          TEXT NOT NULL,
+	content_hash     TEXT DEFAULT '',
+	parent_id        TEXT,
+	title            TEXT NOT NULL,
+	author           TEXT,
+	tags             TEXT,
+	duration_seconds INTEGER DEFAULT 0,
+	size_bytes       INTEGER DEFAULT 0,
+	ext              TEXT,
+	quality          TEXT,
+	thumbnail_url    TEXT,
+	preview_file_id  TEXT,
+	preview_local    TEXT,
+	preview_status   TEXT DEFAULT 'pending',
+	views            INTEGER DEFAULT 0,
+	favorites        INTEGER DEFAULT 0,
+	comments         INTEGER DEFAULT 0,
+	likes            INTEGER DEFAULT 0,
+	dislikes         INTEGER DEFAULT 0,
+	category         TEXT,
+	hidden           INTEGER DEFAULT 0,
+	tags_manual      INTEGER DEFAULT 0,
+	badges           TEXT,
+	description      TEXT,
+	published_at     INTEGER NOT NULL,
+	created_at       INTEGER NOT NULL,
+	updated_at       INTEGER NOT NULL
+)`); err != nil {
+		t.Fatalf("create legacy videos table: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw db: %v", err)
+	}
+
+	cat, err := Open(path)
+	if err != nil {
+		t.Fatalf("open migrated catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	var fileNameDefault string
+	if err := cat.db.QueryRow(`SELECT COALESCE(file_name, '') FROM videos LIMIT 1`).Scan(&fileNameDefault); err != nil && err != sql.ErrNoRows {
+		t.Fatalf("query migrated file_name column: %v", err)
 	}
 }
 
@@ -265,6 +326,156 @@ func TestMigrateCollapsesAVCodeTagsIntoAV(t *testing.T) {
 		if !sameStrings(got.Tags, []string{"AV"}) {
 			t.Fatalf("%s tags = %#v, want AV", id, got.Tags)
 		}
+	}
+}
+
+func TestMigrateClearsVolatileOneDriveThumbnailURLs(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	if err := cat.UpsertDrive(ctx, &Drive{
+		ID:        "onedrive-main",
+		Kind:      "onedrive",
+		Name:      "OneDrive",
+		RootID:    "root",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed onedrive: %v", err)
+	}
+
+	videos := []*Video{
+		{
+			ID:           "onedrive-video",
+			DriveID:      "onedrive-main",
+			FileID:       "file-1",
+			Title:        "OneDrive",
+			ThumbnailURL: "https://westus21-mediap.svc.ms/transform/thumbnail?provider=spo&tempauth=expired",
+		},
+		{
+			ID:           "local-thumb-video",
+			DriveID:      "onedrive-main",
+			FileID:       "file-2",
+			Title:        "Local thumb",
+			ThumbnailURL: "/p/thumb/local-thumb-video",
+		},
+		{
+			ID:           "pikpak-video",
+			DriveID:      "pikpak-main",
+			FileID:       "file-3",
+			Title:        "PikPak",
+			ThumbnailURL: "https://sg-thumbnail-drive.mypikpak.net/v0/screenshot-thumbnails/demo",
+		},
+	}
+	for _, v := range videos {
+		v.PublishedAt = now
+		v.CreatedAt = now
+		v.UpdatedAt = now
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed video %s: %v", v.ID, err)
+		}
+	}
+
+	if err := cat.migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	got, err := cat.GetVideo(ctx, "onedrive-video")
+	if err != nil {
+		t.Fatalf("get onedrive video: %v", err)
+	}
+	if got.ThumbnailURL != "" {
+		t.Fatalf("onedrive thumbnail = %q, want cleared", got.ThumbnailURL)
+	}
+
+	local, err := cat.GetVideo(ctx, "local-thumb-video")
+	if err != nil {
+		t.Fatalf("get local thumb video: %v", err)
+	}
+	if local.ThumbnailURL != "/p/thumb/local-thumb-video" {
+		t.Fatalf("local thumbnail = %q, want preserved", local.ThumbnailURL)
+	}
+
+	pikpak, err := cat.GetVideo(ctx, "pikpak-video")
+	if err != nil {
+		t.Fatalf("get pikpak video: %v", err)
+	}
+	if pikpak.ThumbnailURL == "" {
+		t.Fatal("pikpak thumbnail was cleared")
+	}
+}
+
+func TestMigrateHidesZeroSizeVideosForKnownDrives(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	if err := cat.UpsertDrive(ctx, &Drive{
+		ID:        "drive-main",
+		Kind:      "onedrive",
+		Name:      "OneDrive",
+		RootID:    "root",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	for _, v := range []*Video{
+		{ID: "empty-video", DriveID: "drive-main", FileID: "file-1", Title: "Empty", Size: 0},
+		{ID: "normal-video", DriveID: "drive-main", FileID: "file-2", Title: "Normal", Size: 123},
+		{ID: "orphan-empty-video", DriveID: "unknown-drive", FileID: "file-3", Title: "Orphan", Size: 0},
+	} {
+		v.PublishedAt = now
+		v.CreatedAt = now
+		v.UpdatedAt = now
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed video %s: %v", v.ID, err)
+		}
+	}
+
+	if err := cat.migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	empty, err := cat.GetVideo(ctx, "empty-video")
+	if err != nil {
+		t.Fatalf("get empty video: %v", err)
+	}
+	if !empty.Hidden {
+		t.Fatal("empty video was not hidden")
+	}
+
+	normal, err := cat.GetVideo(ctx, "normal-video")
+	if err != nil {
+		t.Fatalf("get normal video: %v", err)
+	}
+	if normal.Hidden {
+		t.Fatal("normal video was hidden")
+	}
+
+	orphan, err := cat.GetVideo(ctx, "orphan-empty-video")
+	if err != nil {
+		t.Fatalf("get orphan empty video: %v", err)
+	}
+	if orphan.Hidden {
+		t.Fatal("orphan empty video without a known drive was hidden")
 	}
 }
 

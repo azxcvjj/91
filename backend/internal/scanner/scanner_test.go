@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"database/sql"
 	"io"
 	"testing"
 	"time"
@@ -48,6 +49,41 @@ func TestRunPersistsRemoteThumbnailFromDriveEntry(t *testing.T) {
 	}
 	if got.ThumbnailURL != "https://thumbnail.example/clip.jpg" {
 		t.Fatalf("thumbnail = %q, want remote thumbnail", got.ThumbnailURL)
+	}
+}
+
+func TestRunIgnoresZeroSizeVideoFiles(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	drv := &scannerFakeDrive{
+		entries: []drives.Entry{{
+			ID:       "empty-file",
+			Name:     "empty.mp4",
+			Size:     0,
+			MimeType: "video/mp4",
+			ModTime:  time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC),
+		}},
+	}
+	sc := New(cat, drv, []string{".mp4"}, 5, nil)
+
+	stats, err := sc.Run(ctx, "")
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if stats.Added != 0 {
+		t.Fatalf("added = %d, want 0", stats.Added)
+	}
+	if _, err := cat.GetVideo(ctx, "fake-drive-empty-file"); err != sql.ErrNoRows {
+		t.Fatalf("get zero-size video error = %v, want sql.ErrNoRows", err)
 	}
 }
 
@@ -329,6 +365,62 @@ func TestRunSkipsDuplicateFileHashes(t *testing.T) {
 	}
 	if items[0].FileID != "file-1" {
 		t.Fatalf("visible file id = %q, want file-1", items[0].FileID)
+	}
+}
+
+func TestRunSkipsDuplicateFileNamesWithSameSizeWhenHashesMissing(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	drv := &scannerFakeDrive{
+		entries: []drives.Entry{
+			{
+				ID:      "file-1",
+				Name:    "same-name.mp4",
+				Size:    123,
+				ModTime: now,
+			},
+			{
+				ID:      "file-2",
+				Name:    "same-name.mp4",
+				Size:    123,
+				ModTime: now,
+			},
+			{
+				ID:      "file-3",
+				Name:    "same-name.mp4",
+				Size:    456,
+				ModTime: now,
+			},
+		},
+	}
+	addedIDs := []string{}
+	sc := New(cat, drv, []string{".mp4"}, 5, func(v *catalog.Video) {
+		addedIDs = append(addedIDs, v.ID)
+	})
+
+	stats, err := sc.Run(ctx, "")
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if stats.Added != 2 {
+		t.Fatalf("added = %d, want 2", stats.Added)
+	}
+	wantAdded := []string{"fake-drive-file-1", "fake-drive-file-3"}
+	if !sameStrings(addedIDs, wantAdded) {
+		t.Fatalf("on new ids = %#v, want %#v", addedIDs, wantAdded)
+	}
+	if _, err := cat.GetVideo(ctx, "fake-drive-file-2"); err != sql.ErrNoRows {
+		t.Fatalf("duplicate video lookup error = %v, want sql.ErrNoRows", err)
 	}
 }
 
