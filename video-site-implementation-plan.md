@@ -1261,6 +1261,14 @@ src/
 - 代码位置：`src/styles/tokens.css`。
 - 原因：实现复杂布局需要统一的间距和圆角尺度。
 
+#### 14.2.10 published_at 一律用入库时刻，不取网盘 mtime（2026-05-23）
+
+- plan 未明确 `published_at` 的取值规则。
+- 早期实现：通用 scanner 取 `e.ModTime`（115/夸克/PikPak/沃盘/OneDrive 都是网盘端文件 mtime），spider91 用爬取时刻。结果：早期上传到网盘的视频 mtime 很老，扫到后被 spider91 当下时刻的视频压在首页"最新视频"之外，体验上"凌晨明明扫到了 115 新视频却看不到"。
+- 当前实现：所有 driver（含 spider91 / 通用 scanner / 手动上传）`PublishedAt = now`，等于 `CreatedAt`。`scanner.go` 不再读 `e.ModTime`，相应的 `orDefault` 工具函数也删掉。
+- 历史数据保持不变（不回填）；此后扫到的新视频按新规则。
+- 代码位置：`backend/internal/scanner/scanner.go`。
+
 ### 14.3 mock 数据的临时代用
 
 以下内容仅在 mock 阶段成立，接真实后端时需要一并替换。

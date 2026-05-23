@@ -173,7 +173,7 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, depth int, st
 			ThumbnailURL:  e.ThumbnailURL,
 			PreviewStatus: "pending",
 			Category:      dirName,
-			PublishedAt:   orDefault(e.ModTime, now),
+			PublishedAt:   now,
 			CreatedAt:     now,
 			UpdatedAt:     now,
 		}
@@ -254,13 +254,6 @@ func (s *Scanner) backfillDuplicateThumbnail(ctx context.Context, canonical *cat
 		return
 	}
 	_ = s.Catalog.UpdateVideoMeta(ctx, canonical.ID, catalog.VideoMetaPatch{ThumbnailURL: thumbnailURL})
-}
-
-func orDefault(t time.Time, d time.Time) time.Time {
-	if t.IsZero() {
-		return d
-	}
-	return t
 }
 
 func sameTags(a, b []string) bool {
