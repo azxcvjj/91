@@ -581,6 +581,59 @@ func TestListVideosHidesDuplicateContentHashes(t *testing.T) {
 	}
 }
 
+func TestListVideosCanFilterReadyThumbnails(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for _, v := range []*Video{
+		{
+			ID:           "ready-video",
+			DriveID:      "drive",
+			FileID:       "file-ready",
+			Title:        "Ready",
+			ThumbnailURL: "/p/thumb/ready-video",
+			PublishedAt:  now,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		},
+		{
+			ID:          "pending-video",
+			DriveID:     "drive",
+			FileID:      "file-pending",
+			Title:       "Pending",
+			PublishedAt: now.Add(time.Second),
+			CreatedAt:   now.Add(time.Second),
+			UpdatedAt:   now.Add(time.Second),
+		},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed video %s: %v", v.ID, err)
+		}
+	}
+
+	items, total, err := cat.ListVideos(ctx, ListParams{
+		Page: 1, PageSize: 10, ThumbnailReadyOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("list videos: %v", err)
+	}
+	if total != 1 || len(items) != 1 {
+		t.Fatalf("ready videos total=%d len=%d, want 1", total, len(items))
+	}
+	if items[0].ID != "ready-video" {
+		t.Fatalf("ready video id = %q, want ready-video", items[0].ID)
+	}
+}
+
 func sameStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

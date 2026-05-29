@@ -155,24 +155,65 @@ func (s *Server) handleGetTheme(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
-	// 拉一批候选（按发布时间倒序，覆盖最近 200 个），然后随机洗牌取前 homePageSize 个。
-	// 如果库内不足 200 个会自动按实际数量返回，最后裁剪到 homePageSize。
+	// 首页优先展示封面已经生成好的视频，避免新盘扫盘时大量黑封面占满首页。
+	// 候选仍按发布时间覆盖最近 200 个，随后随机洗牌；封面不足时再用普通可见视频补齐。
 	const candidatePool = 200
-	items, _, err := s.Catalog.ListVideos(r.Context(), catalog.ListParams{
-		Sort: "latest", Page: 1, PageSize: candidatePool,
+	readyItems, _, err := s.Catalog.ListVideos(r.Context(), catalog.ListParams{
+		Sort: "latest", Page: 1, PageSize: candidatePool, ThumbnailReadyOnly: true,
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	rand.Shuffle(len(items), func(i, j int) {
-		items[i], items[j] = items[j], items[i]
+	rand.Shuffle(len(readyItems), func(i, j int) {
+		readyItems[i], readyItems[j] = readyItems[j], readyItems[i]
 	})
+
+	items := appendUniqueVideos(nil, readyItems, homePageSize)
 	if len(items) > homePageSize {
 		items = items[:homePageSize]
 	}
+	if len(items) < homePageSize {
+		fallback, _, err := s.Catalog.ListVideos(r.Context(), catalog.ListParams{
+			Sort: "latest", Page: 1, PageSize: candidatePool,
+		})
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		rand.Shuffle(len(fallback), func(i, j int) {
+			fallback[i], fallback[j] = fallback[j], fallback[i]
+		})
+		items = appendUniqueVideos(items, fallback, homePageSize)
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, mapVideos(items))
+}
+
+func appendUniqueVideos(dst []*catalog.Video, candidates []*catalog.Video, limit int) []*catalog.Video {
+	if len(dst) >= limit {
+		return dst[:limit]
+	}
+	seen := make(map[string]struct{}, len(dst))
+	for _, v := range dst {
+		if v != nil {
+			seen[v.ID] = struct{}{}
+		}
+	}
+	for _, v := range candidates {
+		if v == nil {
+			continue
+		}
+		if _, ok := seen[v.ID]; ok {
+			continue
+		}
+		dst = append(dst, v)
+		seen[v.ID] = struct{}{}
+		if len(dst) >= limit {
+			return dst
+		}
+	}
+	return dst
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {

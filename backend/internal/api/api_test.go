@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -95,6 +96,73 @@ func TestPreviewURLFallsBackWithoutUpdatedAt(t *testing.T) {
 
 	if got != "/p/preview/video-1" {
 		t.Fatalf("preview URL = %q, want unversioned URL", got)
+	}
+}
+
+func TestHandleHomePrioritizesVideosWithReadyThumbnails(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for i := 0; i < 20; i++ {
+		id := "pending-video-" + strconv.Itoa(i)
+		if err := cat.UpsertVideo(ctx, &catalog.Video{
+			ID:          id,
+			DriveID:     "drive",
+			FileID:      id,
+			Title:       id,
+			PublishedAt: now.Add(time.Duration(i) * time.Minute),
+			CreatedAt:   now.Add(time.Duration(i) * time.Minute),
+			UpdatedAt:   now.Add(time.Duration(i) * time.Minute),
+		}); err != nil {
+			t.Fatalf("seed pending video %s: %v", id, err)
+		}
+	}
+	for i := 0; i < homePageSize+2; i++ {
+		id := "ready-video-" + strconv.Itoa(i)
+		if err := cat.UpsertVideo(ctx, &catalog.Video{
+			ID:           id,
+			DriveID:      "drive",
+			FileID:       id,
+			Title:        id,
+			ThumbnailURL: "https://thumb.example/" + id + ".jpg",
+			PublishedAt:  now.Add(-time.Duration(i+1) * time.Hour),
+			CreatedAt:    now.Add(-time.Duration(i+1) * time.Hour),
+			UpdatedAt:    now.Add(-time.Duration(i+1) * time.Hour),
+		}); err != nil {
+			t.Fatalf("seed ready video %s: %v", id, err)
+		}
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/home", nil)
+	(&Server{Catalog: cat}).handleHome(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got []VideoDTO
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != homePageSize {
+		t.Fatalf("home items = %d, want %d", len(got), homePageSize)
+	}
+	for _, item := range got {
+		if !strings.HasPrefix(item.ID, "ready-video-") {
+			t.Fatalf("home returned %q without a ready thumbnail; items=%#v", item.ID, got)
+		}
+		if !strings.HasPrefix(item.Thumbnail, "https://thumb.example/") {
+			t.Fatalf("thumbnail for %q = %q, want ready thumbnail URL", item.ID, item.Thumbnail)
+		}
 	}
 }
 

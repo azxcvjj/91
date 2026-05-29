@@ -669,13 +669,14 @@ func (c *Catalog) FindVideoByFileSignature(ctx context.Context, fileName string,
 }
 
 type ListParams struct {
-	Keyword  string
-	DriveID  string
-	Tag      string
-	Category string
-	Sort     string // latest | hot | week | long
-	Page     int
-	PageSize int
+	Keyword            string
+	DriveID            string
+	Tag                string
+	Category           string
+	Sort               string // latest | hot | week | long
+	ThumbnailReadyOnly bool
+	Page               int
+	PageSize           int
 }
 
 func (c *Catalog) ListVideos(ctx context.Context, p ListParams) ([]*Video, int, error) {
@@ -709,6 +710,9 @@ func (c *Catalog) ListVideos(ctx context.Context, p ListParams) ([]*Video, int, 
 	if p.Category != "" && p.Category != "all" {
 		where = append(where, "category = ?")
 		args = append(args, p.Category)
+	}
+	if p.ThumbnailReadyOnly {
+		where = append(where, "COALESCE(thumbnail_url, '') != ''")
 	}
 	where = append(where, "COALESCE(hidden, 0) = 0")
 	where = append(where, uniqueVideoWhereSQL)
