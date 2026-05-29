@@ -96,6 +96,65 @@ func TestRefreshCaptchaTokenRecoversFrom4002(t *testing.T) {
 	}
 }
 
+// TestRefreshCaptchaTokenRecoversFrom9 覆盖 PikPak 返回 error_code=9
+// captcha_invalid 的路径。这个错误和 4002 一样表示当前 captcha_token 已被拒绝；
+// 重试 captcha/init 前必须先清空旧 token，否则服务端会继续拒绝。
+func TestRefreshCaptchaTokenRecoversFrom9(t *testing.T) {
+	var calls int32
+	type bodyShape struct {
+		CaptchaToken string `json:"captcha_token"`
+	}
+	var (
+		firstBody  bodyShape
+		secondBody bodyShape
+	)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/shield/captcha/init", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		switch n {
+		case 1:
+			_ = json.NewDecoder(r.Body).Decode(&firstBody)
+			writeErrorJSON(w, `{
+				"error_code": 9,
+				"error": "captcha_invalid",
+				"error_description": "Verification code is invalid"
+			}`)
+		case 2:
+			_ = json.NewDecoder(r.Body).Decode(&secondBody)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"captcha_token": "fresh-captcha",
+				"expires_in": 300
+			}`))
+		default:
+			t.Errorf("unexpected captcha init call #%d", n)
+		}
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	d := newTestDriver(t, server)
+	d.captchaToken = "expired-captcha"
+
+	if err := d.refreshCaptchaTokenAtLogin(context.Background(), "GET:/drive/v1/files", "user-1"); err != nil {
+		t.Fatalf("refreshCaptchaTokenAtLogin: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("captcha init called %d times, want 2", got)
+	}
+	if firstBody.CaptchaToken != "expired-captcha" {
+		t.Errorf("first body captcha_token = %q, want \"expired-captcha\"", firstBody.CaptchaToken)
+	}
+	if secondBody.CaptchaToken != "" {
+		t.Errorf("second body captcha_token = %q, want empty (cleared after error_code=9)", secondBody.CaptchaToken)
+	}
+	if d.captchaToken != "fresh-captcha" {
+		t.Errorf("d.captchaToken = %q, want \"fresh-captcha\"", d.captchaToken)
+	}
+}
+
 // TestRefreshCaptchaTokenDoesNotLoopOn4002WithEmptyToken 防止退化成无限重试：
 // 如果调用方一开始 captchaToken 就是空，又遇上 4002，不应该再清空一次重试
 // （清空后还是空，再发会拿到同样的错误），应该直接返回错误让上层处理。
@@ -118,6 +177,141 @@ func TestRefreshCaptchaTokenDoesNotLoopOn4002WithEmptyToken(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("captcha init called %d times, want 1 (no retry when token already empty)", got)
+	}
+}
+
+func TestInitWithRefreshTokenDoesNotSendPersistedCaptchaToken(t *testing.T) {
+	var captchaCalls int32
+	var captchaBody struct {
+		CaptchaToken string `json:"captcha_token"`
+	}
+	var persisted struct {
+		access, refresh, captcha string
+		calls                    int
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"access_token": "fresh-access",
+			"refresh_token": "fresh-refresh",
+			"sub": "user-1"
+		}`))
+	})
+	mux.HandleFunc("/v1/shield/captcha/init", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&captchaCalls, 1)
+		_ = json.NewDecoder(r.Body).Decode(&captchaBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"captcha_token": "fresh-captcha",
+			"expires_in": 300
+		}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	d := newTestDriver(t, server)
+	d.captchaToken = "persisted-stale-captcha"
+	d.onTokenUpdate = func(access, refresh, captcha, deviceID string) {
+		persisted.access = access
+		persisted.refresh = refresh
+		persisted.captcha = captcha
+		persisted.calls++
+	}
+
+	if err := d.Init(context.Background()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&captchaCalls); got != 1 {
+		t.Fatalf("captcha init calls = %d, want 1", got)
+	}
+	if captchaBody.CaptchaToken != "" {
+		t.Errorf("captcha init body captcha_token = %q, want empty", captchaBody.CaptchaToken)
+	}
+	if d.captchaToken != "fresh-captcha" {
+		t.Errorf("d.captchaToken = %q, want \"fresh-captcha\"", d.captchaToken)
+	}
+	if persisted.access != "fresh-access" || persisted.refresh != "fresh-refresh" || persisted.captcha != "fresh-captcha" {
+		t.Errorf("persisted tokens = (%q, %q, %q), want fresh values", persisted.access, persisted.refresh, persisted.captcha)
+	}
+	if persisted.calls < 2 {
+		t.Errorf("persist callback calls = %d, want at least 2 (clear stale + persist fresh)", persisted.calls)
+	}
+}
+
+func TestInitFallsBackToLoginWhenRefreshReturnsCaptchaInvalid(t *testing.T) {
+	var (
+		tokenCalls   int32
+		captchaCalls int32
+		signinCalls  int32
+	)
+	var signinBody struct {
+		CaptchaToken string `json:"captcha_token"`
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/token", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&tokenCalls, 1)
+		writeErrorJSON(w, `{
+			"error_code": 4002,
+			"error": "captcha_invalid",
+			"error_description": "Code(4002) - captcha_token expired"
+		}`)
+	})
+	mux.HandleFunc("/v1/shield/captcha/init", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&captchaCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		switch n {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"captcha_token": "login-captcha",
+				"expires_in": 300
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"captcha_token": "files-captcha",
+				"expires_in": 300
+			}`))
+		default:
+			t.Errorf("unexpected captcha init call #%d", n)
+		}
+	})
+	mux.HandleFunc("/v1/auth/signin", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&signinCalls, 1)
+		_ = json.NewDecoder(r.Body).Decode(&signinBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"access_token": "login-access",
+			"refresh_token": "login-refresh",
+			"sub": "user-1"
+		}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	d := newTestDriver(t, server)
+	d.captchaToken = "persisted-stale-captcha"
+
+	if err := d.Init(context.Background()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&tokenCalls); got != 1 {
+		t.Fatalf("token refresh calls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&signinCalls); got != 1 {
+		t.Fatalf("signin calls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&captchaCalls); got != 2 {
+		t.Fatalf("captcha init calls = %d, want 2 (login + post-login files action)", got)
+	}
+	if signinBody.CaptchaToken != "login-captcha" {
+		t.Errorf("signin captcha_token = %q, want \"login-captcha\"", signinBody.CaptchaToken)
+	}
+	if d.accessToken != "login-access" || d.refreshToken != "login-refresh" || d.captchaToken != "files-captcha" {
+		t.Errorf("driver tokens = (%q, %q, %q), want login/files tokens", d.accessToken, d.refreshToken, d.captchaToken)
 	}
 }
 
@@ -165,6 +359,76 @@ func TestRequestOnceRecoversFrom4002OnAPICall(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if body.CaptchaToken != "" {
 			t.Errorf("captcha init body captcha_token = %q, want empty (4002 path should clear cache)", body.CaptchaToken)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"captcha_token": "fresh-captcha", "expires_in": 300}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	d := newTestDriver(t, server)
+	d.captchaToken = "expired-captcha"
+
+	if _, err := d.List(context.Background(), "any-parent"); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&filesCalls); got != 2 {
+		t.Fatalf("/drive/v1/files calls = %d, want 2 (initial + retry)", got)
+	}
+	if got := atomic.LoadInt32(&captchaCalls); got != 1 {
+		t.Fatalf("captcha init calls = %d, want 1", got)
+	}
+	if firstFiles.captchaHeader != "expired-captcha" {
+		t.Errorf("first request X-Captcha-Token = %q, want \"expired-captcha\"", firstFiles.captchaHeader)
+	}
+	if secondFiles.captchaHeader != "fresh-captcha" {
+		t.Errorf("retry X-Captcha-Token = %q, want \"fresh-captcha\"", secondFiles.captchaHeader)
+	}
+	if d.captchaToken != "fresh-captcha" {
+		t.Errorf("d.captchaToken after recovery = %q, want \"fresh-captcha\"", d.captchaToken)
+	}
+}
+
+// TestRequestOnceRecoversFrom9OnAPICall 验证普通 API 调用收到 error_code=9
+// 时，会先清空旧 captchaToken，再刷新 captcha 并重试原请求。
+func TestRequestOnceRecoversFrom9OnAPICall(t *testing.T) {
+	var (
+		filesCalls   int32
+		captchaCalls int32
+	)
+	type capturedFiles struct {
+		captchaHeader string
+	}
+	var firstFiles, secondFiles capturedFiles
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/drive/v1/files", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&filesCalls, 1)
+		switch n {
+		case 1:
+			firstFiles.captchaHeader = r.Header.Get("X-Captcha-Token")
+			writeErrorJSON(w, `{
+				"error_code": 9,
+				"error": "captcha_invalid",
+				"error_description": "Verification code is invalid"
+			}`)
+		case 2:
+			secondFiles.captchaHeader = r.Header.Get("X-Captcha-Token")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"files": [], "next_page_token": ""}`))
+		default:
+			t.Errorf("unexpected /drive/v1/files call #%d", n)
+		}
+	})
+	mux.HandleFunc("/v1/shield/captcha/init", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&captchaCalls, 1)
+		var body struct {
+			CaptchaToken string `json:"captcha_token"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.CaptchaToken != "" {
+			t.Errorf("captcha init body captcha_token = %q, want empty (error_code=9 path should clear cache)", body.CaptchaToken)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"captcha_token": "fresh-captcha", "expires_in": 300}`))

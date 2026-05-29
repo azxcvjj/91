@@ -121,9 +121,28 @@ func (d *Driver) ID() string     { return d.id }
 func (d *Driver) RootID() string { return d.rootID }
 
 func (d *Driver) Init(ctx context.Context) error {
+	clearPersistedCaptcha := func() {
+		if d.captchaToken == "" {
+			return
+		}
+		d.captchaToken = ""
+		d.persistTokens()
+	}
+
 	if d.refreshToken != "" {
 		if err := d.refresh(ctx, d.refreshToken); err != nil {
-			return err
+			if !IsCaptchaError(err) || d.username == "" || d.password == "" {
+				return err
+			}
+			clearPersistedCaptcha()
+			if err := d.login(ctx); err != nil {
+				return fmt.Errorf("pikpak refresh captcha recovery login: %w", err)
+			}
+		} else {
+			// Persisted captcha tokens are short-lived. With a refresh token we can
+			// safely request a fresh captcha token after auth, and avoiding the
+			// stored value prevents known-stale tokens from poisoning startup.
+			clearPersistedCaptcha()
 		}
 	} else {
 		if err := d.login(ctx); err != nil {
@@ -408,14 +427,15 @@ func (d *Driver) requestOnce(ctx context.Context, url, method string, configure 
 				// serialized. Once we hold the lock, if d.captchaToken has
 				// already moved past staleToken, another goroutine has refreshed
 				// it for us — we skip the refresh and just retry. Otherwise we
-				// clear the cached token (4002 means "the value in the body is
-				// expired"; sending it again will keep returning 4002) and ask
-				// /v1/shield/captcha/init for a fresh one.
+				// clear the cached token before asking /v1/shield/captcha/init
+				// for a fresh one. PikPak may report stale captcha as either
+				// 4002 or 9, and sending the rejected token into captcha init can
+				// keep returning captcha_invalid.
 				staleToken := d.captchaToken
 				d.captchaMu.Lock()
 				var refreshErr error
 				if d.captchaToken == staleToken {
-					if e.ErrorCode == 4002 {
+					if d.captchaToken != "" {
 						d.captchaToken = ""
 					}
 					refreshErr = d.refreshCaptchaTokenAtLogin(ctx, getAction(method, url), d.userID)

@@ -59,6 +59,10 @@ func (e *errResp) Error() string {
 	return fmt.Sprintf("pikpak error_code=%d error=%s description=%s", e.ErrorCode, e.ErrorMsg, e.ErrorDescription)
 }
 
+func isCaptchaTokenRejectedCode(code int64) bool {
+	return code == 9 || code == 4002
+}
+
 // APIError is the public alias for the PikPak API error response. Callers
 // outside this package (e.g. the spider91→PikPak migrator, tests) can either
 // construct it for fakes or unwrap it via errors.As. Prefer IsCaptchaError
@@ -76,7 +80,7 @@ func IsCaptchaError(err error) bool {
 	}
 	var e *errResp
 	if errors.As(err, &e) {
-		return e != nil && (e.ErrorCode == 4002 || e.ErrorCode == 9)
+		return e != nil && isCaptchaTokenRejectedCode(e.ErrorCode)
 	}
 	return false
 }
