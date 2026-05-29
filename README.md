@@ -47,8 +47,7 @@
 ### 手机端
 
 <p align="center">
-  <img width="260" alt="91 手机端首页" src="https://github.com/user-attachments/assets/991338bc-914f-42f1-8331-722cb4b155e2" />
-  <img width="260" alt="91 手机端短视频" src="https://github.com/user-attachments/assets/ed9e6240-9864-45a3-8206-0740a702692f" />
+  <img width="1284" height="1134" alt="PixPin_2026-05-29_11-54-12" src="https://github.com/user-attachments/assets/bdb7a86c-a4e5-483e-a307-e02c0bb34dac" />
 </p>
 
 ---
