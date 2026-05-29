@@ -38,6 +38,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
+          git tag -d "$TAG" >/dev/null 2>&1 || true
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
           NOTES="$(git tag -l "$TAG" --format='%(contents)')"
           if [ -z "$NOTES" ]; then
             NOTES="Prebuilt Linux release packages."
