@@ -7,6 +7,90 @@ import (
 	"time"
 )
 
+func TestListVideosNeedingThumbnailIncludesExistingThumbnailMissingDuration(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	videos := []*Video{
+		{
+			ID:           "duration-only",
+			DriveID:      "drive",
+			FileID:       "file-duration-only",
+			Title:        "Duration Only",
+			ThumbnailURL: "/p/thumb/duration-only",
+			PublishedAt:  now,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		},
+		{
+			ID:              "complete",
+			DriveID:         "drive",
+			FileID:          "file-complete",
+			Title:           "Complete",
+			DurationSeconds: 12,
+			ThumbnailURL:    "/p/thumb/complete",
+			PublishedAt:     now.Add(time.Second),
+			CreatedAt:       now.Add(time.Second),
+			UpdatedAt:       now.Add(time.Second),
+		},
+		{
+			ID:              "missing-thumb",
+			DriveID:         "drive",
+			FileID:          "file-missing-thumb",
+			Title:           "Missing Thumb",
+			DurationSeconds: 18,
+			PublishedAt:     now.Add(2 * time.Second),
+			CreatedAt:       now.Add(2 * time.Second),
+			UpdatedAt:       now.Add(2 * time.Second),
+		},
+		{
+			ID:          "failed",
+			DriveID:     "drive",
+			FileID:      "file-failed",
+			Title:       "Failed",
+			PublishedAt: now.Add(3 * time.Second),
+			CreatedAt:   now.Add(3 * time.Second),
+			UpdatedAt:   now.Add(3 * time.Second),
+		},
+	}
+	for _, v := range videos {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed %s: %v", v.ID, err)
+		}
+	}
+	if err := cat.UpdateVideoMeta(ctx, "failed", VideoMetaPatch{ThumbnailStatus: "failed"}); err != nil {
+		t.Fatalf("mark failed thumbnail: %v", err)
+	}
+
+	items, err := cat.ListVideosNeedingThumbnail(ctx, "drive", 0)
+	if err != nil {
+		t.Fatalf("list videos needing thumbnail: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %#v, want duration-only and missing-thumb", items)
+	}
+	if items[0].ID != "duration-only" || items[1].ID != "missing-thumb" {
+		t.Fatalf("item ids = %q, %q; want duration-only, missing-thumb", items[0].ID, items[1].ID)
+	}
+
+	count, err := cat.CountVideosNeedingThumbnail(ctx, "drive")
+	if err != nil {
+		t.Fatalf("count videos needing thumbnail: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("count = %d, want 2", count)
+	}
+}
+
 func TestCreateTagAndClassifyAddsTagToMatchingExistingVideos(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")

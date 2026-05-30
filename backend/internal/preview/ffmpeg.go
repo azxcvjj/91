@@ -975,7 +975,6 @@ type Worker struct {
 	queue   videoQueue
 
 	RateLimitCooldown time.Duration
-	BeforeTask        func(context.Context) bool
 	rateLimit         rateLimitState
 	activity          taskActivity
 }
@@ -985,7 +984,7 @@ func NewWorker(gen TeaserGenerator, cat *catalog.Catalog, drv drives.Drive) *Wor
 		Gen:     gen,
 		Catalog: cat,
 		Drive:   drv,
-		ch:      make(chan *catalog.Video, 4096),
+		ch:      make(chan *catalog.Video, defaultWorkerQueueSize),
 	}
 }
 
@@ -1036,6 +1035,7 @@ type ThumbWorker struct {
 const (
 	defaultTransientMediaCooldown            = 5 * time.Minute
 	defaultGenerationRateLimitCooldown       = 5 * time.Minute
+	defaultWorkerQueueSize                   = 10000
 	maxPreviewTeaserSizeBytes          int64 = 5 * 1024 * 1024 * 1024
 	previewStatusSkipped                     = "skipped"
 )
@@ -1175,7 +1175,7 @@ func NewThumbWorker(gen ThumbnailGenerator, cat *catalog.Catalog, drv drives.Dri
 		Gen:     gen,
 		Catalog: cat,
 		Drive:   drv,
-		ch:      make(chan *catalog.Video, 4096),
+		ch:      make(chan *catalog.Video, defaultWorkerQueueSize),
 	}
 }
 
@@ -1330,10 +1330,6 @@ func (w *ThumbWorker) Run(ctx context.Context) {
 
 func (w *Worker) processQueued(ctx context.Context, v *catalog.Video) {
 	defer w.queue.release(v)
-	if w.BeforeTask != nil && !w.BeforeTask(ctx) {
-		return
-	}
-
 	w.activity.start(v)
 	defer w.activity.done()
 	if !waitForRateLimitCooldown(ctx, &w.rateLimit, "preview", w.Drive) {
@@ -1489,29 +1485,53 @@ func (w *ThumbWorker) process(ctx context.Context, v *catalog.Video) {
 	if w.skipIfRateLimited(v) {
 		return
 	}
-	if current, err := w.Catalog.GetVideo(ctx, v.ID); err == nil {
-		if current.ThumbnailURL != "" {
+	queued := v
+	current := v
+	if loaded, err := w.Catalog.GetVideo(ctx, v.ID); err == nil {
+		if loaded.PreviewLocal == "" {
+			loaded.PreviewLocal = queued.PreviewLocal
+		}
+		current = loaded
+		v = loaded
+		if loaded.ThumbnailURL != "" && loaded.DurationSeconds > 0 {
 			_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "ready"})
 			return
 		}
 	}
-	_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "pending"})
-	link, err := w.Drive.StreamURL(ctx, v.FileID)
-	if err != nil {
-		if localLink, ok := localPreviewLink(v); ok {
-			link = localLink
-		} else {
-			if w.pauseForRecoverableError(err, "streamURL", v.Title) {
+	if current.ThumbnailURL != "" {
+		if current.DurationSeconds <= 0 {
+			link, err := w.streamLink(ctx, current)
+			if err != nil {
+				if w.pauseForRecoverableError(err, "streamURL", current.Title) {
+					return
+				}
+				log.Printf("[thumb] probe streamURL %s: %v", current.Title, err)
+			} else if w.probeDuration(ctx, current, link) {
 				return
 			}
-			log.Printf("[thumb] streamURL %s: %v", v.Title, err)
-			_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "failed"})
+		}
+		_ = w.Catalog.UpdateVideoMeta(ctx, current.ID, catalog.VideoMetaPatch{ThumbnailStatus: "ready"})
+		return
+	}
+	_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "pending"})
+	link, err := w.streamLink(ctx, v)
+	if err != nil {
+		if w.pauseForRecoverableError(err, "streamURL", v.Title) {
 			return
 		}
+		log.Printf("[thumb] streamURL %s: %v", v.Title, err)
+		_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "failed"})
+		return
+	}
+	if w.probeDuration(ctx, v, link) {
+		return
 	}
 
 	if err := w.generateThumbnailFromLink(ctx, v, link); err != nil {
 		if localLink, ok := localPreviewLink(v); ok && link.URL != localLink.URL {
+			if w.probeDuration(ctx, v, localLink) {
+				return
+			}
 			if localErr := w.generateThumbnailFromLink(ctx, v, localLink); localErr == nil {
 				return
 			}
@@ -1523,6 +1543,38 @@ func (w *ThumbWorker) process(ctx context.Context, v *catalog.Video) {
 		_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "failed"})
 		return
 	}
+}
+
+func (w *ThumbWorker) streamLink(ctx context.Context, v *catalog.Video) (*drives.StreamLink, error) {
+	link, err := w.Drive.StreamURL(ctx, v.FileID)
+	if err == nil {
+		return link, nil
+	}
+	if localLink, ok := localPreviewLink(v); ok {
+		return localLink, nil
+	}
+	return nil, err
+}
+
+func (w *ThumbWorker) probeDuration(ctx context.Context, v *catalog.Video, link *drives.StreamLink) bool {
+	if v.DurationSeconds > 0 {
+		return false
+	}
+	dur, err := w.Gen.Probe(ctx, link)
+	if err == nil {
+		if dur > 0 {
+			v.DurationSeconds = int(dur)
+			_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
+				DurationSeconds: int(dur),
+			})
+		}
+		return false
+	}
+	if w.pauseForRecoverableError(err, "probe", v.Title) {
+		return true
+	}
+	log.Printf("[thumb] probe %s: %v", v.Title, err)
+	return false
 }
 
 func (w *ThumbWorker) generateThumbnailFromLink(ctx context.Context, v *catalog.Video, link *drives.StreamLink) error {

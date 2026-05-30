@@ -2,6 +2,8 @@ package onedrive
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -406,6 +408,36 @@ func TestEnsureDirCreatesMissingFolders(t *testing.T) {
 	}
 }
 
+func TestRenamePatchesDriveItemName(t *testing.T) {
+	var body map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.EscapedPath() != "/v1.0/me/drive/items/file-id" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer access-token" {
+			t.Fatalf("authorization = %q, want bearer token", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		writeJSON(t, w, map[string]any{"id": "file-id", "name": "new name.mp4"})
+	}))
+	defer srv.Close()
+
+	d := New(Config{
+		ID:           "od-main",
+		AccessToken:  "access-token",
+		RefreshToken: "refresh-token",
+		APIBaseURL:   srv.URL,
+	})
+	if err := d.Rename(context.Background(), "file-id", "new name.mp4"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if body["name"] != "new name.mp4" {
+		t.Fatalf("rename body = %#v, want new name", body)
+	}
+}
+
 func TestUploadSmallFileReturnsNewItemID(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer access-token" {
@@ -441,6 +473,86 @@ func TestUploadSmallFileReturnsNewItemID(t *testing.T) {
 	}
 	if got != "uploaded-id" {
 		t.Fatalf("uploaded id = %q, want uploaded-id", got)
+	}
+}
+
+func TestUploadLargeFileUsesUploadSessionAndReportsHash(t *testing.T) {
+	oldThreshold := smallUploadThreshold
+	oldChunk := uploadSessionChunk
+	smallUploadThreshold = 8
+	uploadSessionChunk = 4
+	t.Cleanup(func() {
+		smallUploadThreshold = oldThreshold
+		uploadSessionChunk = oldChunk
+	})
+
+	body := "0123456789abc"
+	var ranges []string
+	var chunks []string
+	var createdSession bool
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.EscapedPath() == "/v1.0/me/drive/items/parent-id:/big.mp4:/createUploadSession":
+			createdSession = true
+			if got := r.Header.Get("Authorization"); got != "Bearer access-token" {
+				t.Fatalf("authorization = %q, want bearer token", got)
+			}
+			writeJSON(t, w, map[string]any{"uploadUrl": srv.URL + "/upload-session"})
+		case r.Method == http.MethodPut && r.URL.Path == "/upload-session":
+			ranges = append(ranges, r.Header.Get("Content-Range"))
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read chunk: %v", err)
+			}
+			chunks = append(chunks, string(data))
+			if len(ranges) < 4 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusAccepted)
+				if _, err := w.Write([]byte(`{"nextExpectedRanges":["0-"]}`)); err != nil {
+					t.Fatalf("write accepted: %v", err)
+				}
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			if err := json.NewEncoder(w).Encode(map[string]any{"id": "uploaded-big-id"}); err != nil {
+				t.Fatalf("write final item: %v", err)
+			}
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+
+	d := New(Config{
+		ID:           "od-main",
+		AccessToken:  "access-token",
+		RefreshToken: "refresh-token",
+		APIBaseURL:   srv.URL,
+	})
+	got, err := d.UploadAndReportHash(context.Background(), "parent-id", "big.mp4", strings.NewReader(body), int64(len(body)))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if !createdSession {
+		t.Fatal("createUploadSession was not called")
+	}
+	wantRanges := []string{
+		"bytes 0-3/13",
+		"bytes 4-7/13",
+		"bytes 8-11/13",
+		"bytes 12-12/13",
+	}
+	if strings.Join(ranges, "|") != strings.Join(wantRanges, "|") {
+		t.Fatalf("ranges = %#v, want %#v", ranges, wantRanges)
+	}
+	if strings.Join(chunks, "") != body {
+		t.Fatalf("uploaded chunks = %q, want %q", strings.Join(chunks, ""), body)
+	}
+	sum := sha1.Sum([]byte(body))
+	if got.FileID != "uploaded-big-id" || got.Size != int64(len(body)) || got.Hash != hex.EncodeToString(sum[:]) {
+		t.Fatalf("upload result = %#v, want file id/hash/size for body", got)
 	}
 }
 

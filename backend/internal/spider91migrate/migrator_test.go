@@ -53,6 +53,8 @@ type fakePikPak struct {
 	uploadFunc  func(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error)
 	mu          sync.Mutex
 	gotBodies   map[string][]byte
+	gotParents  map[string]string
+	ensureCalls []string
 	// renameCalls 记录每次 Rename 的 fileID->newName 历史，用于 backfill 测试断言。
 	renameCalls map[string]string
 }
@@ -62,6 +64,7 @@ func newFakePikPak(id, rootID string) *fakePikPak {
 		id:          id,
 		rootID:      rootID,
 		gotBodies:   make(map[string][]byte),
+		gotParents:  make(map[string]string),
 		renameCalls: make(map[string]string),
 	}
 }
@@ -80,8 +83,11 @@ func (d *fakePikPak) StreamURL(context.Context, string) (*drives.StreamLink, err
 func (d *fakePikPak) Upload(context.Context, string, string, io.Reader, int64) (string, error) {
 	return "", drives.ErrNotSupported
 }
-func (d *fakePikPak) EnsureDir(context.Context, string) (string, error) {
-	return "", drives.ErrNotSupported
+func (d *fakePikPak) EnsureDir(_ context.Context, pathFromRoot string) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.ensureCalls = append(d.ensureCalls, pathFromRoot)
+	return d.rootID + "/" + pathFromRoot, nil
 }
 func (d *fakePikPak) Rename(_ context.Context, fileID, newName string) error {
 	d.mu.Lock()
@@ -99,6 +105,7 @@ func (d *fakePikPak) UploadAndReportHash(ctx context.Context, parentID, name str
 	body, _ := io.ReadAll(r)
 	d.mu.Lock()
 	d.gotBodies[name] = body
+	d.gotParents[name] = parentID
 	d.mu.Unlock()
 	return UploadResult{
 		FileID: "remote-" + name,
@@ -126,6 +133,19 @@ func (d *fakeP115) Kind() string { return "p115" }
 
 var _ drives.Drive = (*fakeP115)(nil)
 var _ uploadTarget = (*fakeP115)(nil)
+
+type fakeOneDrive struct {
+	*fakePikPak
+}
+
+func newFakeOneDrive(id, rootID string) *fakeOneDrive {
+	return &fakeOneDrive{fakePikPak: newFakePikPak(id, rootID)}
+}
+
+func (d *fakeOneDrive) Kind() string { return "onedrive" }
+
+var _ drives.Drive = (*fakeOneDrive)(nil)
+var _ uploadTarget = (*fakeOneDrive)(nil)
 
 // TestBackfillFileNamesRenamesOnlyMismatchedSpider91Videos 验证回填逻辑：
 //
@@ -346,6 +366,12 @@ func TestRunOnceMigratesSpider91VideosAndCleansLocalFiles(t *testing.T) {
 	wantName := "Sample vk001-vk001.mp4"
 	if _, ok := pp.gotBodies[wantName]; !ok {
 		t.Fatalf("PikPak did not receive expected upload name %q (got names: %v)", wantName, keysOf(pp.gotBodies))
+	}
+	if gotParent := pp.gotParents[wantName]; gotParent != "pikpak-root-id/"+spider91UploadDirName {
+		t.Fatalf("upload parent = %q, want root/91 Spider", gotParent)
+	}
+	if len(pp.ensureCalls) != 1 || pp.ensureCalls[0] != spider91UploadDirName {
+		t.Fatalf("ensure calls = %#v, want %q", pp.ensureCalls, spider91UploadDirName)
 	}
 	if got.FileID != "remote-"+wantName {
 		t.Fatalf("file_id = %q, want %q", got.FileID, "remote-"+wantName)
@@ -884,6 +910,12 @@ func TestRunOnceMigratesToP115Target(t *testing.T) {
 	if _, ok := target.gotBodies[wantName]; !ok {
 		t.Fatalf("p115 did not receive expected upload name %q (got names: %v)", wantName, keysOf(target.gotBodies))
 	}
+	if gotParent := target.gotParents[wantName]; gotParent != "p115-root-cid/"+spider91UploadDirName {
+		t.Fatalf("p115 upload parent = %q, want root/91 Spider", gotParent)
+	}
+	if len(target.ensureCalls) != 1 || target.ensureCalls[0] != spider91UploadDirName {
+		t.Fatalf("p115 ensure calls = %#v, want %q", target.ensureCalls, spider91UploadDirName)
+	}
 	if got.FileID != "remote-"+wantName {
 		t.Fatalf("file_id = %q, want %q", got.FileID, "remote-"+wantName)
 	}
@@ -905,7 +937,67 @@ func TestRunOnceMigratesToP115Target(t *testing.T) {
 	}
 }
 
-// TestResolveTargetRejectsUnsupportedKind 验证当目标 drive 既不是 PikPak 也不是 115 时，
+func TestRunOnceMigratesToOneDriveTarget(t *testing.T) {
+	cat := setupCatalog(t)
+	src, _ := setupSpider91(t)
+	target := newFakeOneDrive("onedrive-target", "onedrive-root")
+	reg := newFakeRegistry()
+	reg.Add(src)
+	reg.Add(target)
+
+	now := time.Now()
+	id := writeSpider91Video(t, cat, src, "vk-od-001", ".mp4", []byte("video bytes onedrive"), now)
+
+	m := New(Config{
+		Catalog:          cat,
+		Registry:         reg,
+		GetTargetDriveID: func() string { return target.ID() },
+		KeepLatestN:      -1,
+	})
+	m.runOnce(context.Background())
+
+	if target.uploadCalls != 1 {
+		t.Fatalf("onedrive upload calls = %d, want 1", target.uploadCalls)
+	}
+
+	got, err := cat.GetVideo(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.DriveID != target.ID() {
+		t.Fatalf("drive_id = %q, want %q", got.DriveID, target.ID())
+	}
+	wantName := "Sample vk-od-001-001.mp4"
+	if _, ok := target.gotBodies[wantName]; !ok {
+		t.Fatalf("onedrive did not receive expected upload name %q (got names: %v)", wantName, keysOf(target.gotBodies))
+	}
+	if gotParent := target.gotParents[wantName]; gotParent != "onedrive-root/"+spider91UploadDirName {
+		t.Fatalf("onedrive upload parent = %q, want root/91 Spider", gotParent)
+	}
+	if len(target.ensureCalls) != 1 || target.ensureCalls[0] != spider91UploadDirName {
+		t.Fatalf("onedrive ensure calls = %#v, want %q", target.ensureCalls, spider91UploadDirName)
+	}
+	if got.FileID != "remote-"+wantName {
+		t.Fatalf("file_id = %q, want %q", got.FileID, "remote-"+wantName)
+	}
+	if got.FileName != wantName {
+		t.Fatalf("file_name = %q, want %q", got.FileName, wantName)
+	}
+	if got.ContentHash == "" {
+		t.Fatal("content_hash should be set after onedrive migration")
+	}
+
+	videoPath, _ := src.VideoPath("vk-od-001.mp4")
+	if _, err := os.Stat(videoPath); !os.IsNotExist(err) {
+		t.Fatalf("local mp4 still exists after onedrive migration or stat error: %v", err)
+	}
+	thumbPath, _ := src.ThumbPath("vk-od-001.jpg")
+	if _, err := os.Stat(thumbPath); !os.IsNotExist(err) {
+		t.Fatalf("local thumb still exists after onedrive migration or stat error: %v", err)
+	}
+}
+
+// TestResolveTargetRejectsUnsupportedKind 验证当目标 drive 既不是 PikPak、115 也不是 OneDrive 时，
 // resolveTarget 拒绝并返回 error，让 runOnce 静默跳过（不会做破坏性变更）。
 func TestResolveTargetRejectsUnsupportedKind(t *testing.T) {
 	cat := setupCatalog(t)

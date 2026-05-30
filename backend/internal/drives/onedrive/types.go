@@ -82,3 +82,13 @@ type filesResp struct {
 	Value    []graphItem `json:"value"`
 	NextLink string      `json:"@odata.nextLink"`
 }
+
+type UploadResult struct {
+	FileID string
+	Hash   string
+	Size   int64
+}
+
+type uploadSessionResp struct {
+	UploadURL string `json:"uploadUrl"`
+}

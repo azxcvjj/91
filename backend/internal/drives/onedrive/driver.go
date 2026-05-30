@@ -3,6 +3,9 @@ package onedrive
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,10 +23,17 @@ import (
 )
 
 const (
-	maxSmallUploadSize   = 250 * 1024 * 1024
-	defaultRenewAPIURL   = "https://api.oplist.org/onedrive/renewapi"
-	onedriveListCooldown = 5 * time.Minute
-	onedriveListInterval = 1 * time.Second
+	maxSmallUploadSize         = 250 * 1024 * 1024
+	defaultUploadSessionChunk  = 10 * 1024 * 1024
+	uploadSessionRetryAttempts = 3
+	defaultRenewAPIURL         = "https://api.oplist.org/onedrive/renewapi"
+	onedriveListCooldown       = 5 * time.Minute
+	onedriveListInterval       = 1 * time.Second
+)
+
+var (
+	smallUploadThreshold = int64(maxSmallUploadSize)
+	uploadSessionChunk   = int64(defaultUploadSessionChunk)
 )
 
 type Driver struct {
@@ -216,15 +226,49 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 }
 
 func (d *Driver) Upload(ctx context.Context, parentID, name string, r io.Reader, size int64) (string, error) {
+	res, err := d.UploadAndReportHash(ctx, parentID, name, r, size)
+	if err != nil {
+		return "", err
+	}
+	return res.FileID, nil
+}
+
+func (d *Driver) UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
+	parentID, name, err := d.normalizeUploadArgs(parentID, name, r, size)
+	if err != nil {
+		return UploadResult{}, err
+	}
+	threshold := smallUploadThreshold
+	if threshold <= 0 {
+		threshold = maxSmallUploadSize
+	}
+	if size <= threshold {
+		return d.uploadSmallAndReportHash(ctx, parentID, name, r, size, threshold)
+	}
+	return d.uploadSessionAndReportHash(ctx, parentID, name, r, size)
+}
+
+func (d *Driver) normalizeUploadArgs(parentID, name string, r io.Reader, size int64) (string, string, error) {
+	if r == nil {
+		return "", "", errors.New("onedrive upload: body is required")
+	}
+	if size < 0 {
+		return "", "", fmt.Errorf("onedrive upload: invalid size %d", size)
+	}
 	if parentID == "" {
 		parentID = d.rootID
 	}
-	if size > maxSmallUploadSize {
-		return "", fmt.Errorf("onedrive upload: files over %d bytes require upload session", maxSmallUploadSize)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", "", errors.New("onedrive upload: empty file name")
 	}
-	data, err := readSmallUpload(r)
+	return parentID, name, nil
+}
+
+func (d *Driver) uploadSmallAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size, limit int64) (UploadResult, error) {
+	data, hash, actualSize, err := readSmallUpload(r, size, limit)
 	if err != nil {
-		return "", err
+		return UploadResult{}, err
 	}
 	u := fmt.Sprintf("%s/items/%s:/%s:/content", d.driveBaseURL(), url.PathEscape(parentID), url.PathEscape(name))
 	var item graphItem
@@ -233,26 +277,159 @@ func (d *Driver) Upload(ctx context.Context, parentID, name string, r io.Reader,
 		req.SetContentLength(true)
 	}, &item)
 	if err != nil {
-		return "", fmt.Errorf("onedrive upload: %w", err)
+		return UploadResult{}, fmt.Errorf("onedrive upload: %w", err)
 	}
 	if item.ID == "" {
-		return "", errors.New("onedrive upload: empty item id")
+		return UploadResult{}, errors.New("onedrive upload: empty item id")
 	}
-	return item.ID, nil
+	return UploadResult{FileID: item.ID, Hash: hash, Size: actualSize}, nil
 }
 
-func readSmallUpload(r io.Reader) ([]byte, error) {
-	if r == nil {
-		return nil, errors.New("onedrive upload: body is required")
-	}
-	data, err := io.ReadAll(io.LimitReader(r, maxSmallUploadSize+1))
+func (d *Driver) uploadSessionAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
+	session, err := d.createUploadSession(ctx, parentID, name)
 	if err != nil {
-		return nil, fmt.Errorf("onedrive upload: read body: %w", err)
+		return UploadResult{}, err
 	}
-	if len(data) > maxSmallUploadSize {
-		return nil, fmt.Errorf("onedrive upload: files over %d bytes require upload session", maxSmallUploadSize)
+	if strings.TrimSpace(session.UploadURL) == "" {
+		return UploadResult{}, errors.New("onedrive upload session: empty upload url")
 	}
-	return data, nil
+
+	chunkSize := uploadSessionChunk
+	if chunkSize <= 0 {
+		chunkSize = defaultUploadSessionChunk
+	}
+	buf := make([]byte, int(chunkSize))
+	hasher := sha1.New()
+	var finalItem graphItem
+	var offset int64
+	for offset < size {
+		partSize := minInt64(chunkSize, size-offset)
+		chunk := buf[:int(partSize)]
+		n, err := io.ReadFull(r, chunk)
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return UploadResult{}, fmt.Errorf("onedrive upload: size mismatch: declared %d, copied %d", size, offset+int64(n))
+			}
+			return UploadResult{}, fmt.Errorf("onedrive upload: read body: %w", err)
+		}
+		chunk = chunk[:n]
+		_, _ = hasher.Write(chunk)
+		item, err := d.putUploadSessionChunkWithRetry(ctx, session.UploadURL, offset, size, chunk)
+		if err != nil {
+			return UploadResult{}, err
+		}
+		if item != nil {
+			finalItem = *item
+		}
+		offset += int64(n)
+	}
+	if finalItem.ID == "" {
+		return UploadResult{}, errors.New("onedrive upload session: empty item id")
+	}
+	return UploadResult{
+		FileID: finalItem.ID,
+		Hash:   hex.EncodeToString(hasher.Sum(nil)),
+		Size:   offset,
+	}, nil
+}
+
+func (d *Driver) createUploadSession(ctx context.Context, parentID, name string) (uploadSessionResp, error) {
+	u := fmt.Sprintf("%s/items/%s:/%s:/createUploadSession", d.driveBaseURL(), url.PathEscape(parentID), url.PathEscape(name))
+	body := map[string]any{
+		"item": map[string]any{
+			"@microsoft.graph.conflictBehavior": "rename",
+		},
+	}
+	var out uploadSessionResp
+	err := d.request(ctx, u, http.MethodPost, func(req *resty.Request) {
+		req.SetBody(body)
+	}, &out)
+	if err != nil {
+		return uploadSessionResp{}, fmt.Errorf("onedrive upload session: %w", err)
+	}
+	return out, nil
+}
+
+func (d *Driver) putUploadSessionChunkWithRetry(ctx context.Context, uploadURL string, start, total int64, data []byte) (*graphItem, error) {
+	var last error
+	for attempt := 0; attempt < uploadSessionRetryAttempts; attempt++ {
+		if attempt > 0 {
+			if err := sleepContext(ctx, time.Duration(attempt)*time.Second); err != nil {
+				return nil, err
+			}
+		}
+		item, retryable, err := d.putUploadSessionChunk(ctx, uploadURL, start, total, data)
+		if err == nil {
+			return item, nil
+		}
+		last = err
+		if !retryable {
+			return nil, err
+		}
+	}
+	if last == nil {
+		last = errors.New("onedrive upload session: retry attempts exhausted")
+	}
+	return nil, last
+}
+
+func (d *Driver) putUploadSessionChunk(ctx context.Context, uploadURL string, start, total int64, data []byte) (*graphItem, bool, error) {
+	end := start + int64(len(data)) - 1
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, bytes.NewReader(data))
+	if err != nil {
+		return nil, false, err
+	}
+	req.ContentLength = int64(len(data))
+	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, true, err
+	}
+	defer res.Body.Close()
+
+	switch res.StatusCode {
+	case http.StatusOK, http.StatusCreated:
+		var item graphItem
+		if err := json.NewDecoder(res.Body).Decode(&item); err != nil {
+			return nil, false, fmt.Errorf("onedrive upload session: decode completed item: %w", err)
+		}
+		return &item, false, nil
+	case http.StatusAccepted:
+		return nil, false, nil
+	default:
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+		err := fmt.Errorf("onedrive upload session: status=%d body=%s", res.StatusCode, strings.TrimSpace(string(body)))
+		retryable := res.StatusCode == http.StatusTooManyRequests || (res.StatusCode >= 500 && res.StatusCode <= 504)
+		return nil, retryable, err
+	}
+}
+
+func readSmallUpload(r io.Reader, declaredSize, limit int64) ([]byte, string, int64, error) {
+	if r == nil {
+		return nil, "", 0, errors.New("onedrive upload: body is required")
+	}
+	if limit <= 0 {
+		limit = maxSmallUploadSize
+	}
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("onedrive upload: read body: %w", err)
+	}
+	if int64(len(data)) > limit {
+		return nil, "", 0, fmt.Errorf("onedrive upload: files over %d bytes require upload session", limit)
+	}
+	if declaredSize >= 0 && int64(len(data)) != declaredSize {
+		return nil, "", 0, fmt.Errorf("onedrive upload: size mismatch: declared %d, copied %d", declaredSize, len(data))
+	}
+	sum := sha1.Sum(data)
+	return data, hex.EncodeToString(sum[:]), int64(len(data)), nil
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (d *Driver) EnsureDir(ctx context.Context, pathFromRoot string) (string, error) {
@@ -303,6 +480,25 @@ func (d *Driver) makeDir(ctx context.Context, parentID, name string) (string, er
 		return "", fmt.Errorf("onedrive mkdir %s: empty item id", name)
 	}
 	return item.ID, nil
+}
+
+func (d *Driver) Rename(ctx context.Context, fileID, newName string) error {
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" {
+		return errors.New("onedrive rename: empty file id")
+	}
+	newName = strings.TrimSpace(newName)
+	if newName == "" {
+		return errors.New("onedrive rename: empty new name")
+	}
+	var item graphItem
+	err := d.request(ctx, d.itemURL(fileID), http.MethodPatch, func(req *resty.Request) {
+		req.SetBody(map[string]string{"name": newName})
+	}, &item)
+	if err != nil {
+		return fmt.Errorf("onedrive rename: %w", err)
+	}
+	return nil
 }
 
 func (d *Driver) request(ctx context.Context, rawURL, method string, configure func(*resty.Request), out any) error {

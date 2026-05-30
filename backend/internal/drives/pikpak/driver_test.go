@@ -1,10 +1,12 @@
 package pikpak
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
-
-	"github.com/video-site/backend/internal/drives"
 )
 
 func TestNewDefaults(t *testing.T) {
@@ -95,11 +97,85 @@ func TestFolderToEntry(t *testing.T) {
 	}
 }
 
-func TestEnsureDirStillUnsupported(t *testing.T) {
-	d := New(Config{ID: "pikpak-main"})
+func TestEnsureDirReusesExistingFolder(t *testing.T) {
+	var postCalled bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/drive/v1/files", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			if got := r.URL.Query().Get("parent_id"); got != "root-id" {
+				t.Fatalf("parent_id = %q, want root-id", got)
+			}
+			writePikPakJSON(t, w, map[string]any{
+				"files": []map[string]any{{
+					"id":   "existing-folder-id",
+					"kind": "drive#folder",
+					"name": "91 Spider",
+				}},
+			})
+		case http.MethodPost:
+			postCalled = true
+			t.Fatalf("existing folder should not be created again")
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
 
-	if _, err := d.EnsureDir(nil, "/previews"); err != drives.ErrNotSupported {
-		t.Fatalf("EnsureDir error = %v, want ErrNotSupported", err)
+	d := newTestDriver(t, srv)
+	got, err := d.EnsureDir(context.Background(), "91 Spider")
+	if err != nil {
+		t.Fatalf("ensure dir: %v", err)
 	}
-	// Upload 的真实实现见 upload_test.go。
+	if got != "existing-folder-id" {
+		t.Fatalf("dir id = %q, want existing-folder-id", got)
+	}
+	if postCalled {
+		t.Fatal("POST should not be called")
+	}
+}
+
+func TestEnsureDirCreatesMissingFolder(t *testing.T) {
+	var got uploadRequestBody
+	mux := http.NewServeMux()
+	mux.HandleFunc("/drive/v1/files", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			writePikPakJSON(t, w, map[string]any{"files": []map[string]any{}})
+		case http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Fatalf("decode create folder body: %v", err)
+			}
+			writePikPakJSON(t, w, map[string]any{
+				"id":   "new-folder-id",
+				"kind": "drive#folder",
+				"name": "91 Spider",
+			})
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	d := newTestDriver(t, srv)
+	id, err := d.EnsureDir(context.Background(), "91 Spider")
+	if err != nil {
+		t.Fatalf("ensure dir: %v", err)
+	}
+	if id != "new-folder-id" {
+		t.Fatalf("dir id = %q, want new-folder-id", id)
+	}
+	if got.Kind != "drive#folder" || got.ParentID != "root-id" || got.Name != "91 Spider" {
+		t.Fatalf("create folder body = %#v", got)
+	}
+}
+
+func writePikPakJSON(t *testing.T, w http.ResponseWriter, body any) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		t.Fatalf("write json: %v", err)
+	}
 }

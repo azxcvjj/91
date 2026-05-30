@@ -13,11 +13,11 @@ import (
 	"github.com/video-site/backend/internal/drives"
 )
 
-func TestThumbWorkerUpdatesThumbnailWithoutChangingPreviewStatus(t *testing.T) {
+func TestThumbWorkerUpdatesThumbnailAndDurationWithoutChangingPreviewStatus(t *testing.T) {
 	ctx := context.Background()
 	cat, video := seedPreviewTestVideo(t, "thumb-worker-video")
 
-	gen := &fakeThumbGenerator{}
+	gen := &fakeThumbGenerator{probeDuration: 42}
 	drv := &previewFakeDrive{}
 	worker := NewThumbWorker(gen, cat, drv)
 
@@ -33,8 +33,8 @@ func TestThumbWorkerUpdatesThumbnailWithoutChangingPreviewStatus(t *testing.T) {
 	if got.PreviewStatus != "pending" {
 		t.Fatalf("preview status = %q, want pending", got.PreviewStatus)
 	}
-	if got.DurationSeconds != 0 {
-		t.Fatalf("duration = %d, want unchanged", got.DurationSeconds)
+	if got.DurationSeconds != 42 {
+		t.Fatalf("duration = %d, want probed duration", got.DurationSeconds)
 	}
 	if gen.thumbnailVideoID != video.ID {
 		t.Fatalf("thumbnail video id = %q, want %q", gen.thumbnailVideoID, video.ID)
@@ -42,11 +42,50 @@ func TestThumbWorkerUpdatesThumbnailWithoutChangingPreviewStatus(t *testing.T) {
 	if gen.thumbnailDuration != 0 {
 		t.Fatalf("thumbnail duration = %.1f, want fixed-offset thumbnail generation", gen.thumbnailDuration)
 	}
-	if gen.probeCalls != 0 {
-		t.Fatalf("probe calls = %d, want 0 for thumbnail generation", gen.probeCalls)
+	if gen.probeCalls != 1 {
+		t.Fatalf("probe calls = %d, want 1 for thumbnail generation", gen.probeCalls)
 	}
 	if drv.streamFileID != video.FileID {
 		t.Fatalf("stream file id = %q, want %q", drv.streamFileID, video.FileID)
+	}
+}
+
+func TestThumbWorkerBackfillsDurationWhenThumbnailAlreadyExists(t *testing.T) {
+	ctx := context.Background()
+	cat, video := seedPreviewTestVideo(t, "thumb-worker-existing-thumbnail")
+	video.ThumbnailURL = "/p/thumb/" + video.ID
+	if err := cat.UpsertVideo(ctx, video); err != nil {
+		t.Fatalf("update video: %v", err)
+	}
+
+	gen := &fakeThumbGenerator{probeDuration: 19}
+	drv := &previewFakeDrive{}
+	worker := NewThumbWorker(gen, cat, drv)
+
+	worker.process(ctx, video)
+
+	got, err := cat.GetVideo(ctx, video.ID)
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.DurationSeconds != 19 {
+		t.Fatalf("duration = %d, want probed duration", got.DurationSeconds)
+	}
+	if got.ThumbnailURL != "/p/thumb/"+video.ID {
+		t.Fatalf("thumbnail = %q, want unchanged existing thumbnail", got.ThumbnailURL)
+	}
+	ready, err := cat.ListVideosByThumbnailStatus(ctx, video.DriveID, "ready", 0)
+	if err != nil {
+		t.Fatalf("list ready thumbnails: %v", err)
+	}
+	if len(ready) != 1 || ready[0].ID != video.ID {
+		t.Fatalf("ready thumbnails = %#v, want only %s", ready, video.ID)
+	}
+	if gen.probeCalls != 1 {
+		t.Fatalf("probe calls = %d, want 1", gen.probeCalls)
+	}
+	if gen.thumbnailVideoID != "" {
+		t.Fatalf("thumbnail generation video id = %q, want no regeneration", gen.thumbnailVideoID)
 	}
 }
 
@@ -469,12 +508,17 @@ type fakeThumbGenerator struct {
 	thumbnailDuration float64
 	thumbnailURL      string
 	probeCalls        int
+	probeDuration     float64
+	probeErr          error
 	generateErr       error
 }
 
 func (g *fakeThumbGenerator) Probe(context.Context, *drives.StreamLink) (float64, error) {
 	g.probeCalls++
-	return 42, nil
+	if g.probeErr != nil {
+		return 0, g.probeErr
+	}
+	return g.probeDuration, nil
 }
 
 func (g *fakeThumbGenerator) GenerateThumbnail(_ context.Context, link *drives.StreamLink, videoID string, duration float64) (string, error) {
@@ -567,7 +611,6 @@ func (d *previewFakeDrive) EnsureDir(context.Context, string) (string, error) {
 	return "", drives.ErrNotSupported
 }
 func (d *previewFakeDrive) RootID() string { return "root" }
-
 
 func TestWorkerWaitIdleReturnsImmediatelyWhenQueueEmpty(t *testing.T) {
 	worker := NewWorker(&fakeTeaserGenerator{}, nil, &previewFakeDrive{})

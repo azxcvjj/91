@@ -1,5 +1,5 @@
 // Package spider91migrate 周期性把 spider91 drive 下载到本地的视频
-// 上传到一个指定的目标 drive 目录（PikPak 或 115），上传成功后：
+// 上传到一个指定的目标 drive 目录（PikPak、115 或 OneDrive），上传成功后：
 //
 //   - 改写 catalog 行：drive_id / file_id / content_hash 改成目标盘的；
 //     视频自身的 id 不变（仍是 spider91-<driveID>-<viewkey>），video_tags、
@@ -28,6 +28,7 @@ import (
 
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/drives/onedrive"
 	"github.com/video-site/backend/internal/drives/p115"
 	"github.com/video-site/backend/internal/drives/pikpak"
 	"github.com/video-site/backend/internal/drives/spider91"
@@ -39,12 +40,14 @@ import (
 // 这一层抽象把"迁移调用方"和"具体盘的 SDK 协议"解耦：
 //   - PikPak 走 GCID + OSS PutObject（pikpak.UploadResult）
 //   - 115   走 SHA1   + 秒传 / OSS / 分片（p115.UploadResult）
+//   - OneDrive 走 SHA1 + 小文件 PUT / 大文件 upload session
 //
-// 两个返回值都被归一成本地的 UploadResult，并在 catalog 改写阶段统一处理。
+// 各家返回值都被归一成本地的 UploadResult，并在 catalog 改写阶段统一处理。
 type uploadTarget interface {
 	ID() string
 	Kind() string
 	RootID() string
+	EnsureDir(ctx context.Context, pathFromRoot string) (string, error)
 	UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error)
 	Rename(ctx context.Context, fileID, newName string) error
 }
@@ -52,7 +55,7 @@ type uploadTarget interface {
 // UploadResult 是 uploadTarget.UploadAndReportHash 的归一返回。
 //
 // FileID  目标盘上的新文件 ID；
-// Hash    GCID（PikPak）或 SHA1 HEX 大写（115），写入 catalog.content_hash 用于跨盘去重；
+// Hash    GCID（PikPak）或 SHA1 HEX（115 / OneDrive），写入 catalog.content_hash 用于跨盘去重；
 // Size    实际上传字节数。
 type UploadResult struct {
 	FileID string
@@ -60,7 +63,9 @@ type UploadResult struct {
 	Size   int64
 }
 
-// pikpakAdapter / p115Adapter 把具体 driver 包装成 uploadTarget。
+const spider91UploadDirName = "91 Spider"
+
+// pikpakAdapter / p115Adapter / onedriveAdapter 把具体 driver 包装成 uploadTarget。
 //
 // 之所以不让 driver 直接实现 uploadTarget：
 //
@@ -74,6 +79,9 @@ type pikpakAdapter struct {
 func (a *pikpakAdapter) ID() string     { return a.d.ID() }
 func (a *pikpakAdapter) Kind() string   { return a.d.Kind() }
 func (a *pikpakAdapter) RootID() string { return a.d.RootID() }
+func (a *pikpakAdapter) EnsureDir(ctx context.Context, pathFromRoot string) (string, error) {
+	return a.d.EnsureDir(ctx, pathFromRoot)
+}
 func (a *pikpakAdapter) UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
 	res, err := a.d.UploadAndReportHash(ctx, parentID, name, r, size)
 	if err != nil {
@@ -92,6 +100,9 @@ type p115Adapter struct {
 func (a *p115Adapter) ID() string     { return a.d.ID() }
 func (a *p115Adapter) Kind() string   { return a.d.Kind() }
 func (a *p115Adapter) RootID() string { return a.d.RootID() }
+func (a *p115Adapter) EnsureDir(ctx context.Context, pathFromRoot string) (string, error) {
+	return a.d.EnsureDir(ctx, pathFromRoot)
+}
 func (a *p115Adapter) UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
 	res, err := a.d.UploadAndReportSha1(ctx, parentID, name, r, size)
 	if err != nil {
@@ -103,6 +114,27 @@ func (a *p115Adapter) Rename(ctx context.Context, fileID, newName string) error 
 	return a.d.Rename(ctx, fileID, newName)
 }
 
+type onedriveAdapter struct {
+	d *onedrive.Driver
+}
+
+func (a *onedriveAdapter) ID() string     { return a.d.ID() }
+func (a *onedriveAdapter) Kind() string   { return a.d.Kind() }
+func (a *onedriveAdapter) RootID() string { return a.d.RootID() }
+func (a *onedriveAdapter) EnsureDir(ctx context.Context, pathFromRoot string) (string, error) {
+	return a.d.EnsureDir(ctx, pathFromRoot)
+}
+func (a *onedriveAdapter) UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
+	res, err := a.d.UploadAndReportHash(ctx, parentID, name, r, size)
+	if err != nil {
+		return UploadResult{}, err
+	}
+	return UploadResult{FileID: res.FileID, Hash: res.Hash, Size: res.Size}, nil
+}
+func (a *onedriveAdapter) Rename(ctx context.Context, fileID, newName string) error {
+	return a.d.Rename(ctx, fileID, newName)
+}
+
 // adaptUploadTarget 把通用 drive 包装成 uploadTarget。
 // 不支持的盘 kind 返回 error；调用方静默跳过。
 func adaptUploadTarget(d drives.Drive) (uploadTarget, error) {
@@ -111,6 +143,8 @@ func adaptUploadTarget(d drives.Drive) (uploadTarget, error) {
 		return &pikpakAdapter{d: v}, nil
 	case *p115.Driver:
 		return &p115Adapter{d: v}, nil
+	case *onedrive.Driver:
+		return &onedriveAdapter{d: v}, nil
 	case uploadTarget:
 		// 测试或自定义实现可以直接传入；优先使用具体类型分支以拿到适配器。
 		return v, nil
@@ -511,15 +545,19 @@ func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, src *spider
 	}
 	defer f.Close()
 
-	// 上传到目标盘的根目录（用户配置的目标 drive 的 rootID）。
+	// 上传到目标盘 rootID 下的固定 "91 Spider" 子目录。若用户把目标盘 rootID
+	// 配成某个自定义目录，这里会在该自定义目录下查找/创建 "91 Spider"。
 	// 上传名走 desiredPikPakName 算出来的方案 B 格式：
 	//
 	//   <sanitized title>-<viewkey 后 8 位>.<ext>
 	//
 	// 这样网盘 Web 端列出来的文件名能直接看出是哪个视频，
-	// 又用 viewkey 后 8 位避免同标题撞名。两个目标盘（PikPak / 115）共用同一格式，
+	// 又用 viewkey 后 8 位避免同标题撞名。所有目标盘共用同一格式，
 	// 简化前端 / catalog 的认知。
-	parent := pp.RootID()
+	parent, err := pp.EnsureDir(ctx, spider91UploadDirName)
+	if err != nil {
+		return false, fmt.Errorf("%s ensure %q dir: %w", pp.Kind(), spider91UploadDirName, err)
+	}
 	uploadName := desiredPikPakName(v.Title, extractViewKey(v.ID), v.Ext)
 	res, err := pp.UploadAndReportHash(ctx, parent, uploadName, f, info.Size())
 	if err != nil {
@@ -639,7 +677,7 @@ func (m *Migrator) cleanupOldLocalVideos(ctx context.Context, src *spider91.Driv
 	return deleted, nil
 }
 
-// backfillFileNames 扫描目标 drive（PikPak 或 115）下所有 spider91-* 起始 ID 的视频，
+// backfillFileNames 扫描目标 drive（PikPak、115 或 OneDrive）下所有 spider91-* 起始 ID 的视频，
 // 对文件名不是 desiredPikPakName(...) 期望格式的，调 target.Rename 修正，
 // 并把 catalog.file_name 同步到新名字。
 //

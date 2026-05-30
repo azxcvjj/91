@@ -77,7 +77,7 @@ export function checkUpdate() {
 
 export type AdminDrive = {
   id: string;
-  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "spider91";
+  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "localstorage" | "spider91";
   name: string;
   rootId: string;
   scanRootId: string;
@@ -96,12 +96,16 @@ export type AdminDrive = {
   lastCrawlAt?: number;
   thumbnailGenerationStatus?: DriveGenerationStatus;
   previewGenerationStatus?: DriveGenerationStatus;
+  fingerprintGenerationStatus?: DriveGenerationStatus;
   thumbnailReadyCount: number;
   thumbnailPendingCount: number;
   thumbnailFailedCount: number;
   teaserReadyCount: number;
   teaserPendingCount: number;
   teaserFailedCount: number;
+  fingerprintReadyCount: number;
+  fingerprintPendingCount: number;
+  fingerprintFailedCount: number;
 };
 
 export type DriveGenerationStatus = {
@@ -133,7 +137,7 @@ export function getDriveStorage() {
 
 export type UpsertDriveInput = {
   id: string;
-  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "spider91";
+  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "localstorage" | "spider91";
   name: string;
   rootId: string;
   scanRootId: string;
@@ -336,9 +340,9 @@ export type Theme = "dark" | "pink";
 export type Settings = {
   theme: Theme;
   /**
-   * spider91 视频迁移到云盘时的目标 drive ID（必须是已挂载的 pikpak 或 p115 drive）。
+   * spider91 视频迁移到云盘时的目标 drive ID（必须是已挂载的 pikpak、p115 或 onedrive drive）。
    * - 空字符串：本地保存，不上传到云盘。
-   * - 非空：显式指定。后端会校验 drive 存在且 kind ∈ {pikpak, p115}。
+   * - 非空：显式指定。后端会校验 drive 存在且 kind ∈ {pikpak, p115, onedrive}。
    */
   spider91UploadDriveId: string;
 };

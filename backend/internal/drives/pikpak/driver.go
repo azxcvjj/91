@@ -355,7 +355,60 @@ func (d *Driver) Rename(ctx context.Context, fileID, newName string) error {
 }
 
 func (d *Driver) EnsureDir(ctx context.Context, pathFromRoot string) (string, error) {
-	return "", drives.ErrNotSupported
+	currentID := d.rootID
+	for _, name := range splitPath(pathFromRoot) {
+		childID, err := d.findChildDir(ctx, currentID, name)
+		if err != nil {
+			return "", err
+		}
+		if childID == "" {
+			childID, err = d.makeDir(ctx, currentID, name)
+			if err != nil {
+				return "", err
+			}
+		}
+		currentID = childID
+	}
+	return currentID, nil
+}
+
+func (d *Driver) findChildDir(ctx context.Context, parentID, name string) (string, error) {
+	entries, err := d.List(ctx, parentID)
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		if e.IsDir && e.Name == name {
+			return e.ID, nil
+		}
+	}
+	return "", nil
+}
+
+func (d *Driver) makeDir(ctx context.Context, parentID, name string) (string, error) {
+	var out file
+	err := d.request(ctx, filesURL, http.MethodPost, func(req *resty.Request) {
+		req.SetBody(map[string]any{
+			"kind":      "drive#folder",
+			"parent_id": parentID,
+			"name":      name,
+		})
+	}, &out)
+	if err != nil {
+		return "", fmt.Errorf("pikpak mkdir %s: %w", name, err)
+	}
+	if out.ID == "" {
+		return "", fmt.Errorf("pikpak mkdir %s: empty folder id", name)
+	}
+	return out.ID, nil
+}
+
+func splitPath(p string) []string {
+	p = strings.Trim(p, "/")
+	if p == "" {
+		return nil
+	}
+	return strings.Split(p, "/")
 }
 
 func (d *Driver) getFiles(ctx context.Context, parentID string) ([]file, error) {

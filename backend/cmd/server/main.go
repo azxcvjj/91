@@ -25,6 +25,7 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/drives/localstorage"
 	"github.com/video-site/backend/internal/drives/localupload"
 	"github.com/video-site/backend/internal/drives/onedrive"
 	"github.com/video-site/backend/internal/drives/p115"
@@ -39,6 +40,8 @@ import (
 	"github.com/video-site/backend/internal/scanner"
 	"github.com/video-site/backend/internal/spider91migrate"
 )
+
+const fingerprintReconcileInterval = time.Minute
 
 func main() {
 	cfgPath := "./config.yaml"
@@ -79,7 +82,8 @@ func main() {
 		GetTargetDriveID: func() string { return app.Spider91UploadDriveID() },
 	})
 
-	// 初始化现有 drives
+	// 初始化本地内置盘；外部云盘放到 HTTP 服务启动后异步挂载，避免上游
+	// 登录态校验拖慢端口监听。
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -88,16 +92,7 @@ func main() {
 	if err := app.attachLocalUpload(ctx); err != nil {
 		log.Printf("[local-upload] attach failed: %v", err)
 	}
-
-	existing, err := cat.ListDrives(ctx)
-	if err != nil {
-		log.Fatalf("list drives: %v", err)
-	}
-	for _, d := range existing {
-		if err := app.attachDrive(ctx, d); err != nil {
-			log.Printf("[drive %s] attach failed: %v", d.ID, err)
-		}
-	}
+	go app.runFingerprintReconciler(ctx)
 
 	authr := &auth.Authenticator{
 		Username: cfg.Server.Admin.Username,
@@ -256,6 +251,7 @@ func main() {
 			log.Fatalf("server error: %v", err)
 		}
 	}()
+	go app.attachExistingDrives(ctx)
 
 	// 等待退出信号
 	sigs := make(chan os.Signal, 1)
@@ -283,13 +279,17 @@ type App struct {
 	// spider91Crawlers 按 driveID 索引，每个 spider91 drive 独立一个 Crawler
 	spider91Crawlers map[string]*spider91.Crawler
 
+	// driveAttachMu 串行化云盘挂载/重挂载。挂载会访问上游服务，可能较慢；
+	// 串行化可以避免启动后台挂载和手动扫盘按需挂载同一个 drive 时重复创建 worker。
+	driveAttachMu sync.Mutex
+
 	// 全站主题（"dark" | "pink"），从 DB 读
 	theme string
 	// 显式指定的 spider91 上传目标 drive ID。
-	// 空字符串表示本地保存不上传，不再自动挑选 pikpak/p115 drive。
+	// 空字符串表示本地保存不上传，不再自动挑选 pikpak/p115/onedrive drive。
 	spider91UploadDriveID string
 
-	// spider91Migrator 周期把 spider91 视频上传到目标 drive（PikPak 或 115）。
+	// spider91Migrator 周期把 spider91 视频上传到目标 drive（PikPak、115 或 OneDrive）。
 	spider91Migrator *spider91migrate.Migrator
 
 	// nightlyRunner 是凌晨流水线调度器：每天 cron_hour 串行跑扫盘 → 91 爬虫 → 迁移。
@@ -311,6 +311,11 @@ type App struct {
 	// scanQueued 跟踪哪些 driveID 已经排队或正在跑，去重后续重复点击。
 	// 一个 drive 在 scheduleScan 入队时被加入，在 runScan goroutine 结束时被移除。
 	scanQueued map[string]bool
+
+	// fingerprintQueueing 去重每个 drive 的 pending 指纹补队列任务，避免定时
+	// reconcile 和扫盘结束同时为同一批 pending 视频启动多个长时间入队 goroutine。
+	fingerprintQueueMu  sync.Mutex
+	fingerprintQueueing map[string]bool
 }
 
 // teaserEnabledForDrive 查询某个 drive 当前的 per-drive teaser 开关。
@@ -375,7 +380,7 @@ func (a *App) loadTheme(ctx context.Context) {
 }
 
 // Spider91UploadDriveID 返回当前配置的 spider91 上传目标 drive ID。
-// 空字符串表示本地保存不上传；只有管理员显式选择 pikpak/p115 drive 时才迁移上传。
+// 空字符串表示本地保存不上传；只有管理员显式选择 pikpak/p115/onedrive drive 时才迁移上传。
 func (a *App) Spider91UploadDriveID() string {
 	a.mu.Lock()
 	explicit := a.spider91UploadDriveID
@@ -392,7 +397,7 @@ func (a *App) Spider91UploadDriveID() string {
 
 // SetSpider91UploadDriveID 设置 spider91 上传目标 drive ID 并持久化。
 // 接受空字符串（本地保存不上传）。
-// 设置一个不存在或 kind 不是 pikpak / p115 的 drive 会返回错误。
+// 设置一个不存在或 kind 不是 pikpak / p115 / onedrive 的 drive 会返回错误。
 func (a *App) SetSpider91UploadDriveID(ctx context.Context, driveID string) error {
 	driveID = strings.TrimSpace(driveID)
 	if driveID != "" {
@@ -401,7 +406,7 @@ func (a *App) SetSpider91UploadDriveID(ctx context.Context, driveID string) erro
 			return fmt.Errorf("drive %q not found", driveID)
 		}
 		if !isSpider91UploadKind(d.Kind()) {
-			return fmt.Errorf("drive %q kind=%s, only pikpak or p115 can be spider91 upload target", driveID, d.Kind())
+			return fmt.Errorf("drive %q kind=%s, only pikpak, p115 or onedrive can be spider91 upload target", driveID, d.Kind())
 		}
 	}
 	a.mu.Lock()
@@ -413,7 +418,7 @@ func (a *App) SetSpider91UploadDriveID(ctx context.Context, driveID string) erro
 // isSpider91UploadKind 是 spider91 迁移目标盘的 allowlist。
 // 与 spider91migrate.adaptUploadTarget 的支持范围保持一致。
 func isSpider91UploadKind(kind string) bool {
-	return kind == "pikpak" || kind == "p115"
+	return kind == "pikpak" || kind == "p115" || kind == "onedrive"
 }
 
 // loadSpider91UploadDriveID 从 DB 读上传目标 drive ID 设置；不存在时使用空串。
@@ -438,9 +443,13 @@ func (a *App) driveGenerationStatuses() map[string]api.DriveGenerationStatuses {
 	for id, worker := range a.thumbWorkers {
 		thumbWorkers[id] = worker
 	}
+	fingerprintWorkers := make(map[string]*fingerprint.Worker, len(a.fingerprintWorkers))
+	for id, worker := range a.fingerprintWorkers {
+		fingerprintWorkers[id] = worker
+	}
 	a.mu.Unlock()
 
-	out := make(map[string]api.DriveGenerationStatuses, len(previewWorkers)+len(thumbWorkers))
+	out := make(map[string]api.DriveGenerationStatuses, len(previewWorkers)+len(thumbWorkers)+len(fingerprintWorkers))
 	for id, worker := range previewWorkers {
 		status := out[id]
 		status.Preview = generationStatusFromPreview(worker.Status())
@@ -451,11 +460,25 @@ func (a *App) driveGenerationStatuses() map[string]api.DriveGenerationStatuses {
 		status.Thumbnail = generationStatusFromPreview(worker.Status())
 		missing, err := a.cat.CountVideosNeedingThumbnail(context.Background(), id)
 		if err != nil {
-			log.Printf("[thumb] count missing thumbnails %s: %v", id, err)
+			log.Printf("[thumb] count thumbnail work %s: %v", id, err)
 		} else {
 			status.Thumbnail.QueueLength = missing
 			if missing > 0 && status.Thumbnail.State == "idle" {
 				status.Thumbnail.State = "queued"
+			}
+		}
+		out[id] = status
+	}
+	for id, worker := range fingerprintWorkers {
+		status := out[id]
+		status.Fingerprint = generationStatusFromFingerprint(worker.Status())
+		pending, err := a.cat.CountVideosNeedingFingerprint(context.Background(), id)
+		if err != nil {
+			log.Printf("[fingerprint] count pending fingerprints %s: %v", id, err)
+		} else {
+			status.Fingerprint.QueueLength = pending
+			if pending > 0 && status.Fingerprint.State == "idle" {
+				status.Fingerprint.State = "queued"
 			}
 		}
 		out[id] = status
@@ -479,7 +502,67 @@ func generationStatusFromPreview(status preview.TaskStatus) api.GenerationStatus
 	return out
 }
 
+func generationStatusFromFingerprint(status fingerprint.TaskStatus) api.GenerationStatus {
+	state := status.State
+	if state == "" {
+		state = "idle"
+	}
+	out := api.GenerationStatus{
+		State:        state,
+		CurrentTitle: status.CurrentTitle,
+		QueueLength:  status.QueueLength,
+	}
+	if !status.CooldownUntil.IsZero() {
+		out.CooldownUntil = status.CooldownUntil.Format(time.RFC3339)
+	}
+	return out
+}
+
 func (a *App) attachDrive(ctx context.Context, d *catalog.Drive) error {
+	a.driveAttachMu.Lock()
+	defer a.driveAttachMu.Unlock()
+	return a.attachDriveUnlocked(ctx, d)
+}
+
+func (a *App) ensureDriveAttached(ctx context.Context, driveID string) error {
+	if _, ok := a.registry.Get(driveID); ok {
+		return nil
+	}
+	a.driveAttachMu.Lock()
+	defer a.driveAttachMu.Unlock()
+	if _, ok := a.registry.Get(driveID); ok {
+		return nil
+	}
+	d, err := a.cat.GetDrive(ctx, driveID)
+	if err != nil {
+		return err
+	}
+	return a.attachDriveUnlocked(ctx, d)
+}
+
+func (a *App) attachExistingDrives(ctx context.Context) {
+	existing, err := a.cat.ListDrives(ctx)
+	if err != nil {
+		log.Printf("[drive] list existing drives: %v", err)
+		return
+	}
+	log.Printf("[drive] attaching %d configured drive(s) in background", len(existing))
+	for _, d := range existing {
+		if err := ctx.Err(); err != nil {
+			log.Printf("[drive] background attach stopped: %v", err)
+			return
+		}
+		if err := a.attachDrive(ctx, d); err != nil {
+			log.Printf("[drive %s] attach failed: %v", d.ID, err)
+		}
+	}
+	log.Printf("[drive] background attach complete")
+}
+
+func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
+	if d == nil {
+		return errors.New("nil drive")
+	}
 	var drv drives.Drive
 	switch d.Kind {
 	case "quark":
@@ -550,6 +633,11 @@ func (a *App) attachDrive(ctx context.Context, d *catalog.Drive) error {
 				_ = a.cat.UpsertDrive(ctx, d)
 			},
 		})
+	case localstorage.Kind:
+		drv = localstorage.New(localstorage.Config{
+			ID:       d.ID,
+			RootPath: d.Credentials["path"],
+		})
 	case spider91.Kind:
 		drv = spider91.New(spider91.Config{
 			ID:      d.ID,
@@ -583,7 +671,7 @@ func (a *App) attachDrive(ctx context.Context, d *catalog.Drive) error {
 	})
 	worker := preview.NewWorker(gen, a.cat, drv)
 	thumbWorker := preview.NewThumbWorker(gen, a.cat, drv)
-	fingerprintWorker := fingerprint.NewWorker(a.cat, drv, fingerprint.Config{})
+	fingerprintWorker := fingerprint.NewWorker(a.cat, drv, fingerprintConfigForDrive(drv))
 
 	workerCtx, cancel := context.WithCancel(ctx)
 	go worker.Run(workerCtx)
@@ -617,7 +705,7 @@ func (a *App) attachLocalUpload(ctx context.Context) error {
 	})
 	worker := preview.NewWorker(gen, a.cat, drv)
 	thumbWorker := preview.NewThumbWorker(gen, a.cat, drv)
-	fingerprintWorker := fingerprint.NewWorker(a.cat, drv, fingerprint.Config{})
+	fingerprintWorker := fingerprint.NewWorker(a.cat, drv, fingerprintConfigForDrive(drv))
 
 	workerCtx, cancel := context.WithCancel(ctx)
 	go worker.Run(workerCtx)
@@ -630,6 +718,20 @@ func (a *App) attachLocalUpload(ctx context.Context) error {
 
 func (a *App) localUploadDir() string {
 	return filepath.Join(filepath.Dir(a.cfg.Storage.LocalPreviewDir), "uploads")
+}
+
+func fingerprintConfigForDrive(drv drives.Drive) fingerprint.Config {
+	cfg := fingerprint.Config{RateLimitCooldown: 5 * time.Minute}
+	if drv == nil {
+		return cfg
+	}
+	switch strings.ToLower(drv.Kind()) {
+	case "p115", "onedrive":
+		cfg.RateLimitCooldown = 10 * time.Minute
+	case "pikpak":
+		cfg.RateLimitCooldown = 5 * time.Minute
+	}
+	return cfg
 }
 
 // spider91RootDir 是所有 spider91 drive 共享的根目录。
@@ -755,19 +857,9 @@ func (a *App) registerPreviewWorkers(ctx context.Context, driveID string, worker
 	}
 	a.mu.Unlock()
 
-	if worker != nil {
-		if thumbWorker != nil {
-			worker.BeforeTask = func(taskCtx context.Context) bool {
-				return a.waitForThumbnailsBeforePreview(taskCtx, driveID)
-			}
-		} else {
-			worker.BeforeTask = nil
-		}
-	}
-
 	go a.enqueueDriveGeneration(ctx, driveID, worker, thumbWorker)
 	if fingerprintWorker != nil {
-		go a.enqueueFingerprints(ctx, driveID, fingerprintWorker)
+		a.scheduleFingerprintBackfill(ctx, driveID, fingerprintWorker)
 	}
 }
 
@@ -792,43 +884,14 @@ func (a *App) enqueuePending(ctx context.Context, driveID string, w *preview.Wor
 func (a *App) enqueueDriveGeneration(ctx context.Context, driveID string, worker *preview.Worker, thumbWorker *preview.ThumbWorker) {
 	// 封面 worker 始终入队（与早期"全局 preview.enabled=false 时仍然生成封面"
 	// 的行为一致）；teaser worker 仅在该 drive 的 TeaserEnabled 为 true 时入队。
+	// 两条队列互不等待，避免封面批量生成拖住预览视频生成。
 	if thumbWorker != nil {
 		a.enqueueThumbnails(ctx, driveID, thumbWorker)
 	}
 	if worker == nil || !a.teaserEnabledForDrive(ctx, driveID) {
 		return
 	}
-	if thumbWorker != nil && !a.waitForThumbnailsBeforePreview(ctx, driveID) {
-		return
-	}
 	a.enqueuePending(ctx, driveID, worker)
-}
-
-func (a *App) waitForThumbnailsBeforePreview(ctx context.Context, driveID string) bool {
-	const pollInterval = time.Second
-	var lastLog time.Time
-	for {
-		missing, err := a.cat.CountVideosNeedingThumbnail(ctx, driveID)
-		if err != nil {
-			log.Printf("[preview] count missing thumbnails drive=%s: %v", driveID, err)
-			return false
-		}
-		if missing == 0 {
-			return true
-		}
-		now := time.Now()
-		if lastLog.IsZero() || now.Sub(lastLog) >= time.Minute {
-			log.Printf("[preview] drive=%s waiting for %d thumbnails before teaser generation", driveID, missing)
-			lastLog = now
-		}
-		timer := time.NewTimer(pollInterval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return false
-		case <-timer.C:
-		}
-	}
 }
 
 func (a *App) enqueueThumbnails(ctx context.Context, driveID string, w *preview.ThumbWorker) {
@@ -840,13 +903,63 @@ func (a *App) enqueueThumbnails(ctx context.Context, driveID string, w *preview.
 	if len(pending) == 0 {
 		return
 	}
-	log.Printf("[thumb] enqueue %d missing thumbnails for drive=%s", len(pending), driveID)
+	log.Printf("[thumb] enqueue %d thumbnail/duration tasks for drive=%s", len(pending), driveID)
 	for _, v := range pending {
 		if !w.EnqueueBlocking(ctx, v) {
-			log.Printf("[thumb] enqueue missing thumbnails canceled for drive=%s", driveID)
+			log.Printf("[thumb] enqueue thumbnail/duration tasks canceled for drive=%s", driveID)
 			return
 		}
 	}
+}
+
+func (a *App) runFingerprintReconciler(ctx context.Context) {
+	ticker := time.NewTicker(fingerprintReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.enqueueAllPendingFingerprints(ctx)
+		}
+	}
+}
+
+func (a *App) enqueueAllPendingFingerprints(ctx context.Context) {
+	a.mu.Lock()
+	workers := make(map[string]*fingerprint.Worker, len(a.fingerprintWorkers))
+	for id, worker := range a.fingerprintWorkers {
+		workers[id] = worker
+	}
+	a.mu.Unlock()
+	for driveID, worker := range workers {
+		a.scheduleFingerprintBackfill(ctx, driveID, worker)
+	}
+}
+
+func (a *App) scheduleFingerprintBackfill(ctx context.Context, driveID string, w *fingerprint.Worker) {
+	if w == nil {
+		return
+	}
+	a.fingerprintQueueMu.Lock()
+	if a.fingerprintQueueing == nil {
+		a.fingerprintQueueing = make(map[string]bool)
+	}
+	if a.fingerprintQueueing[driveID] {
+		a.fingerprintQueueMu.Unlock()
+		return
+	}
+	a.fingerprintQueueing[driveID] = true
+	a.fingerprintQueueMu.Unlock()
+
+	go func() {
+		defer func() {
+			a.fingerprintQueueMu.Lock()
+			delete(a.fingerprintQueueing, driveID)
+			a.fingerprintQueueMu.Unlock()
+		}()
+		a.enqueueFingerprints(ctx, driveID, w)
+	}()
 }
 
 func (a *App) enqueueFingerprints(ctx context.Context, driveID string, w *fingerprint.Worker) {
@@ -974,6 +1087,10 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 	a.scanGlobalMu.Lock()
 	defer a.scanGlobalMu.Unlock()
 
+	if err := a.ensureDriveAttached(ctx, driveID); err != nil {
+		log.Printf("[scan] drive %s attach failed: %v", driveID, err)
+		return
+	}
 	drv, ok := a.registry.Get(driveID)
 	if !ok {
 		log.Printf("[scan] drive %s not attached", driveID)
@@ -986,12 +1103,12 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 	fingerprintWorker := a.fingerprintWorkers[driveID]
 	a.mu.Unlock()
 
-	var onNew func(v *catalog.Video)
-	if thumbWorker != nil {
-		onNew = func(v *catalog.Video) {
-			if thumbWorker != nil && v.ThumbnailURL == "" {
-				thumbWorker.Enqueue(v)
-			}
+	onNew := func(v *catalog.Video) {
+		if thumbWorker != nil && v.ThumbnailURL == "" {
+			thumbWorker.Enqueue(v)
+		}
+		if fingerprintWorker != nil {
+			fingerprintWorker.Enqueue(v)
 		}
 	}
 
@@ -1035,8 +1152,8 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 			}
 		}
 	}
+	a.scheduleFingerprintBackfill(ctx, driveID, fingerprintWorker)
 	a.enqueueDriveGeneration(ctx, driveID, worker, thumbWorker)
-	a.enqueueFingerprints(ctx, driveID, fingerprintWorker)
 }
 
 func (a *App) cleanupMissingDriveVideos(ctx context.Context, driveID string, liveFileIDs map[string]struct{}, visitedDirIDs map[string]struct{}, fullDriveScan bool) (int, error) {
@@ -1390,26 +1507,36 @@ func (a *App) regenFailedThumbnails(ctx context.Context, driveID string) {
 }
 
 // listScanTargetIDs 返回 nightly Phase 1 应扫描的所有 drive ID
-// （非 spider91、非 localupload）。顺序按 registry.All 给的稳定顺序。
-func (a *App) listScanTargetIDs(_ context.Context) []string {
-	all := a.registry.All()
+// （非 spider91、非 localupload）。它直接读 catalog，而不是 registry，这样
+// 进程刚启动、云盘还在后台挂载时，nightly 也不会漏掉配置过的 drive。
+func (a *App) listScanTargetIDs(ctx context.Context) []string {
+	all, err := a.cat.ListDrives(ctx)
+	if err != nil {
+		log.Printf("[nightly] list scan target drives: %v", err)
+		return nil
+	}
 	out := make([]string, 0, len(all))
 	for _, d := range all {
-		if !shouldScanDrive(d) {
+		if d == nil || d.ID == localupload.DriveID || d.Kind == spider91.Kind {
 			continue
 		}
-		out = append(out, d.ID())
+		out = append(out, d.ID)
 	}
 	return out
 }
 
 // listSpider91DriveIDs 返回 nightly Phase 2 应触发爬取的 spider91 drive ID 列表。
-func (a *App) listSpider91DriveIDs(_ context.Context) []string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	out := make([]string, 0, len(a.spider91Crawlers))
-	for id := range a.spider91Crawlers {
-		out = append(out, id)
+func (a *App) listSpider91DriveIDs(ctx context.Context) []string {
+	all, err := a.cat.ListDrives(ctx)
+	if err != nil {
+		log.Printf("[nightly] list spider91 drives: %v", err)
+		return nil
+	}
+	out := make([]string, 0, len(all))
+	for _, d := range all {
+		if d != nil && d.Kind == spider91.Kind {
+			out = append(out, d.ID)
+		}
 	}
 	return out
 }
@@ -1417,8 +1544,8 @@ func (a *App) listSpider91DriveIDs(_ context.Context) []string {
 // waitAllPreviewQueuesIdle 阻塞直到所有 drive 的封面 worker 和 teaser worker
 // 队列都为空且无 in-flight 任务。
 //
-// 顺序：先等所有 thumb worker（因为 enqueueDriveGeneration 内部已经先等当前
-// drive 的封面再入队 teaser，但这里是跨 drive 的全局同步），再等所有 teaser。
+// 顺序：先等所有 thumb worker，再等所有 teaser。两个队列生成时互不等待；
+// nightly 只在 phase 边界统一等待它们都 drain。
 // 若 ctx 在等待中被取消（软超时 / shutdown），立即返回 ctx.Err。
 func (a *App) waitAllPreviewQueuesIdle(ctx context.Context) error {
 	a.mu.Lock()
@@ -1468,7 +1595,17 @@ func (a *App) runSpider91Crawl(ctx context.Context, driveID string) {
 	c := a.spider91Crawlers[driveID]
 	a.mu.Unlock()
 	if c == nil {
-		return
+		if err := a.ensureDriveAttached(ctx, driveID); err != nil {
+			log.Printf("[spider91] drive=%s attach failed: %v", driveID, err)
+			return
+		}
+		a.mu.Lock()
+		c = a.spider91Crawlers[driveID]
+		a.mu.Unlock()
+		if c == nil {
+			log.Printf("[spider91] drive=%s crawler not attached", driveID)
+			return
+		}
 	}
 
 	d, err := a.cat.GetDrive(ctx, driveID)
@@ -1517,8 +1654,8 @@ func (a *App) runSpider91Crawl(ctx context.Context, driveID string) {
 	thumbWorker := a.thumbWorkers[driveID]
 	fingerprintWorker := a.fingerprintWorkers[driveID]
 	a.mu.Unlock()
+	a.scheduleFingerprintBackfill(ctx, driveID, fingerprintWorker)
 	a.enqueueDriveGeneration(ctx, driveID, worker, thumbWorker)
-	a.enqueueFingerprints(ctx, driveID, fingerprintWorker)
 }
 
 // spider91IntCred 解析 credentials 中的整数字段，缺省时返回 def。
