@@ -194,6 +194,54 @@ func TestHandleCheckUpdateReportsUpToDate(t *testing.T) {
 	}
 }
 
+func TestHandleCheckUpdateUsesDockerImageVersion(t *testing.T) {
+	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"tag_name": "v0.2.0",
+			"html_url": "https://github.com/nianzhibai/91/releases/tag/v0.2.0",
+		})
+	}))
+	t.Cleanup(releaseServer.Close)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/update/check", nil)
+	rr := httptest.NewRecorder()
+	(&AdminServer{
+		ImageVersion:  "v0.1.0",
+		ReleaseAPIURL: releaseServer.URL,
+	}).handleCheckUpdate(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got updateCheckDTO
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.CurrentVersion != "v0.1.0" {
+		t.Fatalf("currentVersion = %q, want v0.1.0", got.CurrentVersion)
+	}
+	if !got.HasUpdate {
+		t.Fatalf("hasUpdate = false, want true")
+	}
+}
+
+func TestInstalledVersionPrefersDockerImageVersionOverVersionFile(t *testing.T) {
+	dir := t.TempDir()
+	versionFile := filepath.Join(dir, ".version")
+	if err := os.WriteFile(versionFile, []byte("v0.1.0\n"), 0o644); err != nil {
+		t.Fatalf("write version file: %v", err)
+	}
+
+	got := (&AdminServer{
+		VersionFilePath: versionFile,
+		ImageVersion:    "v0.2.0",
+	}).installedVersion()
+
+	if got != "v0.2.0" {
+		t.Fatalf("installedVersion = %q, want v0.2.0", got)
+	}
+}
+
 func TestHandleUpsertDrivePreservesExistingCredentialsWhenRequestCredentialsEmpty(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")

@@ -23,6 +23,10 @@ type AdminServer struct {
 	Auth    *auth.Authenticator
 	// VersionFilePath points to the installer-written .version file.
 	VersionFilePath string
+	// ImageVersion is the Docker image version injected at build/runtime.
+	// It takes precedence over VersionFilePath because Docker data volumes can
+	// keep an older .version file across image upgrades.
+	ImageVersion string
 	// GitHubRepo is the owner/name repo used for update checks.
 	GitHubRepo string
 	// ReleaseAPIURL and HTTPClient are injectable for tests. Production code leaves them empty.
@@ -279,6 +283,9 @@ func (a *AdminServer) checkUpdate(ctx context.Context) (updateCheckDTO, error) {
 }
 
 func (a *AdminServer) installedVersion() string {
+	if version := strings.TrimSpace(a.ImageVersion); version != "" {
+		return version
+	}
 	path := strings.TrimSpace(a.VersionFilePath)
 	if path == "" {
 		path = ".version"

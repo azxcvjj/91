@@ -125,6 +125,7 @@ func main() {
 		Catalog:         cat,
 		Auth:            authr,
 		VersionFilePath: versionFilePath,
+		ImageVersion:    strings.TrimSpace(os.Getenv("VIDEO_IMAGE_VERSION")),
 		GitHubRepo:      githubRepo,
 		SetupRequired: func() bool {
 			setupMu.Lock()
