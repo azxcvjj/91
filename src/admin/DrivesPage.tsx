@@ -26,6 +26,7 @@ const kindLabel: Record<string, string> = {
   pikpak: "PikPak",
   wopan: "联通沃盘",
   onedrive: "OneDrive",
+  googledrive: "Google Drive",
   localstorage: "本地存储",
   spider91: "91 爬虫",
 };
@@ -41,7 +42,6 @@ type FormState = {
   kind: Kind;
   name: string;
   rootId: string;
-  scanRootId: string;
   creds: Record<string, string>;
   /**
    * spider91 专用字段：把视频迁移到云盘的目标 drive ID。
@@ -58,16 +58,36 @@ const emptyForm: FormState = {
   id: "",
   kind: "p115",
   name: "",
-  rootId: "0",
-  scanRootId: "0",
+  rootId: "",
   creds: {},
   spider91UploadDriveId: "",
 };
+
+const idleNightlyStatus: api.NightlyJobStatus = {
+  state: "idle",
+  running: false,
+  queued: false,
+};
+
+function nightlyButtonText(status: api.NightlyJobStatus, triggering: boolean) {
+  if (triggering) return "触发中...";
+  if (status.running) return "扫描运行中";
+  if (status.queued) return "扫描已排队";
+  return "扫描所有网盘";
+}
+
+function nightlyBusyText(status: api.NightlyJobStatus) {
+  if (status.running) return "扫描任务正在运行";
+  if (status.queued) return "扫描任务已排队";
+  return "";
+}
 
 export function DrivesPage() {
   const [list, setList] = useState<api.AdminDrive[]>([]);
   const [storage, setStorage] = useState<api.AdminDriveStorage | null>(null);
   const [settings, setSettings] = useState<api.Settings | null>(null);
+  const [nightlyStatus, setNightlyStatus] =
+    useState<api.NightlyJobStatus>(idleNightlyStatus);
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
   const [form, setForm] = useState<FormState>(emptyForm);
@@ -78,8 +98,10 @@ export function DrivesPage() {
   const [regenFailedThumbId, setRegenFailedThumbId] = useState("");
   // togglingTeaserId 在请求未返回前禁用按钮，避免连点导致两次切换互相覆盖。
   const [togglingTeaserId, setTogglingTeaserId] = useState("");
+  const [scanningAll, setScanningAll] = useState(false);
   const [selectedDriveId, setSelectedDriveId] = useState<string | null>(null);
   const { show } = useToast();
+  const nightlyBusy = scanningAll || nightlyStatus.running || nightlyStatus.queued;
 
   // 当前系统中可作为 spider91 上传目标的 drive 列表（pikpak ∪ p115 ∪ onedrive）。
   // 用户保存 spider91 drive 时从这里挑一个；空表示本地保存不上传。
@@ -91,14 +113,16 @@ export function DrivesPage() {
   async function refresh() {
     setLoading(true);
     try {
-      const [data, storageData, settingsData] = await Promise.all([
+      const [data, storageData, settingsData, jobStatus] = await Promise.all([
         api.listDrives(),
         api.getDriveStorage(),
         api.getSettings().catch(() => null),
+        api.getNightlyJobStatus().catch(() => null),
       ]);
       setList(data ?? []);
       setStorage(storageData);
       if (settingsData) setSettings(settingsData);
+      if (jobStatus) setNightlyStatus(jobStatus);
     } catch (e) {
       show(e instanceof Error ? e.message : "加载失败", "error");
     } finally {
@@ -108,8 +132,12 @@ export function DrivesPage() {
 
   async function refreshDriveList() {
     try {
-      const data = await api.listDrives();
+      const [data, jobStatus] = await Promise.all([
+        api.listDrives(),
+        api.getNightlyJobStatus().catch(() => null),
+      ]);
       setList(data ?? []);
+      if (jobStatus) setNightlyStatus(jobStatus);
     } catch {
       // 保持当前页面状态，下一次轮询或手动操作再刷新。
     }
@@ -141,7 +169,6 @@ export function DrivesPage() {
       kind: d.kind,
       name: d.name,
       rootId: d.rootId,
-      scanRootId: d.scanRootId || d.rootId,
       creds: {},
       spider91UploadDriveId: settings?.spider91UploadDriveId ?? "",
     });
@@ -158,6 +185,7 @@ export function DrivesPage() {
     const driveID = existing
       ? form.id
       : makeUniqueDriveId(form.kind, name, list);
+    const rootId = form.rootId.trim() || defaultRootId(form.kind);
     // 若编辑且没有提供凭证，提示一下但仍允许保存（不改凭证）
     setSaving(true);
     try {
@@ -165,8 +193,7 @@ export function DrivesPage() {
         id: driveID,
         kind: form.kind,
         name,
-        rootId: form.rootId || defaultRootId(form.kind),
-        scanRootId: form.scanRootId || form.rootId || defaultRootId(form.kind),
+        rootId,
         credentials: form.creds,
       });
 
@@ -233,14 +260,26 @@ export function DrivesPage() {
   /**
    * 立即触发完整凌晨流水线（Phase1 扫所有云盘 → Phase2 spider91 爬虫 →
    * Phase3 spider91 → 云盘迁移）。后端立即返回 202；进度看 backend 日志。
-   * 如果当前已有流水线在跑，后端最多保留一个待触发请求，当前轮结束后再跑一轮。
+   * 如果当前已有流水线在跑或已排队，前端只提示，不再提交新任务。
    */
   async function handleRunNightly() {
+    if (nightlyBusy) {
+      show(nightlyBusyText(nightlyStatus) || "当前已有扫描所有网盘任务", "info");
+      return;
+    }
+    setScanningAll(true);
     try {
-      await api.runNightlyJob();
-      show("已触发扫描所有网盘，耗时较长，可在 backend 日志观察进度", "success");
+      const resp = await api.runNightlyJob();
+      setNightlyStatus(resp.status);
+      if (resp.accepted) {
+        show("已触发扫描所有网盘，耗时较长，可在任务状态和 backend 日志观察进度", "success");
+      } else {
+        show("当前已有扫描所有网盘任务", "info");
+      }
     } catch (e) {
       show(e instanceof Error ? e.message : "触发失败", "error");
+    } finally {
+      setScanningAll(false);
     }
   }
 
@@ -362,10 +401,6 @@ export function DrivesPage() {
                       <span className="admin-detail-label">根目录 ID</span>
                       <span className="admin-detail-value admin-mono-cell">{d.rootId}</span>
                     </div>
-                    <div className="admin-detail-row">
-                      <span className="admin-detail-label">扫描起点 ID</span>
-                      <span className="admin-detail-value admin-mono-cell">{d.scanRootId || d.rootId}</span>
-                    </div>
                   </>
                 )}
                 {d.kind === "spider91" && (
@@ -463,6 +498,7 @@ export function DrivesPage() {
                       ready={d.thumbnailReadyCount}
                       pending={d.thumbnailPendingCount}
                       failed={d.thumbnailFailedCount}
+                      durationPending={d.thumbnailDurationPendingCount}
                     />
                   </div>
                 </div>
@@ -587,9 +623,10 @@ export function DrivesPage() {
             type="button"
             className="admin-btn"
             onClick={handleRunNightly}
-            title="立即扫描所有网盘。耗时较长，期间不要重复触发。"
+            disabled={scanningAll}
+            title={nightlyBusyText(nightlyStatus) || "立即扫描所有网盘。耗时较长，期间不要重复触发。"}
           >
-            <PlayCircle size={14} /> 扫描所有网盘
+            <PlayCircle size={14} /> {nightlyButtonText(nightlyStatus, scanningAll)}
           </button>
           <button className="admin-btn is-primary" onClick={openCreate}>
             <Plus size={14} /> 新建网盘
@@ -721,10 +758,12 @@ function GenerationCounts({
   ready,
   pending,
   failed,
+  durationPending,
 }: {
   ready?: number;
   pending?: number;
   failed?: number;
+  durationPending?: number;
 }) {
   return (
     <div className="admin-generation-counts">
@@ -737,6 +776,11 @@ function GenerationCounts({
       <span className="admin-drive-teaser__metric is-failed">
         失败 {failed ?? 0}
       </span>
+      {(durationPending ?? 0) > 0 && (
+        <span className="admin-drive-teaser__metric">
+          待补时长 {durationPending}
+        </span>
+      )}
     </div>
   );
 }
@@ -752,7 +796,7 @@ function GenerationStatusLine({
   const queueLength = status?.queueLength ?? 0;
   const detail = generationDetail(status);
   const title = generationTitle(status, detail);
-  const countText = queueLength > 0 ? `${label === "封面" ? "剩余" : "队列"} ${queueLength}` : "";
+  const countText = queueLength > 0 ? `${label === "封面" ? "待处理" : "队列"} ${queueLength}` : "";
 
   return (
     <div className="admin-generation-row" title={title}>
@@ -863,11 +907,6 @@ function DriveForm({
 }) {
   const fields = useMemo(() => credentialFields(form.kind), [form.kind]);
   const help = credentialHelp(form.kind, isEdit);
-  const showDirectoryFields =
-    form.kind !== "spider91" &&
-    form.kind !== "onedrive" &&
-    form.kind !== "localstorage" &&
-    form.kind !== "pikpak";
 
   function set<K extends keyof FormState>(k: K, v: FormState[K]) {
     onChange({ ...form, [k]: v });
@@ -879,8 +918,7 @@ function DriveForm({
     onChange({
       ...form,
       kind: v,
-      rootId: defaultRootId(v),
-      scanRootId: defaultRootId(v),
+      rootId: "",
       creds: {},
     });
   }
@@ -905,35 +943,24 @@ function DriveForm({
           <option value="p115">115 网盘</option>
           <option value="pikpak">PikPak</option>
           <option value="onedrive">OneDrive</option>
+          <option value="googledrive">Google Drive</option>
           <option value="localstorage">本地存储</option>
           <option value="spider91">91 Spider</option>
           <option value="quark">夸克网盘</option>
           <option value="wopan">联通沃盘</option>
         </select>
       </div>
-      {showDirectoryFields && (
-        <>
-          <div className="admin-form__row">
-            <label>根目录 ID</label>
-            <input
-              value={form.rootId}
-              onChange={(e) => set("rootId", e.target.value)}
-              placeholder={form.kind === "pikpak" ? "留空表示根目录" : form.kind === "onedrive" ? "root" : "0"}
-            />
-          </div>
-          <div className="admin-form__row">
-            <label>扫描起点目录 ID</label>
-            <input
-              value={form.scanRootId}
-              onChange={(e) => set("scanRootId", e.target.value)}
-              placeholder="留空则使用根目录"
-            />
-            <div className="admin-form__help">
-              可以指定一个子目录作为视频库入口，避免扫描整个网盘
-            </div>
-          </div>
-        </>
-      )}
+      <div className="admin-form__row">
+        <label>根目录 ID</label>
+        <input
+          value={form.rootId}
+          onChange={(e) => set("rootId", e.target.value)}
+          placeholder={rootIdPlaceholder(form.kind)}
+        />
+        <div className="admin-form__help">
+          留空时使用该网盘类型的默认根目录，具体目录ID获取方式请参考OpenList文档
+        </div>
+      </div>
 
       {(help || fields.length > 0) && (
         <>
@@ -1031,6 +1058,8 @@ function credentialHelp(kind: Kind, isEdit: boolean): string {
       return `需要 access_token 和 refresh_token。后续会加扫码/短信登录入口，第一版只能手工粘贴。${note}`;
     case "onedrive":
       return `按 OpenList 默认应用在线挂载，只需要 refresh_token；保存时会自动刷新并保存 token。${note}`;
+    case "googledrive":
+      return `按 OpenList 在线 API 挂载，只需要 Google Drive refresh_token；保存时会自动刷新并保存 token。播放不走 302，会由后端带 Authorization 代理转发。${note}`;
     case "localstorage":
       return `把服务器上的一个已有目录作为视频来源扫描。填写绝对路径，例如 /mnt/videos；系统会读取该目录及子目录中的视频，并生成封面、Teaser 和指纹。${note}`;
     case "spider91":
@@ -1114,6 +1143,16 @@ function credentialFields(kind: Kind): Array<{
           required: true,
         },
       ];
+    case "googledrive":
+      return [
+        {
+          key: "refresh_token",
+          label: "refresh_token",
+          placeholder: "OpenList Google Drive refresh_token",
+          multiline: true,
+          required: true,
+        },
+      ];
     case "localstorage":
       return [
         {
@@ -1132,9 +1171,15 @@ function credentialFields(kind: Kind): Array<{
 function defaultRootId(kind: Kind): string {
   if (kind === "pikpak") return "";
   if (kind === "onedrive") return "root";
+  if (kind === "googledrive") return "root";
   if (kind === "localstorage") return "/";
   if (kind === "spider91") return "/";
   return "0";
+}
+
+function rootIdPlaceholder(kind: Kind): string {
+  const rootId = defaultRootId(kind);
+  return rootId ? `默认：${rootId}` : "留空表示根目录";
 }
 
 

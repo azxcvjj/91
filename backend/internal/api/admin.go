@@ -23,6 +23,10 @@ type AdminServer struct {
 	Auth    *auth.Authenticator
 	// VersionFilePath points to the installer-written .version file.
 	VersionFilePath string
+	// ImageVersion is the Docker image version injected at build/runtime.
+	// It takes precedence over VersionFilePath because Docker data volumes can
+	// keep an older .version file across image upgrades.
+	ImageVersion string
 	// GitHubRepo is the owner/name repo used for update checks.
 	GitHubRepo string
 	// ReleaseAPIURL and HTTPClient are injectable for tests. Production code leaves them empty.
@@ -55,8 +59,10 @@ type AdminServer struct {
 	SetSpider91UploadDriveID func(driveID string) error
 	// OnRunNightlyJob 触发一次完整的凌晨流水线（Phase1 扫盘 + Phase2 91 爬虫 +
 	// Phase3 迁移）。立即返回 —— 实际任务在后台跑，admin 在日志或下次状态查询里
-	// 看进度。若流水线正在跑，Runner 最多保留一个待触发请求，当前轮结束后再跑一轮。
-	OnRunNightlyJob func()
+	// 看进度。若流水线正在跑或已排队，Runner 会拒绝重复触发。
+	OnRunNightlyJob func() bool
+	// GetNightlyJobStatus 返回凌晨流水线当前状态，用于前端禁用重复触发按钮。
+	GetNightlyJobStatus func() NightlyJobStatus
 	// ListDriveDirChildren 列出某个 drive 在 parentID 目录下的直接子目录。
 	// parentID 为空时使用 drive 的 RootID。返回 (子目录列表, error)。
 	// 用于"设置跳过目录"弹窗按需展开浏览网盘目录树；只返回目录条目，文件忽略。
@@ -81,6 +87,14 @@ type DriveGenerationStatuses struct {
 	Thumbnail   GenerationStatus `json:"thumbnail"`
 	Preview     GenerationStatus `json:"preview"`
 	Fingerprint GenerationStatus `json:"fingerprint"`
+}
+
+type NightlyJobStatus struct {
+	State          string `json:"state"`
+	Running        bool   `json:"running"`
+	Queued         bool   `json:"queued"`
+	StartedAt      string `json:"startedAt,omitempty"`
+	LastFinishedAt string `json:"lastFinishedAt,omitempty"`
 }
 
 func (a *AdminServer) Register(r chi.Router) {
@@ -117,6 +131,7 @@ func (a *AdminServer) Register(r chi.Router) {
 			// 标签
 			r.Get("/tags", a.handleListTags)
 			r.Post("/tags", a.handleCreateTag)
+			r.Delete("/tags/{id}", a.handleDeleteTag)
 
 			// 运行时设置
 			r.Get("/settings", a.handleGetSettings)
@@ -124,6 +139,7 @@ func (a *AdminServer) Register(r chi.Router) {
 
 			// 运维任务
 			r.Get("/update/check", a.handleCheckUpdate)
+			r.Get("/jobs/nightly/status", a.handleNightlyJobStatus)
 			r.Post("/jobs/nightly/run", a.handleRunNightlyJob)
 		})
 	})
@@ -279,6 +295,9 @@ func (a *AdminServer) checkUpdate(ctx context.Context) (updateCheckDTO, error) {
 }
 
 func (a *AdminServer) installedVersion() string {
+	if version := strings.TrimSpace(a.ImageVersion); version != "" {
+		return version
+	}
 	path := strings.TrimSpace(a.VersionFilePath)
 	if path == "" {
 		path = ".version"
@@ -374,19 +393,20 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		SkipDirIDs []string `json:"skipDirIds"`
 		// LastCrawlAt 是 spider91 上次成功爬取的 unix 秒（来自 credentials.last_crawl_at）。
 		// 其它 kind 留 0；前端用它显示"上次抓取: N 小时前"。
-		LastCrawlAt                 int64            `json:"lastCrawlAt,omitempty"`
-		ThumbnailGenerationStatus   GenerationStatus `json:"thumbnailGenerationStatus"`
-		PreviewGenerationStatus     GenerationStatus `json:"previewGenerationStatus"`
-		FingerprintGenerationStatus GenerationStatus `json:"fingerprintGenerationStatus"`
-		ThumbnailReadyCount         int              `json:"thumbnailReadyCount"`
-		ThumbnailPendingCount       int              `json:"thumbnailPendingCount"`
-		ThumbnailFailedCount        int              `json:"thumbnailFailedCount"`
-		TeaserReadyCount            int              `json:"teaserReadyCount"`
-		TeaserPendingCount          int              `json:"teaserPendingCount"`
-		TeaserFailedCount           int              `json:"teaserFailedCount"`
-		FingerprintReadyCount       int              `json:"fingerprintReadyCount"`
-		FingerprintPendingCount     int              `json:"fingerprintPendingCount"`
-		FingerprintFailedCount      int              `json:"fingerprintFailedCount"`
+		LastCrawlAt                   int64            `json:"lastCrawlAt,omitempty"`
+		ThumbnailGenerationStatus     GenerationStatus `json:"thumbnailGenerationStatus"`
+		PreviewGenerationStatus       GenerationStatus `json:"previewGenerationStatus"`
+		FingerprintGenerationStatus   GenerationStatus `json:"fingerprintGenerationStatus"`
+		ThumbnailReadyCount           int              `json:"thumbnailReadyCount"`
+		ThumbnailPendingCount         int              `json:"thumbnailPendingCount"`
+		ThumbnailFailedCount          int              `json:"thumbnailFailedCount"`
+		ThumbnailDurationPendingCount int              `json:"thumbnailDurationPendingCount"`
+		TeaserReadyCount              int              `json:"teaserReadyCount"`
+		TeaserPendingCount            int              `json:"teaserPendingCount"`
+		TeaserFailedCount             int              `json:"teaserFailedCount"`
+		FingerprintReadyCount         int              `json:"fingerprintReadyCount"`
+		FingerprintPendingCount       int              `json:"fingerprintPendingCount"`
+		FingerprintFailedCount        int              `json:"fingerprintFailedCount"`
 	}
 	list := make([]out, 0, len(drives))
 	for _, d := range drives {
@@ -428,32 +448,34 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 			ID: d.ID, Kind: d.Kind, Name: d.Name,
 			RootID: d.RootID, ScanRootID: d.ScanRootID,
 			Status: d.Status, LastError: d.LastError,
-			HasCredential:               hasCred,
-			TeaserEnabled:               d.TeaserEnabled,
-			SkipDirIDs:                  append([]string{}, d.SkipDirIDs...),
-			LastCrawlAt:                 lastCrawlAt,
-			ThumbnailGenerationStatus:   generation.Thumbnail,
-			PreviewGenerationStatus:     generation.Preview,
-			FingerprintGenerationStatus: generation.Fingerprint,
-			ThumbnailReadyCount:         thumbCounts.Ready,
-			ThumbnailPendingCount:       thumbCounts.Pending,
-			ThumbnailFailedCount:        thumbCounts.Failed,
-			TeaserReadyCount:            counts.Ready,
-			TeaserPendingCount:          counts.Pending,
-			TeaserFailedCount:           counts.Failed,
-			FingerprintReadyCount:       fingerprintCount.Ready,
-			FingerprintPendingCount:     fingerprintCount.Pending,
-			FingerprintFailedCount:      fingerprintCount.Failed,
+			HasCredential:                 hasCred,
+			TeaserEnabled:                 d.TeaserEnabled,
+			SkipDirIDs:                    append([]string{}, d.SkipDirIDs...),
+			LastCrawlAt:                   lastCrawlAt,
+			ThumbnailGenerationStatus:     generation.Thumbnail,
+			PreviewGenerationStatus:       generation.Preview,
+			FingerprintGenerationStatus:   generation.Fingerprint,
+			ThumbnailReadyCount:           thumbCounts.Ready,
+			ThumbnailPendingCount:         thumbCounts.Pending,
+			ThumbnailFailedCount:          thumbCounts.Failed,
+			ThumbnailDurationPendingCount: thumbCounts.DurationPending,
+			TeaserReadyCount:              counts.Ready,
+			TeaserPendingCount:            counts.Pending,
+			TeaserFailedCount:             counts.Failed,
+			FingerprintReadyCount:         fingerprintCount.Ready,
+			FingerprintPendingCount:       fingerprintCount.Pending,
+			FingerprintFailedCount:        fingerprintCount.Failed,
 		})
 	}
 	writeJSON(w, http.StatusOK, list)
 }
 
 type upsertDriveReq struct {
-	ID          string            `json:"id"`
-	Kind        string            `json:"kind"`
-	Name        string            `json:"name"`
-	RootID      string            `json:"rootId"`
+	ID     string `json:"id"`
+	Kind   string `json:"kind"`
+	Name   string `json:"name"`
+	RootID string `json:"rootId"`
+	// Deprecated: 扫描起点已固定为 rootId；保留字段只为兼容旧客户端请求体。
 	ScanRootID  string            `json:"scanRootId"`
 	Credentials map[string]string `json:"credentials"`
 	// TeaserEnabled 是 per-drive teaser/封面生成开关。
@@ -511,7 +533,7 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 
 	d := &catalog.Drive{
 		ID: body.ID, Kind: body.Kind, Name: body.Name,
-		RootID: body.RootID, ScanRootID: body.ScanRootID,
+		RootID:        body.RootID,
 		Credentials:   body.Credentials,
 		Status:        "disconnected",
 		TeaserEnabled: teaserEnabled,
@@ -552,12 +574,32 @@ func (a *AdminServer) handleRescan(w http.ResponseWriter, r *http.Request) {
 
 // handleRunNightlyJob 触发一次完整的凌晨流水线（不论当前时间，不论今日是否已跑）。
 // 立即返回 202；进度通过 backend 日志和下次 GET /admin/api/drives 的状态变化观察。
-// 流水线已在跑时 Runner 最多排队一个后续触发；如果已有待触发请求，新的点击会被忽略。
+// 流水线已在跑或已排队时，Runner 会拒绝重复触发。
 func (a *AdminServer) handleRunNightlyJob(w http.ResponseWriter, r *http.Request) {
+	accepted := false
 	if a.OnRunNightlyJob != nil {
-		a.OnRunNightlyJob()
+		accepted = a.OnRunNightlyJob()
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"ok":       true,
+		"accepted": accepted,
+		"status":   a.nightlyJobStatus(),
+	})
+}
+
+func (a *AdminServer) handleNightlyJobStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, a.nightlyJobStatus())
+}
+
+func (a *AdminServer) nightlyJobStatus() NightlyJobStatus {
+	if a.GetNightlyJobStatus == nil {
+		return NightlyJobStatus{State: "idle"}
+	}
+	status := a.GetNightlyJobStatus()
+	if status.State == "" {
+		status.State = "idle"
+	}
+	return status
 }
 
 // teaserEnabledReq 是 POST /admin/api/drives/{id}/teaser-enabled 的入参。
@@ -736,6 +778,27 @@ func (a *AdminServer) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 		"label":      body.Label,
 		"classified": classified,
 	})
+}
+
+func (a *AdminServer) handleDeleteTag(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid tag id"))
+		return
+	}
+	removedVideos, err := a.Catalog.DeleteTag(r.Context(), id)
+	if err != nil {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			writeErr(w, http.StatusNotFound, err)
+		case errors.Is(err, catalog.ErrSystemTag):
+			writeErr(w, http.StatusBadRequest, err)
+		default:
+			writeErr(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "removedVideos": removedVideos})
 }
 
 type updateVideoReq struct {

@@ -77,10 +77,9 @@ export function checkUpdate() {
 
 export type AdminDrive = {
   id: string;
-  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "localstorage" | "spider91";
+  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "googledrive" | "localstorage" | "spider91";
   name: string;
   rootId: string;
-  scanRootId: string;
   status: string;
   lastError?: string;
   hasCredential: boolean;
@@ -100,6 +99,7 @@ export type AdminDrive = {
   thumbnailReadyCount: number;
   thumbnailPendingCount: number;
   thumbnailFailedCount: number;
+  thumbnailDurationPendingCount: number;
   teaserReadyCount: number;
   teaserPendingCount: number;
   teaserFailedCount: number;
@@ -137,10 +137,9 @@ export function getDriveStorage() {
 
 export type UpsertDriveInput = {
   id: string;
-  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "localstorage" | "spider91";
+  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "googledrive" | "localstorage" | "spider91";
   name: string;
   rootId: string;
-  scanRootId: string;
   credentials: Record<string, string>;
   /**
    * 可选：写入"扫描跳过目录"集合。`undefined` 表示不变（沿用服务端旧值），
@@ -333,6 +332,13 @@ export function createTag(label: string, aliases: string[]) {
   });
 }
 
+export function deleteTag(id: number) {
+  return request<{ ok: boolean; removedVideos: number }>(
+    `/tags/${encodeURIComponent(String(id))}`,
+    { method: "DELETE" }
+  );
+}
+
 // ---------- Settings ----------
 
 export type Theme = "dark" | "pink";
@@ -369,10 +375,25 @@ export function updateSettings(body: Partial<Settings>) {
 
 /**
  * 立即触发一次完整的凌晨流水线（Phase1 扫盘 + Phase2 91 爬虫 + Phase3 迁移），
- * 不论当前时间或今日是否已跑。立即返回 202；进度通过 backend 日志观察。
+ * 不论当前时间或今日是否已跑。立即返回 202；进度通过任务状态和 backend 日志观察。
  *
- * 流水线已在跑时后端最多保留一个待触发请求；已有待触发请求时，新的点击会被忽略。
+ * 流水线已在跑或已排队时，后端会拒绝重复触发。
  */
+export type NightlyJobStatus = {
+  state: "idle" | "queued" | "running" | "running_queued";
+  running: boolean;
+  queued: boolean;
+  startedAt?: string;
+  lastFinishedAt?: string;
+};
+
+export function getNightlyJobStatus() {
+  return request<NightlyJobStatus>("/jobs/nightly/status");
+}
+
 export function runNightlyJob() {
-  return request<{ ok: boolean }>("/jobs/nightly/run", { method: "POST" });
+  return request<{ ok: boolean; accepted: boolean; status: NightlyJobStatus }>(
+    "/jobs/nightly/run",
+    { method: "POST" }
+  );
 }

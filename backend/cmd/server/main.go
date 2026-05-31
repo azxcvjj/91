@@ -25,6 +25,7 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/drives/googledrive"
 	"github.com/video-site/backend/internal/drives/localstorage"
 	"github.com/video-site/backend/internal/drives/localupload"
 	"github.com/video-site/backend/internal/drives/onedrive"
@@ -125,6 +126,7 @@ func main() {
 		Catalog:         cat,
 		Auth:            authr,
 		VersionFilePath: versionFilePath,
+		ImageVersion:    strings.TrimSpace(os.Getenv("VIDEO_IMAGE_VERSION")),
 		GitHubRepo:      githubRepo,
 		SetupRequired: func() bool {
 			setupMu.Lock()
@@ -203,10 +205,14 @@ func main() {
 		SetSpider91UploadDriveID: func(id string) error {
 			return app.SetSpider91UploadDriveID(ctx, id)
 		},
-		OnRunNightlyJob: func() {
+		OnRunNightlyJob: func() bool {
 			if app.nightlyRunner != nil {
-				app.nightlyRunner.TriggerNow()
+				return app.nightlyRunner.TriggerNow()
 			}
+			return false
+		},
+		GetNightlyJobStatus: func() api.NightlyJobStatus {
+			return app.nightlyJobStatus()
 		},
 		ListDriveDirChildren: func(reqCtx context.Context, driveID, parentID string) ([]api.DriveDirEntry, error) {
 			return app.listDriveDirChildren(reqCtx, driveID, parentID)
@@ -413,6 +419,27 @@ func (a *App) SetSpider91UploadDriveID(ctx context.Context, driveID string) erro
 	a.spider91UploadDriveID = driveID
 	a.mu.Unlock()
 	return a.cat.SetSetting(ctx, "spider91.upload_drive_id", driveID)
+}
+
+func (a *App) nightlyJobStatus() api.NightlyJobStatus {
+	if a.nightlyRunner == nil {
+		return api.NightlyJobStatus{State: "idle"}
+	}
+	status := a.nightlyRunner.Status()
+	return api.NightlyJobStatus{
+		State:          status.State,
+		Running:        status.Running,
+		Queued:         status.Queued,
+		StartedAt:      formatOptionalRFC3339(status.StartedAt),
+		LastFinishedAt: formatOptionalRFC3339(status.LastFinishedAt),
+	}
+}
+
+func formatOptionalRFC3339(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339)
 }
 
 // isSpider91UploadKind 是 spider91 迁移目标盘的 allowlist。
@@ -624,6 +651,27 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			IsSharePoint: parseBoolDefault(d.Credentials["is_sharepoint"], false),
 			SiteID:       d.Credentials["site_id"],
 			RenewAPIURL:  d.Credentials["api_url_address"],
+			OnTokenUpdate: func(access, refresh string) {
+				if d.Credentials == nil {
+					d.Credentials = make(map[string]string)
+				}
+				d.Credentials["access_token"] = access
+				d.Credentials["refresh_token"] = refresh
+				_ = a.cat.UpsertDrive(ctx, d)
+			},
+		})
+	case googledrive.Kind:
+		drv = googledrive.New(googledrive.Config{
+			ID:           d.ID,
+			RootID:       d.RootID,
+			AccessToken:  d.Credentials["access_token"],
+			RefreshToken: d.Credentials["refresh_token"],
+			ClientID:     d.Credentials["client_id"],
+			ClientSecret: d.Credentials["client_secret"],
+			UseOnlineAPI: parseBoolDefault(d.Credentials["use_online_api"], true),
+			RenewAPIURL:  d.Credentials["api_url_address"],
+			OAuthURL:     d.Credentials["oauth_url"],
+			APIBaseURL:   d.Credentials["api_base_url"],
 			OnTokenUpdate: func(access, refresh string) {
 				if d.Credentials == nil {
 					d.Credentials = make(map[string]string)
@@ -1000,9 +1048,8 @@ func (a *App) detachDrive(id string) {
 // listDriveDirChildren 实现 AdminServer.ListDriveDirChildren：
 // 列指定 drive 在 parentID 下的直接子目录，仅返回目录条目（IsDir=true），文件忽略。
 //
-// parentID 为空时使用 drive 实例的 RootID()，与扫描起点保持一致 —— 但有意不
-// 用 ScanRootID：用户在"设置跳过目录"弹窗里浏览的是整个网盘逻辑根，方便从 0
-// 起逐层挑跳过点；ScanRootID 仅用于实际扫描起点。
+// parentID 为空时使用 drive 实例的 RootID()。用户在"设置跳过目录"弹窗里
+// 浏览的是整个网盘逻辑根，方便从根目录起逐层挑跳过点。
 //
 // 性能优化：p115 的 Driver.List 走 SDK 的 ListWithLimit，会把目录里全部文件 +
 // 目录分页拉完才返回；某些 115 根目录累积了几万个视频，单次列目录可能卡几十
@@ -1112,7 +1159,7 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 		}
 	}
 
-	// 使用 drive 的 scan_root_id，否则 root_id；同时把 admin 配置的 SkipDirIDs
+	// 扫描入口固定使用 drive 的 root_id；同时把 admin 配置的 SkipDirIDs
 	// 传给 scanner（命中即不递归）。
 	d, err := a.cat.GetDrive(ctx, driveID)
 	if err != nil {
@@ -1121,10 +1168,7 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 	}
 	sc := scanner.New(a.cat, drv, a.cfg.Scanner.VideoExtensions, d.SkipDirIDs, onNew)
 
-	startID := d.ScanRootID
-	if startID == "" {
-		startID = d.RootID
-	}
+	startID := d.RootID
 
 	log.Printf("[scan] drive=%s start=%s skip_dirs=%d", driveID, startID, len(d.SkipDirIDs))
 	stats, err := sc.Run(ctx, startID)
@@ -1490,8 +1534,9 @@ func (a *App) regenFailedThumbnails(ctx context.Context, driveID string) {
 		// 来判断是否真的要再生）。但既然之前是 failed 说明 url 没写过，所以这里
 		// 把 url 一并清空更稳。
 		if err := a.cat.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
-			ThumbnailURL:    "",
-			ThumbnailStatus: "pending",
+			ThumbnailURL:           "",
+			ThumbnailStatus:        "pending",
+			ResetThumbnailFailures: true,
 		}); err != nil {
 			log.Printf("[thumb] reset failed video %s drive=%s: %v", v.ID, driveID, err)
 			continue
@@ -1742,20 +1787,32 @@ func corsMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
 }
 
 func mountFrontend(r chi.Router) {
-	dir := strings.TrimSpace(os.Getenv("VIDEO_FRONTEND_DIR"))
-	if dir == "" {
-		dir = "./dist"
-	}
-	info, err := os.Stat(dir)
-	if err != nil || !info.IsDir() {
-		return
-	}
-	indexPath := filepath.Join(dir, "index.html")
-	if st, err := os.Stat(indexPath); err != nil || st.IsDir() {
+	dir, ok := resolveFrontendDir()
+	if !ok {
 		return
 	}
 	log.Printf("serving frontend from %s", dir)
 	r.NotFound(frontendHandler(dir))
+}
+
+func resolveFrontendDir() (string, bool) {
+	candidates := []string{}
+	if dir := strings.TrimSpace(os.Getenv("VIDEO_FRONTEND_DIR")); dir != "" {
+		candidates = append(candidates, dir)
+	} else {
+		candidates = append(candidates, "./dist", "../dist")
+	}
+	for _, dir := range candidates {
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		indexPath := filepath.Join(dir, "index.html")
+		if st, err := os.Stat(indexPath); err == nil && !st.IsDir() {
+			return dir, true
+		}
+	}
+	return "", false
 }
 
 func frontendHandler(dir string) http.HandlerFunc {

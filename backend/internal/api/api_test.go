@@ -261,7 +261,7 @@ func TestHandleUploadVideoSavesFileVideoTagsAndQueuesPreview(t *testing.T) {
 	}
 	req := multipartUploadRequest(t, map[string]string{
 		"title": "用户上传标题",
-		"tags":  "奶子,AV,女大",
+		"tags":  "奶子,口交,AV,女大",
 	}, "clip.mp4", "video-bytes")
 	rr := httptest.NewRecorder()
 
@@ -287,7 +287,7 @@ func TestHandleUploadVideoSavesFileVideoTagsAndQueuesPreview(t *testing.T) {
 	if got.Title != "用户上传标题" {
 		t.Fatalf("title = %q, want submitted title", got.Title)
 	}
-	if !sameStringSet(got.Tags, []string{"奶子", "AV", "女大"}) {
+	if !sameStringSet(got.Tags, []string{"奶子", "口交", "AV", "女大"}) {
 		t.Fatalf("tags = %#v, want selected tags", got.Tags)
 	}
 	if got.PreviewStatus != "pending" {
@@ -520,6 +520,66 @@ func TestHandleTagsReturnsUnifiedTagPool(t *testing.T) {
 	}
 	if qingchunCount != 1 {
 		t.Fatalf("清纯 count = %d, want 1; tags = %#v", qingchunCount, got)
+	}
+}
+
+func TestHandleShortsNextUsesPreferredVideoLeastPopulatedTag(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for _, v := range []*catalog.Video{
+		{ID: "current", DriveID: "drive", FileID: "f-current", Title: "current", Tags: []string{"common", "rare"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "common-1", DriveID: "drive", FileID: "f-common-1", Title: "common 1", Tags: []string{"common"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "common-2", DriveID: "drive", FileID: "f-common-2", Title: "common 2", Tags: []string{"common"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "rare-1", DriveID: "drive", FileID: "f-rare-1", Title: "rare 1", Tags: []string{"rare"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed %s: %v", v.ID, err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/shorts/next", strings.NewReader(`{"seenIds":["current"],"count":3,"preferredFromVideoId":"current"}`))
+	rr := httptest.NewRecorder()
+	(&Server{Catalog: cat}).handleShortsNext(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Items         []ShortsItemDTO `json:"items"`
+		Total         int             `json:"total"`
+		RoundComplete bool            `json:"roundComplete"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	ids := make([]string, 0, len(got.Items))
+	for _, item := range got.Items {
+		ids = append(ids, item.ID)
+	}
+	if got.Total != 4 {
+		t.Fatalf("total = %d, want 4", got.Total)
+	}
+	if got.RoundComplete {
+		t.Fatalf("roundComplete = true, want false with fallback-filled batch")
+	}
+	if !containsString(ids, "rare-1") {
+		t.Fatalf("ids = %#v, want rare-1 from least populated tag", ids)
+	}
+	if containsString(ids, "current") {
+		t.Fatalf("ids = %#v, should exclude current", ids)
+	}
+	if len(ids) != 3 {
+		t.Fatalf("ids = %#v, want 3 items", ids)
 	}
 }
 

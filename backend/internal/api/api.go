@@ -40,7 +40,7 @@ var allowedUploadExtensions = map[string]struct{}{
 var allowedUploadTags = map[string]struct{}{
 	"奶子": {},
 	"臀":  {},
-	"口角": {},
+	"口交": {},
 	"女大": {},
 	"人妻": {},
 	"AV": {},
@@ -440,11 +440,12 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// shortsNextReq 客户端把当前轮已看过的 video id 列表传上来，
-// 服务器从未在列表中的视频里随机抽 count 个返回。
+// shortsNextReq 客户端把当前轮已看过的 video id 列表传上来。
+// PreferredFromVideoID 来自短视频页最近一次点赞成功的视频，用于优先推荐相似标签。
 type shortsNextReq struct {
-	SeenIDs []string `json:"seenIds"`
-	Count   int      `json:"count"`
+	SeenIDs              []string `json:"seenIds"`
+	Count                int      `json:"count"`
+	PreferredFromVideoID string   `json:"preferredFromVideoId"`
 }
 
 // ShortsItemDTO 是短视频流单条的精简结构。比 VideoDTO 多 videoSrc / poster，
@@ -490,7 +491,12 @@ func (s *Server) handleShortsNext(w http.ResponseWriter, r *http.Request) {
 		exclude = nil
 	}
 
-	items, err := s.Catalog.RandomVideosExcluding(r.Context(), exclude, count)
+	var items []*catalog.Video
+	if strings.TrimSpace(body.PreferredFromVideoID) != "" {
+		items, err = s.Catalog.RandomVideosForPreferredVideoExcluding(r.Context(), body.PreferredFromVideoID, exclude, count)
+	} else {
+		items, err = s.Catalog.RandomVideosExcluding(r.Context(), exclude, count)
+	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -900,6 +906,8 @@ func driveKindLabel(kind string) string {
 		return "联通沃盘"
 	case "onedrive":
 		return "OneDrive"
+	case "googledrive":
+		return "Google Drive"
 	case localstorage.Kind:
 		return "本地存储"
 	case spider91.Kind:

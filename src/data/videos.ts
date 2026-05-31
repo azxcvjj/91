@@ -93,17 +93,19 @@ export type ShortsNextResponse = {
 
 /**
  * 拉取短视频流的下一批候选。把当前轮已看过的 video id 列表传给后端，
- * 服务器从未在列表中的视频里随机抽 count 条返回。
+ * 服务器从未在列表中的视频里随机抽 count 条返回。preferredFromVideoId
+ * 来自用户最近一次点赞成功的视频，用于按相似标签优先推荐。
  *
  * 失败时返回空批 + roundComplete=false，由调用方决定是否重试。
  */
 export function fetchShortsNext(
   seenIds: string[],
-  count: number
+  count: number,
+  preferredFromVideoId?: string
 ): Promise<ShortsNextResponse> {
   return apiJSON<ShortsNextResponse>("/api/shorts/next", {
     method: "POST",
-    body: JSON.stringify({ seenIds, count }),
+    body: JSON.stringify({ seenIds, count, preferredFromVideoId }),
   }).catch(() => ({ items: [], total: 0, roundComplete: false }));
 }
 

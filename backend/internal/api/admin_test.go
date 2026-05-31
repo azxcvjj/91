@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -194,6 +195,106 @@ func TestHandleCheckUpdateReportsUpToDate(t *testing.T) {
 	}
 }
 
+func TestHandleCheckUpdateUsesDockerImageVersion(t *testing.T) {
+	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"tag_name": "v0.2.0",
+			"html_url": "https://github.com/nianzhibai/91/releases/tag/v0.2.0",
+		})
+	}))
+	t.Cleanup(releaseServer.Close)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/update/check", nil)
+	rr := httptest.NewRecorder()
+	(&AdminServer{
+		ImageVersion:  "v0.1.0",
+		ReleaseAPIURL: releaseServer.URL,
+	}).handleCheckUpdate(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got updateCheckDTO
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.CurrentVersion != "v0.1.0" {
+		t.Fatalf("currentVersion = %q, want v0.1.0", got.CurrentVersion)
+	}
+	if !got.HasUpdate {
+		t.Fatalf("hasUpdate = false, want true")
+	}
+}
+
+func TestInstalledVersionPrefersDockerImageVersionOverVersionFile(t *testing.T) {
+	dir := t.TempDir()
+	versionFile := filepath.Join(dir, ".version")
+	if err := os.WriteFile(versionFile, []byte("v0.1.0\n"), 0o644); err != nil {
+		t.Fatalf("write version file: %v", err)
+	}
+
+	got := (&AdminServer{
+		VersionFilePath: versionFile,
+		ImageVersion:    "v0.2.0",
+	}).installedVersion()
+
+	if got != "v0.2.0" {
+		t.Fatalf("installedVersion = %q, want v0.2.0", got)
+	}
+}
+
+func TestHandleRunNightlyJobReturnsAcceptedStatus(t *testing.T) {
+	called := false
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/jobs/nightly/run", nil)
+	rr := httptest.NewRecorder()
+
+	(&AdminServer{
+		OnRunNightlyJob: func() bool {
+			called = true
+			return true
+		},
+		GetNightlyJobStatus: func() NightlyJobStatus {
+			return NightlyJobStatus{State: "queued", Queued: true}
+		},
+	}).handleRunNightlyJob(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body = %s", rr.Code, rr.Body.String())
+	}
+	if !called {
+		t.Fatal("OnRunNightlyJob was not called")
+	}
+	var got struct {
+		OK       bool             `json:"ok"`
+		Accepted bool             `json:"accepted"`
+		Status   NightlyJobStatus `json:"status"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.OK || !got.Accepted || got.Status.State != "queued" || !got.Status.Queued {
+		t.Fatalf("response = %#v, want accepted queued status", got)
+	}
+}
+
+func TestHandleNightlyJobStatusDefaultsToIdle(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/jobs/nightly/status", nil)
+	rr := httptest.NewRecorder()
+
+	(&AdminServer{}).handleNightlyJobStatus(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rr.Code, rr.Body.String())
+	}
+	var got NightlyJobStatus
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.State != "idle" || got.Running || got.Queued {
+		t.Fatalf("status = %#v, want idle", got)
+	}
+}
+
 func TestHandleUpsertDrivePreservesExistingCredentialsWhenRequestCredentialsEmpty(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
@@ -242,11 +343,49 @@ func TestHandleUpsertDrivePreservesExistingCredentialsWhenRequestCredentialsEmpt
 	if got.Name != "New name" {
 		t.Fatalf("name = %q, want New name", got.Name)
 	}
-	if got.ScanRootID != "scan-root" {
-		t.Fatalf("scanRootId = %q, want scan-root", got.ScanRootID)
+	if got.ScanRootID != "0" {
+		t.Fatalf("scanRootId = %q, want rootId 0", got.ScanRootID)
 	}
 	if got.Credentials["cookie"] != "existing-cookie" {
 		t.Fatalf("cookie credential = %q, want existing-cookie", got.Credentials["cookie"])
+	}
+}
+
+func TestHandleUpsertDriveDefaultsEmptyRootID(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives", strings.NewReader(`{
+		"id": "onedrive-main",
+		"kind": "onedrive",
+		"name": "OneDrive",
+		"rootId": "",
+		"credentials": {"refresh_token": "token"}
+	}`))
+	rr := httptest.NewRecorder()
+
+	(&AdminServer{Catalog: cat}).handleUpsertDrive(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := cat.GetDrive(ctx, "onedrive-main")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if got.RootID != "root" {
+		t.Fatalf("rootId = %q, want root", got.RootID)
+	}
+	if got.ScanRootID != got.RootID {
+		t.Fatalf("scanRootId = %q, want rootId %q", got.ScanRootID, got.RootID)
 	}
 }
 
@@ -363,64 +502,68 @@ func TestHandleListDrivesIncludesTeaserCounts(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 	}
 	var got []struct {
-		ID                          string           `json:"id"`
-		ThumbnailGenerationStatus   GenerationStatus `json:"thumbnailGenerationStatus"`
-		PreviewGenerationStatus     GenerationStatus `json:"previewGenerationStatus"`
-		FingerprintGenerationStatus GenerationStatus `json:"fingerprintGenerationStatus"`
-		ThumbnailReadyCount         int              `json:"thumbnailReadyCount"`
-		ThumbnailPendingCount       int              `json:"thumbnailPendingCount"`
-		ThumbnailFailedCount        int              `json:"thumbnailFailedCount"`
-		TeaserReadyCount            int              `json:"teaserReadyCount"`
-		TeaserPendingCount          int              `json:"teaserPendingCount"`
-		TeaserFailedCount           int              `json:"teaserFailedCount"`
-		FingerprintReadyCount       int              `json:"fingerprintReadyCount"`
-		FingerprintPendingCount     int              `json:"fingerprintPendingCount"`
-		FingerprintFailedCount      int              `json:"fingerprintFailedCount"`
+		ID                            string           `json:"id"`
+		ThumbnailGenerationStatus     GenerationStatus `json:"thumbnailGenerationStatus"`
+		PreviewGenerationStatus       GenerationStatus `json:"previewGenerationStatus"`
+		FingerprintGenerationStatus   GenerationStatus `json:"fingerprintGenerationStatus"`
+		ThumbnailReadyCount           int              `json:"thumbnailReadyCount"`
+		ThumbnailPendingCount         int              `json:"thumbnailPendingCount"`
+		ThumbnailFailedCount          int              `json:"thumbnailFailedCount"`
+		ThumbnailDurationPendingCount int              `json:"thumbnailDurationPendingCount"`
+		TeaserReadyCount              int              `json:"teaserReadyCount"`
+		TeaserPendingCount            int              `json:"teaserPendingCount"`
+		TeaserFailedCount             int              `json:"teaserFailedCount"`
+		FingerprintReadyCount         int              `json:"fingerprintReadyCount"`
+		FingerprintPendingCount       int              `json:"fingerprintPendingCount"`
+		FingerprintFailedCount        int              `json:"fingerprintFailedCount"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	byID := map[string]struct {
-		TeaserReady        int
-		TeaserPending      int
-		TeaserFailed       int
-		ThumbnailReady     int
-		ThumbnailPending   int
-		ThumbnailFailed    int
-		FingerprintReady   int
-		FingerprintPending int
-		FingerprintFailed  int
-		Thumbnail          GenerationStatus
-		Preview            GenerationStatus
-		Fingerprint        GenerationStatus
+		TeaserReady              int
+		TeaserPending            int
+		TeaserFailed             int
+		ThumbnailReady           int
+		ThumbnailPending         int
+		ThumbnailFailed          int
+		ThumbnailDurationPending int
+		FingerprintReady         int
+		FingerprintPending       int
+		FingerprintFailed        int
+		Thumbnail                GenerationStatus
+		Preview                  GenerationStatus
+		Fingerprint              GenerationStatus
 	}{}
 	for _, d := range got {
 		byID[d.ID] = struct {
-			TeaserReady        int
-			TeaserPending      int
-			TeaserFailed       int
-			ThumbnailReady     int
-			ThumbnailPending   int
-			ThumbnailFailed    int
-			FingerprintReady   int
-			FingerprintPending int
-			FingerprintFailed  int
-			Thumbnail          GenerationStatus
-			Preview            GenerationStatus
-			Fingerprint        GenerationStatus
+			TeaserReady              int
+			TeaserPending            int
+			TeaserFailed             int
+			ThumbnailReady           int
+			ThumbnailPending         int
+			ThumbnailFailed          int
+			ThumbnailDurationPending int
+			FingerprintReady         int
+			FingerprintPending       int
+			FingerprintFailed        int
+			Thumbnail                GenerationStatus
+			Preview                  GenerationStatus
+			Fingerprint              GenerationStatus
 		}{
-			TeaserReady:        d.TeaserReadyCount,
-			TeaserPending:      d.TeaserPendingCount,
-			TeaserFailed:       d.TeaserFailedCount,
-			ThumbnailReady:     d.ThumbnailReadyCount,
-			ThumbnailPending:   d.ThumbnailPendingCount,
-			ThumbnailFailed:    d.ThumbnailFailedCount,
-			FingerprintReady:   d.FingerprintReadyCount,
-			FingerprintPending: d.FingerprintPendingCount,
-			FingerprintFailed:  d.FingerprintFailedCount,
-			Thumbnail:          d.ThumbnailGenerationStatus,
-			Preview:            d.PreviewGenerationStatus,
-			Fingerprint:        d.FingerprintGenerationStatus,
+			TeaserReady:              d.TeaserReadyCount,
+			TeaserPending:            d.TeaserPendingCount,
+			TeaserFailed:             d.TeaserFailedCount,
+			ThumbnailReady:           d.ThumbnailReadyCount,
+			ThumbnailPending:         d.ThumbnailPendingCount,
+			ThumbnailFailed:          d.ThumbnailFailedCount,
+			ThumbnailDurationPending: d.ThumbnailDurationPendingCount,
+			FingerprintReady:         d.FingerprintReadyCount,
+			FingerprintPending:       d.FingerprintPendingCount,
+			FingerprintFailed:        d.FingerprintFailedCount,
+			Thumbnail:                d.ThumbnailGenerationStatus,
+			Preview:                  d.PreviewGenerationStatus,
+			Fingerprint:              d.FingerprintGenerationStatus,
 		}
 	}
 	if byID["OneDrive"].TeaserReady != 2 || byID["OneDrive"].TeaserPending != 1 || byID["OneDrive"].TeaserFailed != 0 {
@@ -428,6 +571,9 @@ func TestHandleListDrivesIncludesTeaserCounts(t *testing.T) {
 	}
 	if byID["OneDrive"].ThumbnailReady != 1 || byID["OneDrive"].ThumbnailPending != 1 || byID["OneDrive"].ThumbnailFailed != 1 {
 		t.Fatalf("OneDrive thumbnail counts = %#v, want ready=1 pending=1 failed=1", byID["OneDrive"])
+	}
+	if byID["OneDrive"].ThumbnailDurationPending != 1 {
+		t.Fatalf("OneDrive thumbnail duration pending = %#v, want 1", byID["OneDrive"])
 	}
 	if byID["OneDrive"].Thumbnail.State != "cooling" || byID["OneDrive"].Preview.State != "generating" {
 		t.Fatalf("OneDrive generation statuses = %#v, want thumbnail cooling and preview generating", byID["OneDrive"])
@@ -612,6 +758,64 @@ func TestHandleCreateTagClassifiesExistingVideos(t *testing.T) {
 	}
 	if len(video.Tags) != 1 || video.Tags[0] != "清纯" {
 		t.Fatalf("video tags = %#v, want 清纯", video.Tags)
+	}
+}
+
+func TestHandleDeleteTagRemovesTagFromVideos(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:          "video-1",
+		DriveID:     "drive",
+		FileID:      "file-1",
+		Title:       "清纯短发",
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if _, err := cat.CreateTagAndClassify(ctx, "清纯", nil, "user"); err != nil {
+		t.Fatalf("create tag: %v", err)
+	}
+	tags, err := cat.ListTags(ctx)
+	if err != nil {
+		t.Fatalf("list tags: %v", err)
+	}
+	var tagID int64
+	for _, tag := range tags {
+		if tag.Label == "清纯" {
+			tagID = tag.ID
+			break
+		}
+	}
+	if tagID == 0 {
+		t.Fatal("created tag not found")
+	}
+
+	req := requestWithRouteParam(http.MethodDelete, "/admin/api/tags/1", "id", strconv.FormatInt(tagID, 10), strings.NewReader(``))
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleDeleteTag(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	video, err := cat.GetVideo(ctx, "video-1")
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if len(video.Tags) != 0 {
+		t.Fatalf("video tags = %#v, want none", video.Tags)
 	}
 }
 

@@ -82,11 +82,6 @@ export function LoginPage() {
           <Play size={18} fill="currentColor" /> {setupRequired ? "首次设置管理员" : "登录"}
         </h1>
         <div className="admin-form">
-          {setupRequired && (
-            <div className="admin-form__help admin-form__help--lead">
-              请先设置后台管理员账号。保存后会写入本机配置文件，之后使用该账号登录。
-            </div>
-          )}
           <div className="admin-form__row">
             <label>用户名</label>
             <input
