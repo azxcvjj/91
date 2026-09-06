@@ -1,4 +1,6 @@
 import {
+  Suspense,
+  lazy,
   useEffect,
   useMemo,
   useRef,
@@ -8,6 +10,7 @@ import {
 import {
   Check,
   Clock3,
+  Film,
   Loader2,
   RefreshCw,
   SlidersHorizontal,
@@ -16,9 +19,7 @@ import {
 } from "lucide-react";
 import { invalidateTagsCache } from "@/data/videos";
 import * as api from "./api";
-import { ConfirmModal } from "./ConfirmModal";
 import { useToast } from "./ToastContext";
-import { ConfigDiffModal } from "./settings/ConfigDiffModal";
 import {
   ConfigSourceWorkspace,
   preloadConfigSourceEditor,
@@ -28,13 +29,34 @@ import { useAdminRouteRevalidation } from "./AdminRouteCache";
 import { SettingsRow, SettingsSection } from "./settings/SettingsSection";
 import {
   DEFAULT_DRAFT,
+  MAX_GENERATION_CONCURRENCY,
+  MIN_GENERATION_CONCURRENCY,
   applyVisualFields,
   changedVisualFields,
   isValidStartTime,
+  isValidTimezone,
   parseConfig,
   type SettingsDraft,
   type VisualField,
 } from "./settings/configYaml";
+
+type ConfigDiffModalModule = {
+  default: typeof import("./settings/ConfigDiffModal").ConfigDiffModal;
+};
+
+let configDiffModalRequest: Promise<ConfigDiffModalModule> | undefined;
+
+function loadConfigDiffModal(): Promise<ConfigDiffModalModule> {
+  configDiffModalRequest ??= import("./settings/ConfigDiffModal")
+    .then((module) => ({ default: module.ConfigDiffModal }))
+    .catch((error: unknown) => {
+      configDiffModalRequest = undefined;
+      throw error;
+    });
+  return configDiffModalRequest;
+}
+
+const LazyConfigDiffModal = lazy(loadConfigDiffModal);
 
 type LoadedConfig = {
   content: string;
@@ -49,27 +71,76 @@ type PendingSave = {
 };
 
 type EditorTab = "visual" | "source";
-type SectionID = "config-automation" | "config-tags";
+type SectionID = "config-automation" | "config-preview" | "config-tags";
+
+const NIGHTLY_TIMEZONE_OPTIONS = [
+  "Asia/Shanghai",
+  "Etc/UTC",
+  "Asia/Tokyo",
+  "Asia/Singapore",
+  "Europe/London",
+  "America/New_York",
+  "America/Los_Angeles",
+] as const;
+
+const GENERATION_CONCURRENCY_OPTIONS = Array.from(
+  { length: MAX_GENERATION_CONCURRENCY - MIN_GENERATION_CONCURRENCY + 1 },
+  (_, index) => MIN_GENERATION_CONCURRENCY + index
+);
+const GENERATION_FIELDS = [
+  {
+    field: "thumbnailConcurrency",
+    label: "封面并发",
+  },
+  {
+    field: "previewConcurrency",
+    label: "预览并发",
+  },
+  {
+    field: "fingerprintConcurrency",
+    label: "视频指纹并发",
+  },
+] as const;
+const CONFIG_FIELD_COUNT = Object.keys(DEFAULT_DRAFT).length;
 
 const SECTION_META: Array<{
   id: SectionID;
-  index: string;
   title: string;
   icon: LucideIcon;
 }> = [
   {
     id: "config-automation",
-    index: "01",
     title: "定时任务",
     icon: Clock3,
   },
   {
+    id: "config-preview",
+    title: "媒体生成",
+    icon: Film,
+  },
+  {
     id: "config-tags",
-    index: "02",
     title: "内置标签",
     icon: Tags,
   },
 ];
+
+type ConfigPageMetaProps = {
+  statusClass: string;
+  statusText: string;
+};
+
+function ConfigPageMeta({ statusClass, statusText }: ConfigPageMetaProps) {
+  return (
+    <p className="admin-config-meta">
+      <span>{CONFIG_FIELD_COUNT} 项常用配置</span>
+      <span className="admin-config-meta__separator" aria-hidden="true">
+        ·
+      </span>
+      <span className={`admin-config-meta__status ${statusClass}`}>{statusText}</span>
+    </p>
+  );
+}
 
 export function SettingsPage() {
   const floatingActionPageRef = useAdminFloatingActionSpace<HTMLFormElement>();
@@ -85,11 +156,6 @@ export function SettingsPage() {
   const [loadError, setLoadError] = useState("");
   const [saving, setSaving] = useState(false);
   const [pendingSave, setPendingSave] = useState<PendingSave | null>(null);
-  const [builtinTagsEnabled, setBuiltinTagsEnabled] = useState<boolean | null>(null);
-  const [builtinTagsLoading, setBuiltinTagsLoading] = useState(true);
-  const [builtinTagsLoadError, setBuiltinTagsLoadError] = useState("");
-  const [builtinTagsSaving, setBuiltinTagsSaving] = useState(false);
-  const [removeBuiltinTagsConfirmOpen, setRemoveBuiltinTagsConfirmOpen] = useState(false);
 
   const visualDirtyFields = useMemo(
     () => (loaded ? changedVisualFields(loaded.visual, draft) : new Set<VisualField>()),
@@ -101,23 +167,39 @@ export function SettingsPage() {
   const dirtyRef = useRef(dirty);
   dirtyRef.current = dirty;
   const timeValid = isValidStartTime(draft.nightlyStartTime);
+  const timezoneValid = isValidTimezone(draft.nightlyTimezone);
+  const generationConcurrencyValid = GENERATION_FIELDS.every(
+    ({ field }) =>
+      Number.isInteger(draft[field]) &&
+      draft[field] >= MIN_GENERATION_CONCURRENCY &&
+      draft[field] <= MAX_GENERATION_CONCURRENCY
+  );
+  const timezoneIsBuiltIn = NIGHTLY_TIMEZONE_OPTIONS.some(
+    (timezone) => timezone === draft.nightlyTimezone
+  );
   const controlsDisabled = loading || saving || loaded === null;
-  const statusClass = loading
-    ? ""
-    : sourceError
+  const scheduleControlsDisabled = controlsDisabled || draft.nightlyDisabled;
+  const hasConfigError =
+    Boolean(sourceError) ||
+    !timeValid ||
+    !timezoneValid ||
+    !generationConcurrencyValid;
+  const statusClass = loading || saving
+    ? "is-busy"
+    : hasConfigError
       ? "is-error"
       : dirty
         ? "is-dirty"
         : "is-saved";
   const statusText = loading
-    ? "加载配置中"
-    : sourceError
+    ? "正在同步"
+    : hasConfigError
       ? "配置有误"
       : saving
-        ? "处理中"
+        ? "正在保存"
         : dirty
           ? "有未保存更改"
-          : "配置已加载";
+          : "已同步";
 
   async function load(silent = false) {
     if (!silent) {
@@ -162,34 +244,12 @@ export function SettingsPage() {
     }
   }
 
-  async function loadBuiltinTagsSetting(silent = false) {
-    if (!silent) {
-      setBuiltinTagsLoading(true);
-      setBuiltinTagsLoadError("");
-    }
-    try {
-      const settings = await api.getSettings();
-      setBuiltinTagsEnabled(settings.builtinTagsEnabled !== false);
-      setBuiltinTagsLoadError("");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "读取内置标签设置失败";
-      if (!silent) {
-        setBuiltinTagsLoadError(message);
-        show(message, "error");
-      }
-    } finally {
-      if (!silent) setBuiltinTagsLoading(false);
-    }
-  }
-
   useEffect(() => {
     void load();
-    void loadBuiltinTagsSetting();
   }, []);
 
   useAdminRouteRevalidation(() => {
     if (!dirty) void load(true);
-    void loadBuiltinTagsSetting(true);
   });
 
   useEffect(() => {
@@ -225,7 +285,16 @@ export function SettingsPage() {
 
   async function prepareSave(event: FormEvent) {
     event.preventDefault();
-    if (!loaded || !dirty || !timeValid || sourceError || saving) return;
+    if (
+      !loaded ||
+      !dirty ||
+      !timeValid ||
+      !timezoneValid ||
+      !generationConcurrencyValid ||
+      sourceError ||
+      saving
+    )
+      return;
     try {
       parseConfig(workingYAML);
     } catch (error) {
@@ -237,7 +306,10 @@ export function SettingsPage() {
 
     setSaving(true);
     try {
-      const latest = await api.getConfigYAML();
+      const [latest] = await Promise.all([
+        api.getConfigYAML(),
+        loadConfigDiffModal(),
+      ]);
       const candidate = candidateForLatest(latest);
       parseConfig(candidate);
       if (candidate === latest.content) {
@@ -278,12 +350,15 @@ export function SettingsPage() {
 
       const response = await api.updateConfigYAML(pendingSave.after, pendingSave.version);
       const visual = parseConfig(pendingSave.after).draft;
+      const builtinTagsChanged =
+        loaded.visual.builtinTagsEnabled !== visual.builtinTagsEnabled;
       setLoaded({ content: pendingSave.after, version: response.version, visual });
       setWorkingYAML(pendingSave.after);
       setDraft(visual);
       setSourceTouched(false);
       setSourceError("");
       setPendingSave(null);
+      if (builtinTagsChanged) invalidateTagsCache();
       show(
         response.restartRequired
           ? "配置已保存；部分字段需重启服务后生效"
@@ -371,39 +446,21 @@ export function SettingsPage() {
     }
   }
 
-  async function updateBuiltinTags(enabled: boolean) {
-    if (builtinTagsSaving) return;
-    setBuiltinTagsSaving(true);
-    try {
-      const settings = await api.updateSettings({ builtinTagsEnabled: enabled });
-      const savedEnabled = settings.builtinTagsEnabled !== false;
-      setBuiltinTagsEnabled(savedEnabled);
-      setBuiltinTagsLoadError("");
-      setRemoveBuiltinTagsConfirmOpen(false);
-      invalidateTagsCache();
-      show(
-        savedEnabled
-          ? "内置标签已恢复"
-          : "内置标签及其已有视频关联已移除",
-        "success"
-      );
-    } catch (error) {
-      show(error instanceof Error ? error.message : "更新内置标签设置失败", "error");
-    } finally {
-      setBuiltinTagsSaving(false);
-    }
-  }
-
   if (!loading && (loadError || !loaded)) {
     return (
-      <div className="admin-page admin-config-page admin-config-page--error">
-        <SlidersHorizontal size={26} aria-hidden="true" />
-        <strong>配置加载失败</strong>
-        <span>{loadError || "暂时无法读取 config.yaml"}</span>
-        <button type="button" className="admin-btn is-primary" onClick={() => void load()}>
-          重新加载
-        </button>
-      </div>
+      <>
+        <header className="admin-config-header admin-config-header--standalone">
+          <ConfigPageMeta statusClass="is-error" statusText="同步失败" />
+        </header>
+        <div className="admin-page admin-config-page admin-config-page--error">
+          <SlidersHorizontal size={26} aria-hidden="true" />
+          <strong>配置加载失败</strong>
+          <span>{loadError || "暂时无法读取 config.yaml"}</span>
+          <button type="button" className="admin-btn is-primary" onClick={() => void load()}>
+            重新加载
+          </button>
+        </div>
+      </>
     );
   }
 
@@ -416,11 +473,15 @@ export function SettingsPage() {
         onSubmit={prepareSave}
       >
         <header className="admin-config-header">
-          <div className="admin-config-tabs" role="tablist" aria-label="配置编辑模式">
+          <ConfigPageMeta statusClass={statusClass} statusText={statusText} />
+          <div
+            className="admin-config-mode-switch"
+            role="group"
+            aria-label="配置编辑模式"
+          >
             <button
               type="button"
-              role="tab"
-              aria-selected={activeTab === "visual"}
+              aria-pressed={activeTab === "visual"}
               className={activeTab === "visual" ? "is-active" : ""}
               disabled={loading || saving}
               onClick={() => handleTabChange("visual")}
@@ -429,8 +490,7 @@ export function SettingsPage() {
             </button>
             <button
               type="button"
-              role="tab"
-              aria-selected={activeTab === "source"}
+              aria-pressed={activeTab === "source"}
               className={activeTab === "source" ? "is-active" : ""}
               disabled={loading || saving}
               onClick={() => handleTabChange("source")}
@@ -441,7 +501,7 @@ export function SettingsPage() {
         </header>
 
         {activeTab === "visual" ? (
-          <div className="admin-config-visual" role="tabpanel">
+          <div className="admin-config-visual">
             <nav
               className="admin-config-section-nav"
               role="tablist"
@@ -460,11 +520,10 @@ export function SettingsPage() {
                     className={activeSection === section.id ? "is-active" : ""}
                     onClick={() => setActiveSection(section.id)}
                   >
-                    <span className="admin-config-section-nav__index">{section.index}</span>
                     <span className="admin-config-section-nav__icon" aria-hidden="true">
-                      <Icon size={16} />
+                      <Icon size={15} />
                     </span>
-                    <span>{section.title}</span>
+                    <span className="admin-config-section-nav__label">{section.title}</span>
                   </button>
                 );
               })}
@@ -477,20 +536,23 @@ export function SettingsPage() {
                   index="01"
                   icon={<Clock3 size={16} />}
                   title="定时任务"
-                  description="控制每日扫盘和库内视频维护时间"
+                  description="控制每日扫盘和库内视频维护"
                 >
                   <SettingsRow
                     label="启动时间"
                     htmlFor="nightly-start-time"
                     layout="inline"
                   >
-                    <div className="admin-config-control admin-config-control--time">
+                    <div className="admin-config-control admin-config-control--picker">
                       <div
-                        className={`admin-config-time-field${
+                        className={`admin-config-picker-field admin-config-picker-field--time${
                           !timeValid ? " is-invalid" : ""
-                        }${controlsDisabled ? " is-disabled" : ""}`}
+                        }${scheduleControlsDisabled ? " is-disabled" : ""}`}
                       >
-                        <span className="admin-config-time-field__value" aria-hidden="true">
+                        <span
+                          className="admin-config-picker-field__value admin-config-picker-field__value--time"
+                          aria-hidden="true"
+                        >
                           {draft.nightlyStartTime || "--:--"}
                         </span>
                         <input
@@ -498,7 +560,7 @@ export function SettingsPage() {
                           type="time"
                           step={60}
                           value={draft.nightlyStartTime}
-                          disabled={controlsDisabled}
+                          disabled={scheduleControlsDisabled}
                           aria-invalid={!timeValid}
                           aria-describedby={!timeValid ? "nightly-start-time-hint" : undefined}
                           onClick={(event) => {
@@ -520,62 +582,152 @@ export function SettingsPage() {
                       )}
                     </div>
                   </SettingsRow>
+                  <SettingsRow
+                    label="时区配置"
+                    htmlFor="nightly-timezone"
+                    layout="inline"
+                  >
+                    <div className="admin-config-control admin-config-control--picker">
+                      <div
+                        className={`admin-config-picker-field admin-config-picker-field--timezone${
+                          !timezoneValid ? " is-invalid" : ""
+                        }${scheduleControlsDisabled ? " is-disabled" : ""}`}
+                      >
+                        <span className="admin-config-picker-field__value" aria-hidden="true">
+                          {draft.nightlyTimezone || "--"}
+                        </span>
+                        <select
+                          id="nightly-timezone"
+                          value={draft.nightlyTimezone}
+                          disabled={scheduleControlsDisabled}
+                          aria-invalid={!timezoneValid}
+                          aria-describedby={!timezoneValid ? "nightly-timezone-hint" : undefined}
+                          onChange={(event) =>
+                            updateVisualField("nightlyTimezone", event.target.value)
+                          }
+                        >
+                          {!timezoneIsBuiltIn && (
+                            <option value={draft.nightlyTimezone}>
+                              {draft.nightlyTimezone || "无效时区"}
+                            </option>
+                          )}
+                          {NIGHTLY_TIMEZONE_OPTIONS.map((timezone) => (
+                            <option key={timezone} value={timezone}>
+                              {timezone}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      {!timezoneValid && (
+                        <span id="nightly-timezone-hint" className="is-error">
+                          请输入有效的 IANA 时区名
+                        </span>
+                      )}
+                    </div>
+                  </SettingsRow>
+                  <SettingsRow
+                    label="停止定时任务"
+                    labelID="nightly-disabled-label"
+                    layout="inline"
+                  >
+                    <div className="admin-config-control admin-config-control--switch">
+                      <button
+                        id="nightly-disabled-toggle"
+                        type="button"
+                        className={`toggle-switch ${draft.nightlyDisabled ? "is-on" : ""}`}
+                        role="switch"
+                        aria-checked={draft.nightlyDisabled}
+                        aria-labelledby="nightly-disabled-label"
+                        disabled={controlsDisabled}
+                        onClick={() =>
+                          updateVisualField("nightlyDisabled", !draft.nightlyDisabled)
+                        }
+                      >
+                        <span className="toggle-switch__dot" />
+                      </button>
+                    </div>
+                  </SettingsRow>
+                </SettingsSection>
+              )}
+              {activeSection === "config-preview" && (
+                <SettingsSection
+                  id="config-preview"
+                  index="02"
+                  icon={<Film size={16} />}
+                  title="媒体生成"
+                  description="控制视频资源生成的并发数，请根据服务器性能和网盘API风控调整，如果性能允许推荐 1-3-1"
+                >
+                  {GENERATION_FIELDS.map(({ field, label }) => (
+                    <SettingsRow
+                      key={field}
+                      label={label}
+                      htmlFor={field}
+                      layout="inline"
+                    >
+                      <div className="admin-config-control admin-config-control--picker">
+                        <div
+                          className={`admin-config-picker-field admin-config-picker-field--concurrency${
+                            controlsDisabled ? " is-disabled" : ""
+                          }`}
+                        >
+                          <span className="admin-config-picker-field__value" aria-hidden="true">
+                            {draft[field]}
+                          </span>
+                          <select
+                            id={field}
+                            value={draft[field]}
+                            disabled={controlsDisabled}
+                            aria-invalid={!generationConcurrencyValid}
+                            onChange={(event) =>
+                              updateVisualField(field, Number(event.target.value))
+                            }
+                          >
+                            {GENERATION_CONCURRENCY_OPTIONS.map((concurrency) => (
+                              <option key={concurrency} value={concurrency}>
+                                {concurrency}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+                    </SettingsRow>
+                  ))}
                 </SettingsSection>
               )}
               {activeSection === "config-tags" && (
                 <SettingsSection
                   id="config-tags"
-                  index="02"
+                  index="03"
                   icon={<Tags size={16} />}
                   title="内置标签"
                   description="管理系统内置标签"
                 >
                   <SettingsRow
-                    label="内置标签开关"
+                    label="内置标签"
                     labelID="builtin-tags-label"
                     layout="inline"
                   >
                     <div className="admin-config-control admin-config-control--switch">
-                      {builtinTagsLoadError ? (
-                        <button
-                          type="button"
-                          className="admin-config-control__retry"
-                          onClick={() => void loadBuiltinTagsSetting()}
-                          disabled={controlsDisabled || builtinTagsLoading || builtinTagsSaving}
-                        >
-                          重新读取
-                        </button>
-                      ) : (
-                        <span className="admin-config-control__status">
-                          {builtinTagsLoading
-                            ? "读取中"
-                            : builtinTagsEnabled
-                              ? "已启用"
-                              : "已移除"}
-                        </span>
-                      )}
+                      <span className="admin-config-control__status">
+                        {visualDirtyFields.has("builtinTagsEnabled")
+                          ? draft.builtinTagsEnabled
+                            ? "待恢复"
+                            : "待移除"
+                          : draft.builtinTagsEnabled
+                            ? "已启用"
+                            : "已移除"}
+                      </span>
                       <button
                         id="builtin-tags-toggle"
                         type="button"
-                        className={`toggle-switch ${builtinTagsEnabled ? "is-on" : ""} ${
-                          builtinTagsSaving ? "is-saving" : ""
-                        }`}
+                        className={`toggle-switch ${draft.builtinTagsEnabled ? "is-on" : ""}`}
                         role="switch"
-                        aria-checked={builtinTagsEnabled === true}
+                        aria-checked={draft.builtinTagsEnabled}
                         aria-labelledby="builtin-tags-label"
-                        disabled={
-                          controlsDisabled ||
-                          builtinTagsLoading ||
-                          builtinTagsSaving ||
-                          builtinTagsEnabled === null
+                        disabled={controlsDisabled}
+                        onClick={() =>
+                          updateVisualField("builtinTagsEnabled", !draft.builtinTagsEnabled)
                         }
-                        onClick={() => {
-                          if (builtinTagsEnabled) {
-                            setRemoveBuiltinTagsConfirmOpen(true);
-                          } else {
-                            void updateBuiltinTags(true);
-                          }
-                        }}
                       >
                         <span className="toggle-switch__dot" />
                       </button>
@@ -586,7 +738,7 @@ export function SettingsPage() {
             </div>
           </div>
         ) : (
-          <div role="tabpanel">
+          <div>
             <ConfigSourceWorkspace
               value={workingYAML}
               error={sourceError}
@@ -616,7 +768,14 @@ export function SettingsPage() {
           <button
             type="submit"
             className="admin-config-actions__button"
-            disabled={controlsDisabled || !dirty || !timeValid || Boolean(sourceError)}
+            disabled={
+              controlsDisabled ||
+              !dirty ||
+              !timeValid ||
+              !timezoneValid ||
+              !generationConcurrencyValid ||
+              Boolean(sourceError)
+            }
             title="预览并保存配置"
             aria-label="预览并保存配置"
           >
@@ -630,28 +789,18 @@ export function SettingsPage() {
         </div>
       </form>
 
-      <ConfigDiffModal
-        open={pendingSave !== null}
-        before={pendingSave?.before ?? ""}
-        after={pendingSave?.after ?? ""}
-        saving={saving}
-        onClose={() => setPendingSave(null)}
-        onConfirm={() => void confirmSave()}
-      />
-      <ConfirmModal
-        open={removeBuiltinTagsConfirmOpen}
-        title="移除内置标签"
-        message="确定移除全部内置标签及其已有视频关联吗？自定义标签不会被删除。"
-        confirmText="确认移除"
-        danger
-        hideIcon
-        centerMessage
-        loading={builtinTagsSaving}
-        onCancel={() => {
-          if (!builtinTagsSaving) setRemoveBuiltinTagsConfirmOpen(false);
-        }}
-        onConfirm={() => void updateBuiltinTags(false)}
-      />
+      {pendingSave && (
+        <Suspense fallback={null}>
+          <LazyConfigDiffModal
+            open
+            before={pendingSave.before}
+            after={pendingSave.after}
+            saving={saving}
+            onClose={() => setPendingSave(null)}
+            onConfirm={() => void confirmSave()}
+          />
+        </Suspense>
+      )}
     </>
   );
 }

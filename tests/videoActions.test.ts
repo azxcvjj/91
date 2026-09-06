@@ -78,11 +78,26 @@ test("detail playback actions only expose delete as the management action", () =
 });
 
 test("detail recommendations stay stable when returning from another video", () => {
-  assert.match(detailPageSource, /const cachedRelatedVideosByID = new Map<string, VideoDetail\["relatedVideos"\]>\(\)/);
-  assert.match(detailPageSource, /function withStableRelatedVideos\(detail: VideoDetail \| null\): VideoDetail \| null/);
-  assert.match(detailPageSource, /let stableDetail = withStableRelatedVideos\(d\)/);
-  assert.match(detailPageSource, /setDetail\(stableDetail\)/);
-  assert.doesNotMatch(detailPageSource, /setDetail\(d\)/);
+  assert.match(
+    detailPageSource,
+    /const cachedRecommendationsByID = new Map<string, VideoItem\[\]>\(\)/
+  );
+  assert.match(
+    detailPageSource,
+    /function readCachedRecommendations\(id: string\): VideoItem\[\] \| null/
+  );
+  assert.match(
+    detailPageSource,
+    /function rememberRecommendations\(id: string, videos: VideoItem\[\]\)[\s\S]*?if \(cachedRecommendationsByID\.has\(id\)\) return;/
+  );
+  assert.match(
+    detailPageSource,
+    /const \[initialRecommendations\] = useState<VideoItem\[\] \| null>\([\s\S]*?readCachedRecommendations\(id\)/
+  );
+  assert.match(
+    detailPageSource,
+    /rememberRecommendations\(id, videos\);\s*setRecommendations\(cachedRecommendationsByID\.get\(id\) \?\? videos\)/
+  );
 });
 
 test("detail background refresh preserves confirmed local reaction counts", () => {
@@ -124,11 +139,21 @@ test("detail history navigation renders cached content before background refresh
   );
   assert.match(
     detailPageSource,
-    /Promise\.all\(\[fetchVideoDetail\(id\), fetchTags\(\)\]\)/
+    /const detailRequest = prefetchedDetail \?\? fetchVideoDetail\(id\);[\s\S]*?detailRequest[\s\S]*?\.then\(\(d\) =>[\s\S]*?setLoading\(false\)/
   );
-  assert.match(detailPageSource, /if \(!stableDetail && initialSnapshot\)/);
-  assert.match(detailPageSource, /if \(navigationType !== "POP"\)/);
-  assert.doesNotMatch(detailPageSource, /setLoading\(true\)/);
+  assert.doesNotMatch(
+    detailPageSource,
+    /Promise\.all\(\[detailRequest, fetchTags\(\)\]\)/
+  );
+  assert.match(
+    detailPageSource,
+    /\.catch\(\(\) => \{[\s\S]*?setDetailError\("视频信息暂时无法加载，请稍后重试"\);[\s\S]*?setLoading\(false\)/
+  );
+  assert.match(
+    detailPageSource,
+    /const \[entryNavigationType\] = useState\(navigationType\)[\s\S]*?if \(entryNavigationType !== "POP"\)/
+  );
+  assert.match(detailPageSource, /if \(!initialSnapshot\) setLoading\(true\)/);
 });
 
 test("detail page defers subtitles to the player menu", () => {

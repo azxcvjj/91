@@ -15,6 +15,12 @@ import (
 )
 
 func (c *Catalog) migrate(ctx context.Context) error {
+	if err := c.addColumnIfMissing(ctx, "scans", "result", "TEXT"); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_scans_drive_id ON scans(drive_id, id)`); err != nil {
+		return err
+	}
 	if err := c.addColumnIfMissing(ctx, "videos", "tags_manual", "INTEGER DEFAULT 0"); err != nil {
 		return err
 	}
@@ -36,10 +42,40 @@ func (c *Catalog) migrate(ctx context.Context) error {
 	if err := c.addColumnIfMissing(ctx, "videos", "hidden", "INTEGER DEFAULT 0"); err != nil {
 		return err
 	}
+	if err := c.addColumnIfMissing(ctx, "videos", "is_canonical", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return err
+	}
 	if err := c.addColumnIfMissing(ctx, "videos", "thumbnail_status", "TEXT DEFAULT 'pending'"); err != nil {
 		return err
 	}
 	if err := c.addColumnIfMissing(ctx, "videos", "thumbnail_failures", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := c.addColumnIfMissing(ctx, "videos", "thumbnail_updated_at", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+	// Older databases only had videos.updated_at. Seed the thumbnail revision
+	// once, then keep it independent from views, reactions, and other metadata.
+	if _, err := c.db.ExecContext(ctx, `
+UPDATE videos
+   SET thumbnail_updated_at = updated_at
+ WHERE COALESCE(thumbnail_url, '') != ''
+   AND COALESCE(thumbnail_updated_at, 0) = 0
+`); err != nil {
+		return err
+	}
+	if err := c.addColumnIfMissing(ctx, "videos", "preview_updated_at", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+	// Legacy previews were versioned with videos.updated_at. Seed a dedicated
+	// revision once; future metadata-only writes leave it unchanged.
+	if _, err := c.db.ExecContext(ctx, `
+UPDATE videos
+   SET preview_updated_at = updated_at
+ WHERE COALESCE(preview_local, '') != ''
+   AND COALESCE(preview_status, 'pending') = 'ready'
+   AND COALESCE(preview_updated_at, 0) = 0
+`); err != nil {
 		return err
 	}
 	if err := c.addColumnIfMissing(ctx, "videos", "last_viewed_at", "INTEGER DEFAULT 0"); err != nil {
@@ -48,19 +84,12 @@ func (c *Catalog) migrate(ctx context.Context) error {
 	if err := c.addColumnIfMissing(ctx, "videos", "last_liked_at", "INTEGER DEFAULT 0"); err != nil {
 		return err
 	}
-	// videos.transcode_*：浏览器兼容性转码状态。
-	// status：''=未检测 / pending=已入队 / ready=已转码 / skipped=检测后无需转码 / failed=失败。
-	// transcoded_file_id 指向转码产物在同一 drive 上的 fileID，播放源优先使用它。
-	if err := c.addColumnIfMissing(ctx, "videos", "transcode_status", "TEXT DEFAULT ''"); err != nil {
+	// 目录身份用于同目录合集。非常早期的库可能还没有 parent_id；先补身份列，
+	// 再补仅用于展示和标签匹配的目录名。
+	if err := c.addColumnIfMissing(ctx, "videos", "parent_id", "TEXT DEFAULT ''"); err != nil {
 		return err
 	}
-	if err := c.addColumnIfMissing(ctx, "videos", "transcode_error", "TEXT DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := c.addColumnIfMissing(ctx, "videos", "transcoded_file_id", "TEXT DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := c.addColumnIfMissing(ctx, "videos", "transcoded_size", "INTEGER DEFAULT 0"); err != nil {
+	if err := c.addColumnIfMissing(ctx, "videos", "ancestor_dir_ids", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	// videos.dir_name：视频所在目录名，扫盘时落库；标签全库重算需要用它做匹配材料。
@@ -89,6 +118,16 @@ func (c *Catalog) migrate(ctx context.Context) error {
 	if err := c.dropColumnIfExists(ctx, "videos", "llm_tagged_at"); err != nil {
 		return err
 	}
+	// quality 曾被扫盘统一写成 HD，并不代表真实分辨率；完整退役该无效元数据。
+	if err := c.dropColumnIfExists(ctx, "videos", "quality"); err != nil {
+		return err
+	}
+	// 浏览器兼容性转码已整体退役；老库不再保留任务状态和产物引用。
+	for _, column := range []string{"transcode_status", "transcode_error", "transcoded_file_id", "transcoded_size"} {
+		if err := c.dropColumnIfExists(ctx, "videos", column); err != nil {
+			return err
+		}
+	}
 	if err := c.ensureBaseVideoIndexes(ctx); err != nil {
 		return err
 	}
@@ -103,6 +142,9 @@ func (c *Catalog) migrate(ctx context.Context) error {
 	// 其中任意一个的目录及其全部子目录都不会被递归扫描。替代旧版硬编码"影视"
 	// 目录例外分支；旧 drive 升级后默认空数组 → 行为等同于以前未启用跳过。
 	if err := c.addColumnIfMissing(ctx, "drives", "skip_dir_ids", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if err := c.addColumnIfMissing(ctx, "drives", "skip_cleanup_dir_ids", "TEXT"); err != nil {
 		return err
 	}
 	if _, err := c.db.ExecContext(ctx, `
@@ -162,6 +204,9 @@ CREATE TABLE IF NOT EXISTS deleted_videos (
 	if err := c.reconcileThumbnailStatusOnce(ctx); err != nil {
 		return err
 	}
+	if err := c.requeueFailedThumbnailsWithReadyPreviewOnce(ctx); err != nil {
+		return err
+	}
 	if err := c.requeueSkippedPreviews(ctx); err != nil {
 		return err
 	}
@@ -180,9 +225,6 @@ CREATE TABLE IF NOT EXISTS deleted_videos (
 	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_hidden ON videos(hidden)`); err != nil {
 		return err
 	}
-	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_visible_pub ON videos(COALESCE(hidden, 0), published_at DESC)`); err != nil {
-		return err
-	}
 	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_last_viewed ON videos(last_viewed_at DESC)`); err != nil {
 		return err
 	}
@@ -193,6 +235,12 @@ CREATE TABLE IF NOT EXISTS deleted_videos (
 		return err
 	}
 	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_file_name_size_created ON videos(file_name, size_bytes, created_at, id)`); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_directory ON videos(drive_id, parent_id)`); err != nil {
+		return err
+	}
+	if err := c.ensureCanonicalVideoMaterialization(ctx); err != nil {
 		return err
 	}
 	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_deleted_videos_drive_file ON deleted_videos(drive_id, file_id)`); err != nil {
@@ -262,6 +310,12 @@ CREATE TABLE IF NOT EXISTS deleted_videos (
 // generated labels, and re-matches videos. The only generated labels it may
 // add are AV series labels while the built-in AV mechanism is enabled.
 func (c *Catalog) RunPostStartupTagMaintenance(ctx context.Context) error {
+	c.tagMaintenanceMu.Lock()
+	defer c.tagMaintenanceMu.Unlock()
+	return c.runPostStartupTagMaintenance(ctx)
+}
+
+func (c *Catalog) runPostStartupTagMaintenance(ctx context.Context) error {
 	if err := c.removeRetiredTagRuleFields(ctx); err != nil {
 		return err
 	}
@@ -601,11 +655,28 @@ func (c *Catalog) dropColumnIfExists(ctx context.Context, table, column string) 
 	if _, err = c.db.ExecContext(ctx, `ALTER TABLE `+table+` DROP COLUMN `+column); err == nil {
 		return nil
 	}
-	if table == "videos" && (strings.EqualFold(column, "category") || strings.EqualFold(column, "llm_tagged_at")) {
+	if table == "videos" && isRetiredVideoColumn(column) {
 		log.Printf("[catalog] native drop column videos.%s failed, rebuilding videos table with current columns: %v", column, err)
-		return c.rebuildVideosTableWithoutCategory(ctx)
+		return c.rebuildVideosTableWithCurrentColumns(ctx)
 	}
 	return err
+}
+
+func isRetiredVideoColumn(column string) bool {
+	for _, retired := range []string{
+		"category",
+		"llm_tagged_at",
+		"quality",
+		"transcode_status",
+		"transcode_error",
+		"transcoded_file_id",
+		"transcoded_size",
+	} {
+		if strings.EqualFold(column, retired) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Catalog) ensureBaseVideoIndexes(ctx context.Context) error {
@@ -623,6 +694,376 @@ func (c *Catalog) ensureBaseVideoIndexes(ctx context.Context) error {
 	return nil
 }
 
+const canonicalMaterializationMarker = "videos.is_canonical.v1"
+
+const dedupRepresentativesMarker = "videos.dedup_representatives.v1"
+
+const canonicalRowsMatchingNewVideoSQL = `(videos.id = NEW.id
+	OR (COALESCE(NEW.content_hash, '') != ''
+		AND videos.content_hash = NEW.content_hash)
+	OR (NEW.size_bytes > 0
+		AND COALESCE(NEW.sampled_sha256, '') != ''
+		AND videos.size_bytes = NEW.size_bytes
+		AND videos.sampled_sha256 = NEW.sampled_sha256)
+	OR (NEW.size_bytes > 0
+		AND COALESCE(NEW.file_name, '') != ''
+		AND videos.size_bytes = NEW.size_bytes
+		AND videos.file_name = NEW.file_name))`
+
+const canonicalRowsMatchingOldVideoSQL = `(videos.id = OLD.id
+	OR (COALESCE(OLD.content_hash, '') != ''
+		AND videos.content_hash = OLD.content_hash)
+	OR (OLD.size_bytes > 0
+		AND COALESCE(OLD.sampled_sha256, '') != ''
+		AND videos.size_bytes = OLD.size_bytes
+		AND videos.sampled_sha256 = OLD.sampled_sha256)
+	OR (OLD.size_bytes > 0
+		AND COALESCE(OLD.file_name, '') != ''
+		AND videos.size_bytes = OLD.size_bytes
+		AND videos.file_name = OLD.file_name))`
+
+// ensureCanonicalVideoMaterialization installs row-local maintenance triggers
+// and performs a one-time full backfill. The trigger UPDATE runs inside the
+// originating SQLite statement, so every Catalog writer, direct INSERT, bulk
+// DELETE and restored database keeps the derived flag transactionally aligned.
+func (c *Catalog) ensureCanonicalVideoMaterialization(ctx context.Context) error {
+	if _, err := c.db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS video_dedup_representatives (
+	video_id          TEXT NOT NULL,
+	basis             TEXT NOT NULL CHECK (basis IN ('self', 'content_hash', 'sampled_sha256', 'file_name_size')),
+	representative_id TEXT NOT NULL,
+	PRIMARY KEY (video_id, basis)
+);
+CREATE INDEX IF NOT EXISTS idx_video_dedup_representative
+	ON video_dedup_representatives(representative_id, video_id);
+`); err != nil {
+		return fmt.Errorf("create dedup representative table: %w", err)
+	}
+
+	canonicalValueSQL := `CASE WHEN ` + dynamicUniqueVideoWhereSQL + ` THEN 1 ELSE 0 END`
+	insertRepresentativeRefreshSQL := refreshInsertedVideoDedupRepresentativesSQL()
+	updateRepresentativeRefreshSQL := refreshUpdatedVideoDedupRepresentativesSQL()
+	deleteRepresentativeRefreshSQL := refreshDeletedVideoDedupRepresentativesSQL()
+	triggerSQL := `
+DROP TRIGGER IF EXISTS maintain_video_canonical_after_insert;
+DROP TRIGGER IF EXISTS maintain_video_canonical_after_update;
+DROP TRIGGER IF EXISTS maintain_video_canonical_after_delete;
+DROP TRIGGER IF EXISTS maintain_video_representatives_after_insert;
+DROP TRIGGER IF EXISTS maintain_video_representatives_after_update;
+DROP TRIGGER IF EXISTS maintain_video_representatives_after_delete;
+
+CREATE TRIGGER maintain_video_canonical_after_insert
+AFTER INSERT ON videos
+BEGIN
+	UPDATE videos
+	   SET is_canonical = ` + canonicalValueSQL + `
+	 WHERE ` + canonicalRowsMatchingNewVideoSQL + `
+	   AND is_canonical != ` + canonicalValueSQL + `;
+END;
+
+CREATE TRIGGER maintain_video_canonical_after_update
+AFTER UPDATE OF id, content_hash, sampled_sha256, size_bytes, file_name, created_at ON videos
+WHEN OLD.id IS NOT NEW.id
+	OR COALESCE(OLD.content_hash, '') IS NOT COALESCE(NEW.content_hash, '')
+	OR COALESCE(OLD.sampled_sha256, '') IS NOT COALESCE(NEW.sampled_sha256, '')
+	OR COALESCE(OLD.size_bytes, 0) IS NOT COALESCE(NEW.size_bytes, 0)
+	OR COALESCE(OLD.file_name, '') IS NOT COALESCE(NEW.file_name, '')
+	OR OLD.created_at IS NOT NEW.created_at
+BEGIN
+	UPDATE videos
+	   SET is_canonical = ` + canonicalValueSQL + `
+	 WHERE (` + canonicalRowsMatchingOldVideoSQL + ` OR ` + canonicalRowsMatchingNewVideoSQL + `)
+	   AND is_canonical != ` + canonicalValueSQL + `;
+END;
+
+CREATE TRIGGER maintain_video_canonical_after_delete
+AFTER DELETE ON videos
+BEGIN
+	UPDATE videos
+	   SET is_canonical = ` + canonicalValueSQL + `
+	 WHERE ` + canonicalRowsMatchingOldVideoSQL + `
+	   AND is_canonical != ` + canonicalValueSQL + `;
+END;
+
+CREATE TRIGGER maintain_video_representatives_after_insert
+AFTER INSERT ON videos
+BEGIN
+` + insertRepresentativeRefreshSQL + `
+END;
+
+CREATE TRIGGER maintain_video_representatives_after_update
+AFTER UPDATE OF id, content_hash, sampled_sha256, size_bytes, file_name, created_at ON videos
+WHEN OLD.id IS NOT NEW.id
+	OR COALESCE(OLD.content_hash, '') IS NOT COALESCE(NEW.content_hash, '')
+	OR COALESCE(OLD.sampled_sha256, '') IS NOT COALESCE(NEW.sampled_sha256, '')
+	OR COALESCE(OLD.size_bytes, 0) IS NOT COALESCE(NEW.size_bytes, 0)
+	OR COALESCE(OLD.file_name, '') IS NOT COALESCE(NEW.file_name, '')
+	OR OLD.created_at IS NOT NEW.created_at
+BEGIN
+` + updateRepresentativeRefreshSQL + `
+END;
+
+CREATE TRIGGER maintain_video_representatives_after_delete
+AFTER DELETE ON videos
+BEGIN
+` + deleteRepresentativeRefreshSQL + `
+END;
+`
+	if _, err := c.db.ExecContext(ctx, triggerSQL); err != nil {
+		return fmt.Errorf("install canonical video triggers: %w", err)
+	}
+
+	marker, err := c.GetSetting(ctx, canonicalMaterializationMarker, "")
+	if err != nil {
+		return fmt.Errorf("read canonical materialization marker: %w", err)
+	}
+	if strings.TrimSpace(marker) != "1" {
+		if _, err := c.db.ExecContext(ctx, `
+UPDATE videos
+	SET is_canonical = `+canonicalValueSQL+`
+	WHERE is_canonical != `+canonicalValueSQL); err != nil {
+			return fmt.Errorf("backfill canonical videos: %w", err)
+		}
+		var inconsistent int
+		if err := c.db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+	FROM videos
+	WHERE is_canonical != `+canonicalValueSQL).Scan(&inconsistent); err != nil {
+			return fmt.Errorf("verify canonical video backfill: %w", err)
+		}
+		if inconsistent != 0 {
+			return fmt.Errorf("verify canonical video backfill: %d inconsistent rows", inconsistent)
+		}
+		if err := c.SetSetting(ctx, canonicalMaterializationMarker, "1"); err != nil {
+			return fmt.Errorf("write canonical materialization marker: %w", err)
+		}
+	}
+
+	representativeMarker, err := c.GetSetting(ctx, dedupRepresentativesMarker, "")
+	if err != nil {
+		return fmt.Errorf("read dedup representative marker: %w", err)
+	}
+	if strings.TrimSpace(representativeMarker) != "1" {
+		tx, err := c.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin dedup representative backfill: %w", err)
+		}
+		defer tx.Rollback()
+		if _, err := tx.ExecContext(ctx, rebuildVideoDedupRepresentativesSQL("1 = 1", "")); err != nil {
+			return fmt.Errorf("backfill dedup representatives: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO settings (key, value, updated_at) VALUES (?, '1', ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+`, dedupRepresentativesMarker, time.Now().UnixMilli()); err != nil {
+			return fmt.Errorf("write dedup representative marker: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit dedup representative backfill: %w", err)
+		}
+	}
+	// This legacy index makes SQLite prefer a full visible-row scan followed by
+	// a temporary sort over the canonical expression indexes below.
+	if _, err := c.db.ExecContext(ctx, `
+DROP INDEX IF EXISTS idx_videos_visible_pub;
+DROP INDEX IF EXISTS idx_videos_canonical_hot_ready;
+DROP INDEX IF EXISTS idx_videos_canonical_recent_ready;
+`); err != nil {
+		return fmt.Errorf("drop superseded visible video index: %w", err)
+	}
+
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_videos_canonical_id
+			ON videos(id)
+			WHERE is_canonical = 1 AND COALESCE(hidden, 0) = 0`,
+		`CREATE INDEX IF NOT EXISTS idx_videos_canonical_latest
+			ON videos(published_at DESC, id ASC)
+			WHERE is_canonical = 1 AND COALESCE(hidden, 0) = 0`,
+		`CREATE INDEX IF NOT EXISTS idx_videos_canonical_latest_ready
+			ON videos(
+				CASE WHEN COALESCE(thumbnail_url, '') != '' THEN 0 ELSE 1 END,
+				published_at DESC,
+				id ASC
+			)
+			WHERE is_canonical = 1 AND COALESCE(hidden, 0) = 0`,
+	} {
+		if _, err := c.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("create canonical video index: %w", err)
+		}
+	}
+	return nil
+}
+
+func rebuildVideoDedupRepresentativesSQL(scopeSQL, removedVideoIDSQL string) string {
+	deleteWhere := `video_id IN (SELECT videos.id FROM videos WHERE ` + scopeSQL + `)`
+	if strings.TrimSpace(removedVideoIDSQL) != "" {
+		deleteWhere = `video_id = ` + removedVideoIDSQL + ` OR ` + deleteWhere
+	}
+	return `
+	DELETE FROM video_dedup_representatives
+	 WHERE ` + deleteWhere + `;
+
+	INSERT OR REPLACE INTO video_dedup_representatives (video_id, basis, representative_id)
+	SELECT videos.id, 'self', videos.id
+	  FROM videos
+	 WHERE ` + scopeSQL + `;
+
+	INSERT OR REPLACE INTO video_dedup_representatives (video_id, basis, representative_id)
+	SELECT videos.id,
+	       'content_hash',
+	       (SELECT canonical.id
+	          FROM videos canonical
+	         WHERE canonical.content_hash = videos.content_hash
+	           AND COALESCE(canonical.content_hash, '') != ''
+	         ORDER BY canonical.created_at ASC, canonical.id ASC
+	         LIMIT 1)
+	  FROM videos
+	 WHERE ` + scopeSQL + `
+	   AND COALESCE(videos.content_hash, '') != '';
+
+	INSERT OR REPLACE INTO video_dedup_representatives (video_id, basis, representative_id)
+	SELECT videos.id,
+	       'sampled_sha256',
+	       (SELECT canonical.id
+	          FROM videos canonical
+	         WHERE canonical.sampled_sha256 = videos.sampled_sha256
+	           AND canonical.size_bytes = videos.size_bytes
+	           AND COALESCE(canonical.sampled_sha256, '') != ''
+	           AND canonical.size_bytes > 0
+	         ORDER BY canonical.created_at ASC, canonical.id ASC
+	         LIMIT 1)
+	  FROM videos
+	 WHERE ` + scopeSQL + `
+	   AND COALESCE(videos.sampled_sha256, '') != ''
+	   AND videos.size_bytes > 0;
+
+	INSERT OR REPLACE INTO video_dedup_representatives (video_id, basis, representative_id)
+	SELECT videos.id,
+	       'file_name_size',
+	       (SELECT canonical.id
+	          FROM videos canonical
+	         WHERE canonical.file_name = videos.file_name
+	           AND canonical.size_bytes = videos.size_bytes
+	           AND COALESCE(canonical.file_name, '') != ''
+	           AND canonical.size_bytes > 0
+	         ORDER BY canonical.created_at ASC, canonical.id ASC
+	         LIMIT 1)
+	  FROM videos
+	 WHERE ` + scopeSQL + `
+	   AND COALESCE(videos.file_name, '') != ''
+	   AND videos.size_bytes > 0;
+`
+}
+
+func refreshInsertedVideoDedupRepresentativesSQL() string {
+	return `
+	DELETE FROM video_dedup_representatives WHERE video_id = NEW.id;
+	INSERT OR REPLACE INTO video_dedup_representatives (video_id, basis, representative_id)
+	VALUES (NEW.id, 'self', NEW.id);
+` + refreshVideoDedupRepresentativeGroupsSQL("", "NEW")
+}
+
+func refreshUpdatedVideoDedupRepresentativesSQL() string {
+	return `
+	DELETE FROM video_dedup_representatives WHERE video_id = OLD.id OR video_id = NEW.id;
+	INSERT OR REPLACE INTO video_dedup_representatives (video_id, basis, representative_id)
+	VALUES (NEW.id, 'self', NEW.id);
+` + refreshVideoDedupRepresentativeGroupsSQL("OLD", "NEW")
+}
+
+func refreshDeletedVideoDedupRepresentativesSQL() string {
+	return `
+	DELETE FROM video_dedup_representatives WHERE video_id = OLD.id;
+` + refreshVideoDedupRepresentativeGroupsSQL("OLD", "")
+}
+
+func refreshVideoDedupRepresentativeGroupsSQL(oldRef, newRef string) string {
+	hashScope := dedupRepresentativeHashScopeSQL(oldRef, newRef)
+	sampleScope := dedupRepresentativeSampleScopeSQL(oldRef, newRef)
+	fileScope := dedupRepresentativeFileScopeSQL(oldRef, newRef)
+	return `
+	INSERT OR REPLACE INTO video_dedup_representatives (video_id, basis, representative_id)
+	SELECT videos.id,
+	       'content_hash',
+	       (SELECT canonical.id
+	          FROM videos canonical
+	         WHERE canonical.content_hash = videos.content_hash
+	           AND COALESCE(canonical.content_hash, '') != ''
+	         ORDER BY canonical.created_at ASC, canonical.id ASC
+	         LIMIT 1)
+	  FROM videos
+	 WHERE ` + hashScope + `;
+
+	INSERT OR REPLACE INTO video_dedup_representatives (video_id, basis, representative_id)
+	SELECT videos.id,
+	       'sampled_sha256',
+	       (SELECT canonical.id
+	          FROM videos canonical
+	         WHERE canonical.sampled_sha256 = videos.sampled_sha256
+	           AND canonical.size_bytes = videos.size_bytes
+	           AND COALESCE(canonical.sampled_sha256, '') != ''
+	           AND canonical.size_bytes > 0
+	         ORDER BY canonical.created_at ASC, canonical.id ASC
+	         LIMIT 1)
+	  FROM videos
+	 WHERE ` + sampleScope + `;
+
+	INSERT OR REPLACE INTO video_dedup_representatives (video_id, basis, representative_id)
+	SELECT videos.id,
+	       'file_name_size',
+	       (SELECT canonical.id
+	          FROM videos canonical
+	         WHERE canonical.file_name = videos.file_name
+	           AND canonical.size_bytes = videos.size_bytes
+	           AND COALESCE(canonical.file_name, '') != ''
+	           AND canonical.size_bytes > 0
+	         ORDER BY canonical.created_at ASC, canonical.id ASC
+	         LIMIT 1)
+	  FROM videos
+	 WHERE ` + fileScope + `;
+`
+}
+
+func dedupRepresentativeHashScopeSQL(refs ...string) string {
+	conditions := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if ref == "" {
+			continue
+		}
+		conditions = append(conditions, `(COALESCE(`+ref+`.content_hash, '') != ''
+		AND videos.content_hash = `+ref+`.content_hash)`)
+	}
+	return strings.Join(conditions, " OR ")
+}
+
+func dedupRepresentativeSampleScopeSQL(refs ...string) string {
+	conditions := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if ref == "" {
+			continue
+		}
+		conditions = append(conditions, `(`+ref+`.size_bytes > 0
+		AND COALESCE(`+ref+`.sampled_sha256, '') != ''
+		AND videos.size_bytes = `+ref+`.size_bytes
+		AND videos.sampled_sha256 = `+ref+`.sampled_sha256)`)
+	}
+	return strings.Join(conditions, " OR ")
+}
+
+func dedupRepresentativeFileScopeSQL(refs ...string) string {
+	conditions := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if ref == "" {
+			continue
+		}
+		conditions = append(conditions, `(`+ref+`.size_bytes > 0
+		AND COALESCE(`+ref+`.file_name, '') != ''
+		AND videos.size_bytes = `+ref+`.size_bytes
+		AND videos.file_name = `+ref+`.file_name)`)
+	}
+	return strings.Join(conditions, " OR ")
+}
+
 var currentVideoColumnNames = []string{
 	"id",
 	"drive_id",
@@ -633,6 +1074,7 @@ var currentVideoColumnNames = []string{
 	"fingerprint_status",
 	"fingerprint_error",
 	"parent_id",
+	"ancestor_dir_ids",
 	"dir_name",
 	"title",
 	"author",
@@ -640,17 +1082,14 @@ var currentVideoColumnNames = []string{
 	"duration_seconds",
 	"size_bytes",
 	"ext",
-	"quality",
 	"thumbnail_url",
+	"thumbnail_updated_at",
 	"thumbnail_status",
 	"thumbnail_failures",
 	"preview_file_id",
 	"preview_local",
+	"preview_updated_at",
 	"preview_status",
-	"transcode_status",
-	"transcode_error",
-	"transcoded_file_id",
-	"transcoded_size",
 	"views",
 	"last_viewed_at",
 	"favorites",
@@ -659,6 +1098,7 @@ var currentVideoColumnNames = []string{
 	"last_liked_at",
 	"dislikes",
 	"hidden",
+	"is_canonical",
 	"tags_manual",
 	"badges",
 	"description",
@@ -667,8 +1107,8 @@ var currentVideoColumnNames = []string{
 	"updated_at",
 }
 
-const createVideosWithoutCategorySQL = `
-CREATE TABLE videos_category_drop_new (
+const createCurrentVideosTableSQL = `
+CREATE TABLE videos_schema_rebuild_new (
     id                 TEXT PRIMARY KEY,
     drive_id           TEXT NOT NULL,
     file_id            TEXT NOT NULL,
@@ -678,6 +1118,7 @@ CREATE TABLE videos_category_drop_new (
     fingerprint_status TEXT DEFAULT 'pending',
     fingerprint_error  TEXT DEFAULT '',
     parent_id          TEXT,
+    ancestor_dir_ids   TEXT NOT NULL DEFAULT '',
     dir_name           TEXT DEFAULT '',
     title              TEXT NOT NULL,
     author             TEXT,
@@ -685,17 +1126,14 @@ CREATE TABLE videos_category_drop_new (
     duration_seconds   INTEGER DEFAULT 0,
     size_bytes         INTEGER DEFAULT 0,
     ext                TEXT,
-    quality            TEXT,
     thumbnail_url      TEXT,
+	thumbnail_updated_at INTEGER DEFAULT 0,
     thumbnail_status   TEXT DEFAULT 'pending',
     thumbnail_failures INTEGER DEFAULT 0,
     preview_file_id    TEXT,
     preview_local      TEXT,
+    preview_updated_at INTEGER DEFAULT 0,
     preview_status     TEXT DEFAULT 'pending',
-    transcode_status   TEXT DEFAULT '',
-    transcode_error    TEXT DEFAULT '',
-    transcoded_file_id TEXT DEFAULT '',
-    transcoded_size    INTEGER DEFAULT 0,
     views              INTEGER DEFAULT 0,
     last_viewed_at     INTEGER DEFAULT 0,
     favorites          INTEGER DEFAULT 0,
@@ -704,6 +1142,7 @@ CREATE TABLE videos_category_drop_new (
     last_liked_at      INTEGER DEFAULT 0,
     dislikes           INTEGER DEFAULT 0,
     hidden             INTEGER DEFAULT 0,
+    is_canonical       INTEGER NOT NULL DEFAULT 1,
     tags_manual        INTEGER DEFAULT 0,
     badges             TEXT,
     description        TEXT,
@@ -712,28 +1151,28 @@ CREATE TABLE videos_category_drop_new (
     updated_at         INTEGER NOT NULL
 )`
 
-func (c *Catalog) rebuildVideosTableWithoutCategory(ctx context.Context) error {
+func (c *Catalog) rebuildVideosTableWithCurrentColumns(ctx context.Context) error {
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS videos_category_drop_new`); err != nil {
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS videos_schema_rebuild_new`); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, createVideosWithoutCategorySQL); err != nil {
+	if _, err := tx.ExecContext(ctx, createCurrentVideosTableSQL); err != nil {
 		return err
 	}
 	cols := strings.Join(currentVideoColumnNames, ", ")
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO videos_category_drop_new (`+cols+`) SELECT `+cols+` FROM videos`); err != nil {
+		`INSERT INTO videos_schema_rebuild_new (`+cols+`) SELECT `+cols+` FROM videos`); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE videos`); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `ALTER TABLE videos_category_drop_new RENAME TO videos`); err != nil {
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE videos_schema_rebuild_new RENAME TO videos`); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -840,11 +1279,47 @@ UPDATE videos
 	return nil
 }
 
+// requeueFailedThumbnailsWithReadyPreviewOnce repairs rows created before
+// preview completion became a thumbnail retry signal. Future rows are handled
+// transactionally by UpdatePreview; the marker prevents a permanently bad
+// source video from being retried on every process restart.
+func (c *Catalog) requeueFailedThumbnailsWithReadyPreviewOnce(ctx context.Context) error {
+	const markerKey = "videos.failed_thumbnail.ready_preview_requeued_v2"
+	marker, err := c.GetSetting(ctx, markerKey, "")
+	if err != nil {
+		return fmt.Errorf("read %s marker: %w", markerKey, err)
+	}
+	if strings.TrimSpace(marker) == "1" {
+		return nil
+	}
+	result, err := c.db.ExecContext(ctx, `
+UPDATE videos
+   SET thumbnail_status = 'pending',
+       thumbnail_failures = 0,
+       updated_at = ?
+ WHERE COALESCE(thumbnail_url, '') = ''
+   AND COALESCE(thumbnail_status, 'pending') = 'failed'
+   AND COALESCE(preview_status, 'pending') = 'ready'
+   AND TRIM(COALESCE(preview_local, '')) != ''
+`, time.Now().UnixMilli())
+	if err != nil {
+		return fmt.Errorf("requeue failed thumbnails with ready preview: %w", err)
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr == nil && affected > 0 {
+		log.Printf("[catalog] requeued %d failed thumbnail(s) with a ready local preview", affected)
+	}
+	if err := c.SetSetting(ctx, markerKey, "1"); err != nil {
+		return fmt.Errorf("write %s marker: %w", markerKey, err)
+	}
+	return nil
+}
+
 func (c *Catalog) requeueSkippedPreviews(ctx context.Context) error {
 	res, err := c.db.ExecContext(ctx, `
 UPDATE videos
    SET preview_file_id = '',
        preview_local = '',
+	   preview_updated_at = 0,
        preview_status = 'pending',
        updated_at = ?
  WHERE COALESCE(preview_status, 'pending') = 'skipped'
@@ -866,6 +1341,7 @@ func (c *Catalog) clearVolatileOneDriveThumbnails(ctx context.Context) error {
 	_, err := c.db.ExecContext(ctx, `
 UPDATE videos
    SET thumbnail_url = '',
+	   thumbnail_updated_at = 0,
        thumbnail_status = 'pending',
        updated_at = ?
  WHERE lower(COALESCE(thumbnail_url, '')) LIKE 'https://%mediap.svc.ms/transform/thumbnail%'
@@ -896,6 +1372,7 @@ func (c *Catalog) clearRemoteP123ThumbnailsOnce(ctx context.Context) error {
 	res, err := c.db.ExecContext(ctx, `
 	UPDATE videos
 	   SET thumbnail_url = '',
+	       thumbnail_updated_at = 0,
 	       thumbnail_status = 'pending',
 	       thumbnail_failures = 0,
 	       updated_at = ?
@@ -928,6 +1405,7 @@ func (c *Catalog) clearRemoteThumbnails(ctx context.Context) error {
 	res, err := c.db.ExecContext(ctx, `
 UPDATE videos
    SET thumbnail_url = '',
+	   thumbnail_updated_at = 0,
        thumbnail_status = 'pending',
        thumbnail_failures = 0,
        updated_at = ?

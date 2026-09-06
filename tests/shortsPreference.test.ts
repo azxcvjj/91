@@ -82,7 +82,7 @@ test("shorts progress dragging uses immediate pointer state", () => {
 test("mobile shorts scrubbing time is shown at the top", () => {
   assert.match(
     shortsPageSource,
-    /\{scrubbing && isActive && shouldLoad && !isMarkedHidden && \(\s*<div\s*ref=\{progressTimeRef\}\s*className="shorts-slide__progress-time"\s*aria-live="polite"\s*>\s*\{formatClock\(currentTimeRef\.current\)\} \/ \{formatClock\(duration\)\}/
+    /\{scrubbing &&\s*!playbackFailure &&\s*isActive &&\s*shouldLoad &&\s*!isMarkedHidden && \(\s*<div\s*ref=\{progressTimeRef\}\s*className="shorts-slide__progress-time"\s*aria-live="polite"\s*>\s*\{formatClock\(currentTimeRef\.current\)\} \/ \{formatClock\(duration\)\}/
   );
   assert.doesNotMatch(
     shortsPageSource,
@@ -91,6 +91,52 @@ test("mobile shorts scrubbing time is shown at the top", () => {
   assert.match(
     shortsCssSource,
     /@media \(hover: none\) and \(pointer: coarse\) \{\s*\.shorts-slide__progress-time \{\s*top: calc\(env\(safe-area-inset-top\) \+ 76px\);\s*bottom: auto;/
+  );
+});
+
+test("mobile shorts title stays plain text without creating a gesture dead zone", () => {
+  assert.match(
+    shortsPageSource,
+    /<h2 className="shorts-slide__title">\{item\.title\}<\/h2>/
+  );
+  assert.match(shortsPageSource, /<div className="shorts-slide__overlay">/);
+  assert.doesNotMatch(shortsPageSource, /shorts-slide__title-link/);
+  assert.doesNotMatch(shortsCssSource, /\.shorts-slide__overlay \* \{/);
+});
+
+test("the shorts drive badge is the only video detail link", () => {
+  assert.match(
+    shortsPageSource,
+    /const detailPath = `\/video\/\$\{encodeURIComponent\(item\.id\)\}`;/
+  );
+  assert.match(
+    shortsPageSource,
+    /<Link\s+to=\{detailPath\}\s+className="shorts-drive-badge"[\s\S]*?aria-label=\{`查看视频详情，来源：\$\{item\.sourceLabel \|\| "本地"\}`\}[\s\S]*?onClick=\{\(event\) => onRouteClick\(event, detailPath\)\}/
+  );
+  assert.doesNotMatch(shortsPageSource, /shorts-slide__detail|<Info\b|>查看详情</);
+  assert.doesNotMatch(shortsCssSource, /\.shorts-slide__detail/);
+  assert.match(
+    shortsCssSource,
+    /\.shorts-drive-badge\s*\{[^}]*cursor:\s*pointer;[^}]*-webkit-tap-highlight-color:\s*transparent;/s
+  );
+});
+
+test("low-height landscape shorts keep actions below the header", () => {
+  assert.match(
+    shortsCssSource,
+    /\.shorts-slide__actions \{[\s\S]*?right: calc\(14px \+ env\(safe-area-inset-right\)\);/
+  );
+  assert.match(
+    shortsCssSource,
+    /@media \(orientation: landscape\) and \(max-height: 520px\) \{\s*\.shorts-slide__actions \{\s*top: calc\(env\(safe-area-inset-top\) \+ 68px\);\s*bottom: auto;\s*gap: 12px;\s*\}\s*\}/
+  );
+  assert.doesNotMatch(
+    shortsCssSource,
+    /\.shorts-drive-badge\s*\{[^}]*display:\s*none;/s
+  );
+  assert.match(
+    shortsCssSource,
+    /padding: env\(safe-area-inset-top\)\s*calc\(16px \+ env\(safe-area-inset-right\)\) 0\s*calc\(16px \+ env\(safe-area-inset-left\)\);/
   );
 });
 
@@ -245,6 +291,73 @@ test("shorts retries interrupted active playback and exposes rejected autoplay",
   );
 });
 
+test("shorts exposes media failures separately from pause and retries in place", () => {
+  assert.match(
+    shortsPageSource,
+    /type ShortsPlaybackFailure =\s*\| "media-error"\s*\| "play-rejected"\s*\| "loop-restart";/
+  );
+  assert.match(
+    shortsPageSource,
+    /const \[playbackFailure, setPlaybackFailure\] =\s*useState<ShortsPlaybackFailure \| null>\(null\);/
+  );
+
+  const mediaErrorStart = shortsPageSource.indexOf("const handleError = () => {");
+  const mediaErrorEnd = shortsPageSource.indexOf(
+    "function syncActivePreloadReadiness",
+    mediaErrorStart
+  );
+  assert.ok(mediaErrorStart >= 0 && mediaErrorEnd > mediaErrorStart);
+  const mediaErrorBlock = shortsPageSource.slice(mediaErrorStart, mediaErrorEnd);
+  assert.match(mediaErrorBlock, /exposePlaybackFailure\("media-error"\);/);
+  assert.doesNotMatch(mediaErrorBlock, /setPaused\(true\)/);
+
+  assert.match(shortsPageSource, /exposePlaybackFailure\("play-rejected"\);/);
+  assert.match(shortsPageSource, /exposePlaybackFailure\("loop-restart"\);/);
+  assert.match(
+    shortsPageSource,
+    /\{paused &&\s*!playbackFailure &&\s*isActive &&\s*!scrubbing &&\s*!isMarkedHidden && \(/
+  );
+  assert.match(
+    shortsPageSource,
+    /className="shorts-slide__playback-error"\s*role="alert"[\s\S]*?<div className="shorts-slide__playback-error-title">播放失败<\/div>[\s\S]*?className="shorts-slide__playback-retry"[\s\S]*?>\s*重试播放\s*<\/button>/
+  );
+  assert.doesNotMatch(shortsPageSource, /视频暂时无法播放|>重新播放</);
+  const retryButtonMarkup =
+    /<button\s+[^>]*className="shorts-slide__playback-retry"[^>]*>[\s\S]*?<\/button>/.exec(
+      shortsPageSource
+    );
+  assert.ok(retryButtonMarkup, "playback retry button should be present");
+  assert.doesNotMatch(
+    retryButtonMarkup[0],
+    /<Play/,
+    "playback retry button should not contain an icon"
+  );
+  assert.doesNotMatch(
+    shortsCssSource,
+    /shorts-slide__playback-error-copy|shorts-slide__playback-error-message/
+  );
+
+  const retryStart = shortsPageSource.indexOf("function handlePlaybackRetry(");
+  const retryEnd = shortsPageSource.indexOf("// 手势输入", retryStart);
+  assert.ok(retryStart >= 0 && retryEnd > retryStart);
+  const retryBlock = shortsPageSource.slice(retryStart, retryEnd);
+  assert.match(retryBlock, /resetLoopRestartState\(\);/);
+  assert.match(retryBlock, /video\.load\(\);/);
+  assert.match(retryBlock, /\.play\(\)/);
+  assert.match(
+    shortsPageSource,
+    /disabled: isMarkedHidden \|\| playbackFailure !== null/
+  );
+  assert.match(
+    slideGesturesSource,
+    /const start = \(\) => \{\s*if \(optionsRef\.current\.disabled\) return;/
+  );
+  assert.match(
+    shortsCssSource,
+    /\.shorts-slide__playback-error \{[\s\S]*?width:\s*min\(240px, calc\(100% - 48px\)\);[\s\S]*?z-index: 18;[\s\S]*?backdrop-filter: blur\(14px\);/
+  );
+});
+
 test("shorts keyboard play pause does not show a toast", () => {
   const keyboardBlock = /else if \(e\.key === " "\) \{[\s\S]*?\} else if \(e\.key === "m"/.exec(useShortsKeyboardSource);
   assert.ok(keyboardBlock, "space key handler should be present");
@@ -300,7 +413,7 @@ test("shorts keeps the full heart animation when reduced motion is enabled", () 
   );
 });
 
-test("desktop held arrow-key seeking previews progress and commits once", () => {
+test("desktop left-key seeking and held right-key playback keep distinct semantics", () => {
   assert.match(
     useShortsKeyboardSource,
     /type ShortsKeyboardSeekPreview = \{[\s\S]*?videoIndex: number;[\s\S]*?currentTime: number;[\s\S]*?duration: number;/
@@ -315,7 +428,7 @@ test("desktop held arrow-key seeking previews progress and commits once", () => 
   );
   assert.match(
     useShortsKeyboardSource,
-    /const handleKeyUp = \(e: KeyboardEvent\) => \{[\s\S]*?keyboardSeekHeldKeysRef\.current\.delete\(e\.key\);[\s\S]*?size === 0\) finishKeyboardSeek\(\)/
+    /if \(e\.key !== "ArrowLeft"\) return;[\s\S]*?keyboardSeekHeldKeysRef\.current\.delete\(e\.key\);[\s\S]*?size === 0\) finishKeyboardSeek\(\)/
   );
   const previewStart = useShortsKeyboardSource.indexOf("const previewKeyboardSeek");
   const keydownStart = useShortsKeyboardSource.indexOf("const handleKeyDown", previewStart);
@@ -332,6 +445,34 @@ test("desktop held arrow-key seeking previews progress and commits once", () => 
     useShortsKeyboardSource,
     /SHORTS_KEYBOARD_SEEK_IDLE_COMMIT_MS[\s\S]*?scheduleKeyboardSeekIdleCommit/
   );
+  assert.match(
+    useShortsKeyboardSource,
+    /const SHORTS_KEYBOARD_FAST_PLAYBACK_DELAY_MS = 400;/
+  );
+  assert.match(
+    useShortsKeyboardSource,
+    /else if \(e\.key === "ArrowRight"\) \{\s*e\.preventDefault\(\);\s*if \(e\.repeat\) return;\s*startKeyboardRightPress\(\);/
+  );
+  assert.match(
+    useShortsKeyboardSource,
+    /keyboardRightPressTimer = window\.setTimeout\([\s\S]*?target\.video\.playbackRate = 2;[\s\S]*?setKeyboardFastPlaybackIndex\(target\.videoIndex\);[\s\S]*?SHORTS_KEYBOARD_FAST_PLAYBACK_DELAY_MS/
+  );
+  assert.match(
+    useShortsKeyboardSource,
+    /if \(target\.fastPlaybackActive\) \{[\s\S]*?target\.video\.playbackRate = 1;[\s\S]*?setKeyboardFastPlaybackIndex\(null\);/
+  );
+  assert.match(
+    useShortsKeyboardSource,
+    /if \(e\.key === "ArrowRight"\) \{[\s\S]*?finishKeyboardRightPress\(true\);/
+  );
+  assert.match(
+    useShortsKeyboardSource,
+    /seekOnShortPress[\s\S]*?previewKeyboardSeek\(\s*SHORTS_KEYBOARD_SEEK_SECONDS,\s*"ArrowRight"\s*\);/
+  );
+  assert.match(
+    useShortsKeyboardSource,
+    /const handleWindowBlur = \(\) => \{\s*finishKeyboardRightPress\(false\);/
+  );
   assert.match(useShortsKeyboardSource, /window\.addEventListener\("keyup", handleKeyUp\);/);
   assert.match(
     shortsPageSource,
@@ -344,6 +485,14 @@ test("desktop held arrow-key seeking previews progress and commits once", () => 
   assert.match(
     shortsPageSource,
     /keyboardSeekPreview=\{[\s\S]*?keyboardSeekPreview\?\.videoIndex === index[\s\S]*?\? keyboardSeekPreview/
+  );
+  assert.match(
+    shortsPageSource,
+    /keyboardFastPlayback=\{keyboardFastPlaybackIndex === index\}/
+  );
+  assert.match(
+    shortsPageSource,
+    /\{\(fastActive \|\| keyboardFastPlayback\) && \([\s\S]*?2x 速播放中/
   );
   assert.match(
     shortsPageSource,
@@ -364,7 +513,7 @@ test("shorts play pause does not render transient center hud", () => {
   assert.doesNotMatch(shortsCssSource, /@keyframes shorts-hud-pop/);
   assert.match(
     shortsPageSource,
-    /\{paused && isActive && !scrubbing && \(\s*<div className="shorts-slide__paused"/
+    /\{paused &&\s*!playbackFailure &&\s*isActive &&\s*!scrubbing &&\s*!isMarkedHidden && \(\s*<div className="shorts-slide__paused"/
   );
   assert.match(
     shortsPageSource,
@@ -375,6 +524,13 @@ test("shorts play pause does not render transient center hud", () => {
     /\.shorts-slide__paused-icon\s*\{[\s\S]*?width:\s*52px;[\s\S]*?height:\s*52px;[\s\S]*?border-radius:\s*50%;/
   );
   assert.doesNotMatch(shortsPageSource, />\s*▶\s*</);
+});
+
+test("shorts screen taps do not show the browser tap highlight", () => {
+  assert.match(
+    shortsCssSource,
+    /\.shorts-slide\s*\{[^}]*-webkit-tap-highlight-color:\s*transparent;/s
+  );
 });
 
 test("shorts hud toast keeps icon and text close together", () => {
@@ -413,21 +569,49 @@ test("shorts loading spinner covers video buffering and initial feed loading", (
     /@keyframes shorts-spinner-rotate\s*\{[\s\S]*to\s*\{\s*transform:\s*rotate\(360deg\);/
   );
   assert.match(shortsCssSource, /\.shorts-loading \.shorts-slide__loading-spinner\s*\{/);
-  assert.match(
-    shortsCssSource,
-    /@media \(max-width:\s*640px\)\s*\{[\s\S]*\.shorts-slide__buffering\s*\{[\s\S]*--shorts-spinner-size:\s*24px;[\s\S]*width:\s*56px;[\s\S]*height:\s*56px;/
+  const bufferingRule =
+    shortsCssSource.match(/\.shorts-slide__buffering\s*\{[^}]*\}/s)?.[0] ?? "";
+  assert.doesNotMatch(
+    bufferingRule,
+    /background:|backdrop-filter:|box-shadow:|border:|border-radius:|width:|height:/
   );
+  const mobileBufferingRule =
+    shortsCssSource.match(
+      /@media \(max-width:\s*640px\)\s*\{[\s\S]*?\.shorts-slide__buffering\s*\{[^}]*\}/
+    )?.[0] ?? "";
+  assert.match(mobileBufferingRule, /--shorts-spinner-size:\s*24px;/);
+  assert.doesNotMatch(mobileBufferingRule, /width:\s*56px|height:\s*56px/);
 });
 
-test("shorts preloads the next two original videos only after the active video has comfortable buffer", () => {
+test("shorts prepares the next video lightly until the active buffer is healthy", () => {
   assert.match(shortsPageSource, /const \[activeReadyForPreload, setActiveReadyForPreload\] = useState\(false\);/);
   assert.match(mediaBufferSource, /const ACTIVE_PRELOAD_BUFFER_SECONDS = 12;/);
-  assert.match(shortsPageSource, /const PRELOAD_AHEAD_COUNT = 2;/);
+  assert.match(mediaBufferSource, /export const PRELOAD_AHEAD_COUNT = 2;/);
+  // 下一条始终保留 src，但只有授权后才能和更后面的条目一起用 auto。
   assert.match(
     shortsPageSource,
-    /const preloadOffset = index - activeIndex;[\s\S]*?preloadOffset > 0 &&[\s\S]*?preloadOffset <= PRELOAD_AHEAD_COUNT;/
+    /const shouldPrepareNext =\s*!useIOSSharedVideo && preloadOffset === 1;/
   );
-  assert.match(shortsPageSource, /const shouldLoad = isActiveSlide \|\| shouldPreload \|\| shouldRetainCached;/);
+  assert.match(
+    shortsPageSource,
+    /const preloadOffset = index - activeIndex;[\s\S]*?preloadOffset > 0 &&[\s\S]*?preloadOffset <= getPreloadAheadCount\(activeReadyForPreload\);/
+  );
+  assert.doesNotMatch(
+    shortsPageSource,
+    /const shouldPreload =\s*!useIOSSharedVideo &&\s*activeReadyForPreload/
+  );
+  assert.match(
+    shortsPageSource,
+    /const shouldLoad =\s*isActiveSlide \|\|\s*shouldPrepareNext \|\|\s*shouldPreload \|\|\s*shouldRetainCached;/
+  );
+  assert.match(
+    shortsPageSource,
+    /const shouldEagerLoad = isActiveSlide \|\| shouldPreload;/
+  );
+  assert.match(
+    shortsPageSource,
+    /preload=\{shouldLoad \? \(shouldEagerLoad \? "auto" : "metadata"\) : "none"\}/
+  );
   assert.match(shortsPageSource, /shouldLoad=\{shouldLoad\}/);
   assert.match(shortsPageSource, /setActiveReadyForPreload\(false\);\s*setActiveIndex\(bestIndex\);/);
   assert.match(shortsPageSource, /function syncActivePreloadReadiness\(currentVideo: HTMLVideoElement\)/);
@@ -570,6 +754,14 @@ test("shorts empty library reuses the homepage empty visual", () => {
 
 test("shorts hidden overlay keeps only the concise confirmation", () => {
   assert.match(shortsPageSource, /shorts-slide__hidden-title">已隐藏该视频/);
+  assert.match(
+    shortsCssSource,
+    /\.shorts-slide__hidden-overlay\s*\{[\s\S]*?gap:\s*8px;/
+  );
+  assert.match(
+    shortsPageSource,
+    /\{paused &&\s*!playbackFailure &&\s*isActive &&\s*!scrubbing &&\s*!isMarkedHidden && \(/
+  );
   assert.doesNotMatch(
     shortsPageSource,
     /系统将不会再次在任何地方向您展示此视频|shorts-slide__hidden-desc/
@@ -649,7 +841,7 @@ test("shorts keeps buffered sources inside a four video window", () => {
   );
   assert.match(
     shortsPageSource,
-    /const shouldMount =\s*isActiveSlide \|\|\s*\(!useIOSSharedVideo && \(isInCacheWindow \|\| shouldPreload\)\);/
+    /const shouldMount =\s*isActiveSlide \|\|\s*\(!useIOSSharedVideo &&\s*\(isInCacheWindow \|\| shouldPrepareNext \|\| shouldPreload\)\);/
   );
   // 视频窗口内已缓冲过的视频都保留 src，来回切换均复用缓存
   assert.match(
@@ -737,9 +929,10 @@ test("shorts reuses one persistent media element across iOS slides", () => {
   assert.match(shortsPlatformSource, /function shouldUseIOSSharedVideo\(\)/);
   assert.match(shortsPlatformSource, /\\biPhone\\b\|\\biPad\\b\|\\biPod\\b/);
   assert.match(shortsPlatformSource, /navigator\.platform === "MacIntel" && navigator\.maxTouchPoints > 1/);
+  // iOS 走共享元素分支，完全不参与上面那套 <video> 预载
   assert.match(
     shortsPageSource,
-    /const shouldPreload =\s*!useIOSSharedVideo &&\s*activeReadyForPreload/
+    /const shouldPreload =\s*!useIOSSharedVideo &&/
   );
   assert.match(shortsPageSource, /const iosSharedVideoRef = useRef<HTMLVideoElement \| null>\(null\);/);
   assert.match(shortsPageSource, /if \(!video\) \{\s*video = document\.createElement\("video"\);/);
@@ -768,11 +961,15 @@ test("iOS preloads the next video on a standby element and promotes it on swipe"
     shortsPageSource,
     /const iosStandbyVideoRef = useRef<HTMLVideoElement \| null>\(null\);/
   );
-  // Preloading starts on the same high/low watermark the desktop branch uses,
-  // so it never steals bandwidth from a still-buffering active video.
+  // The standby keeps the next src but switches between metadata and auto on
+  // the same high/low watermark as the desktop branch.
   assert.match(
     shortsPageSource,
-    /if \(!useIOSSharedVideo \|\| iosStandbyPreloadDisabled \|\| !activeReadyForPreload\) \{\s*return;\s*\}\s*const nextIndex = activeIndex \+ 1;/
+    /if \(!useIOSSharedVideo \|\| iosStandbyPreloadDisabled\) return;[\s\S]*?const nextIndex = activeIndex \+ browseDirectionRef\.current;/
+  );
+  assert.match(
+    shortsPageSource,
+    /applyIOSVideoRole\(standby, "standby"\);\s*standby\.preload = activeReadyForPreload \? "auto" : "metadata";/
   );
   assert.match(
     shortsPageSource,
@@ -834,7 +1031,7 @@ test("iOS standby preload has a kill switch for on-device A/B", () => {
 test("the sound toggle also grants unmuted playback to the iOS standby element", () => {
   assert.match(
     shortsPageSource,
-    /const standbyVideo = iosStandbyVideoRef\.current;\s*if \(standbyVideo && standbyVideo !== activeVideo\) \{\s*unlockVideoAudioPlayback\(standbyVideo\);/
+    /if \(useIOSSharedVideo\) \{\s*const standbyVideo = iosStandbyVideoRef\.current;\s*if \(standbyVideo && standbyVideo !== activeVideo\) \{\s*unlockVideoAudioPlayback\(standbyVideo\);/
   );
   assert.match(
     shortsPageSource,
@@ -1071,7 +1268,7 @@ test("shorts grants preload only after the active video really started", () => {
   );
 });
 
-test("shorts sound toggle grants playback in the direct user click", () => {
+test("shorts sound toggle limits playback recovery to the iOS media path", () => {
   assert.match(shortsPageSource, /function applyVideoMutedState/);
   assert.doesNotMatch(shortsPageSource, /onFirstPointer/);
   assert.doesNotMatch(shortsPageSource, /currentPage\.addEventListener\("pointerdown"/);
@@ -1085,12 +1282,11 @@ test("shorts sound toggle grants playback in the direct user click", () => {
   assert.match(shortsPageSource, /onTouchStart=\{stopHeaderControlPropagation\}/);
   assert.match(shortsPageSource, /function normalizeVideoPlaybackRate/);
   assert.match(shortsPageSource, /function stabilizeVideoAfterAudioToggle/);
-  assert.match(shortsPageSource, /normalizeVideoPlaybackRate\(activeVideo\);/);
-  assert.match(shortsPageSource, /getVideoAtIndex\(activeIndexRef\.current\) === activeVideo/);
   assert.match(
     shortsPageSource,
-    /applyVideoMutedState\(activeVideo, next\);[\s\S]*?activeVideo\.play\(\)\.catch[\s\S]*?setMuted\(next\);/
+    /if \(!useIOSSharedVideo\) \{\s*applyVideoMutedState\(activeVideo, next\);\s*\} else \{[\s\S]*?normalizeVideoPlaybackRate\(activeVideo\);\s*applyVideoMutedState\(activeVideo, next\);[\s\S]*?activeVideo\.play\(\)\.catch[\s\S]*?stabilizeVideoAfterAudioToggle/
   );
+  assert.match(shortsPageSource, /getVideoAtIndex\(activeIndexRef\.current\) === activeVideo/);
   assert.match(shortsPageSource, /stabilizeVideoAfterAudioToggle\(\s*activeVideo,\s*canResumeActiveVideo\s*\);/);
   assert.match(shortsPageSource, /if \(shouldResume\(\) && video\.paused && !video\.ended\) \{/);
   assert.match(shortsPageSource, /for \(const delay of \[80, 240, 600\]\)/);
@@ -1147,7 +1343,7 @@ test("Windows viewport resize keeps the current short aligned", () => {
   );
   assert.match(
     shortsPageSource,
-    /const observer = new IntersectionObserver\(\s*\(entries\) => \{\s*if \(\s*viewportResizeAnchorIndexRef\.current !== null \|\|\s*queueTrimInProgressRef\.current\s*\) \{\s*return;\s*\}/
+    /const handleSlideIntersections = useCallback\([\s\S]*?if \(\s*viewportResizeAnchorIndexRef\.current !== null \|\|\s*queueTrimInProgressRef\.current\s*\) \{\s*slideVisibilityRef\.current\.clear\(\);\s*return;\s*\}/
   );
 });
 
@@ -1216,7 +1412,7 @@ test("shorts keeps per-swipe work off the queue length", () => {
   );
   assert.match(
     shortsPageSource,
-    /slideObserverRef\.current = observer;\s*return \(\) => \{\s*slideObserverRef\.current = null;\s*observedSlidesRef\.current = new WeakSet\(\);\s*observer\.disconnect\(\);\s*\};\s*\}, \[\]\);/
+    /slideObserverRef\.current = observer;\s*return \(\) => \{\s*slideObserverRef\.current = null;\s*observedSlidesRef\.current = new WeakSet\(\);\s*observer\.disconnect\(\);\s*slideVisibilityRef\.current\.clear\(\);\s*\};\s*\}, \[handleSlideIntersections\]\);/
   );
   assert.match(
     shortsPageSource,
@@ -1251,7 +1447,37 @@ test("shorts keeps per-swipe work off the queue length", () => {
   // ③ 备用元素预载不占绘制前的同步块；提升那一条仍然必须是 layout effect。
   assert.match(
     shortsPageSource,
-    /useEffect\(\(\) => \{\s*if \(!useIOSSharedVideo \|\| iosStandbyPreloadDisabled \|\| !activeReadyForPreload\)/
+    /useEffect\(\(\) => \{\s*if \(!useIOSSharedVideo \|\| iosStandbyPreloadDisabled\) return;/
+  );
+  // 备用元素始终保留下一条的源，但全速预载受当前视频健康状态控制。
+  assert.doesNotMatch(
+    shortsPageSource,
+    /iosStandbyPreloadDisabled \|\| !activeReadyForPreload/
+  );
+  assert.match(
+    shortsPageSource,
+    /standby\.preload = activeReadyForPreload \? "auto" : "metadata";/
+  );
+  // 拉下字节还不够：video 在真正播放前一直画 poster，要 seek 一次逼出首帧
+  assert.match(shortsPageSource, /warmStandbyFirstFrame\(standby\);/);
+  // 备用元素跟着浏览方向放：只盯 activeIndex+1 的话，往回看每一条都是冷启动
+  assert.match(shortsPageSource, /const browseDirectionRef = useRef\(1\);/);
+  assert.match(
+    shortsPageSource,
+    /browseDirectionRef\.current = activeIndex > previous \? 1 : -1;/
+  );
+  // 队列裁剪的索引重排不代表浏览方向
+  assert.match(
+    shortsPageSource,
+    /if \(!queueTrimInProgressRef\.current && activeIndex !== previous\)/
+  );
+  assert.match(
+    shortsPageSource,
+    /function warmStandbyFirstFrame\(video: HTMLVideoElement\)/
+  );
+  assert.match(
+    shortsPageSource,
+    /video\.addEventListener\("loadedmetadata", nudge, \{ once: true \}\)/
   );
   assert.match(
     shortsPageSource,
@@ -1259,12 +1485,12 @@ test("shorts keeps per-swipe work off the queue length", () => {
   );
 });
 
-test("shorts back button exits document fullscreen before showing home", () => {
-  assert.match(shortsPageSource, /import \{ Link, useNavigate \} from "react-router-dom";/);
+test("shorts links exit document fullscreen before leaving the immersive page", () => {
+  assert.match(shortsPageSource, /import \{ Link, useNavigate \} from "react-router";/);
   assert.match(shortsPageSource, /const navigate = useNavigate\(\);/);
   assert.match(
     shortsPageSource,
-    /const handleBackToHomeClick = useCallback\([\s\S]*?const exitRequest = exitDocumentFullscreen\(\);[\s\S]*?if \(!exitRequest\) return;[\s\S]*?event\.preventDefault\(\);[\s\S]*?exitRequest\.then\(returnHome, returnHome\)/
+    /const handleShortsRouteClick = useCallback\([\s\S]*?const exitRequest = exitDocumentFullscreen\(\);[\s\S]*?if \(!exitRequest\) return;[\s\S]*?event\.preventDefault\(\);[\s\S]*?const completeNavigation = \(\) => navigate\(destination\);[\s\S]*?exitRequest\.then\(completeNavigation, completeNavigation\)/
   );
   assert.match(
     shortsPageSource,
@@ -1273,6 +1499,15 @@ test("shorts back button exits document fullscreen before showing home", () => {
   assert.match(
     shortsPageSource,
     /<Link\s*to="\/"[\s\S]*?className="shorts-header__back"[\s\S]*?onClick=\{handleBackToHomeClick\}/
+  );
+  assert.match(
+    shortsPageSource,
+    /onRouteClick=\{handleShortsRouteClick\}/
+  );
+  assert.doesNotMatch(shortsPageSource, /shorts-slide__title-link/);
+  assert.match(
+    shortsPageSource,
+    /className="shorts-drive-badge"[\s\S]*?onClick=\{\(event\) => onRouteClick\(event, detailPath\)\}/
   );
 });
 

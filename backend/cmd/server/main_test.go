@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +31,7 @@ import (
 	"github.com/video-site/backend/internal/mediaasset"
 	"github.com/video-site/backend/internal/preview"
 	"github.com/video-site/backend/internal/proxy"
+	"github.com/video-site/backend/internal/scanner"
 )
 
 func TestHashPasswordCommandProducesBcryptHash(t *testing.T) {
@@ -83,6 +85,140 @@ func TestGuangYaPanLegacyRootPath(t *testing.T) {
 	}
 	if got := guangYaPanLegacyRootPath("folder-id", credentials); got != "" {
 		t.Fatalf("root ID should take precedence, legacy path = %q", got)
+	}
+}
+
+func TestPersistDriveCredentialsPreservesSkipDirsSavedAfterAttach(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:         "pikpak-main",
+		Kind:       "pikpak",
+		Name:       "PikPak",
+		RootID:     "root",
+		SkipDirIDs: []string{"old-dir"},
+		Credentials: map[string]string{
+			"access_token":  "old-access",
+			"refresh_token": "old-refresh",
+		},
+		Status: "ok",
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	if err := cat.SetDriveSkipDirIDs(ctx, "pikpak-main", []string{"latest-dir"}); err != nil {
+		t.Fatalf("save skip dirs: %v", err)
+	}
+
+	app := &App{cat: cat}
+	lease := app.beginDriveCredentialLease("pikpak-main")
+	app.persistDriveCredentials(lease, map[string]string{
+		"access_token":  "new-access",
+		"refresh_token": "new-refresh",
+	})
+
+	got, err := cat.GetDrive(ctx, "pikpak-main")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if len(got.SkipDirIDs) != 1 || got.SkipDirIDs[0] != "latest-dir" {
+		t.Fatalf("skip dir ids = %#v, want latest setting", got.SkipDirIDs)
+	}
+	if got.Credentials["access_token"] != "new-access" || got.Credentials["refresh_token"] != "new-refresh" {
+		t.Fatalf("credentials = %#v, want refreshed tokens", got.Credentials)
+	}
+}
+
+func TestStaleDriveCredentialLeaseCannotOverwriteRemountedTokens(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:     "onedrive-main",
+		Kind:   "onedrive",
+		Name:   "OneDrive",
+		RootID: "root",
+		Credentials: map[string]string{
+			"access_token":  "seed-access",
+			"refresh_token": "seed-refresh",
+		},
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	app := &App{cat: cat}
+	staleLease := app.beginDriveCredentialLease("onedrive-main")
+	activeLease := app.beginDriveCredentialLease("onedrive-main")
+	app.persistDriveCredentials(activeLease, map[string]string{
+		"access_token":  "active-access",
+		"refresh_token": "active-refresh",
+	})
+	app.persistDriveCredentials(staleLease, map[string]string{
+		"access_token":  "late-stale-access",
+		"refresh_token": "late-stale-refresh",
+	})
+
+	got, err := cat.GetDrive(ctx, "onedrive-main")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if got.Credentials["access_token"] != "active-access" || got.Credentials["refresh_token"] != "active-refresh" {
+		t.Fatalf("credentials = %#v, stale runtime callback overwrote active tokens", got.Credentials)
+	}
+}
+
+func TestDriveCredentialLeaseRejectsCallbackAfterAdminTokenReplacement(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:     "onedrive-main",
+		Kind:   "onedrive",
+		Name:   "OneDrive",
+		RootID: "root",
+		Credentials: map[string]string{
+			"access_token":  "old-access",
+			"refresh_token": "old-refresh",
+		},
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	app := &App{cat: cat}
+	lease := app.beginDriveCredentialLease("onedrive-main")
+	drive, err := cat.GetDrive(ctx, "onedrive-main")
+	if err != nil {
+		t.Fatalf("get drive for lease: %v", err)
+	}
+	configureDriveCredentialLease(lease, drive)
+
+	if err := cat.PatchDriveCredentials(ctx, "onedrive-main", map[string]string{
+		"refresh_token": "administrator-refresh",
+	}); err != nil {
+		t.Fatalf("replace token as administrator: %v", err)
+	}
+	app.persistDriveCredentials(lease, map[string]string{
+		"access_token":  "late-runtime-access",
+		"refresh_token": "late-runtime-refresh",
+	})
+
+	got, err := cat.GetDrive(ctx, "onedrive-main")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if got.Credentials["access_token"] != "old-access" || got.Credentials["refresh_token"] != "administrator-refresh" {
+		t.Fatalf("credentials = %#v, late callback overwrote administrator token", got.Credentials)
 	}
 }
 
@@ -141,6 +277,72 @@ func TestListDriveDirChildrenPersistsFailureAndRecovery(t *testing.T) {
 	}
 	if got.Status != "ok" || got.LastError != "" {
 		t.Fatalf("status=%q lastError=%q, want recovered ok status", got.Status, got.LastError)
+	}
+}
+
+func TestListDriveDirChildrenPreservesOriginalAttachFailure(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	const attachError = "pikpak error_code=4126 error=invalid_grant description=AccessProhibited"
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:        "pikpak-main",
+		Kind:      "pikpak",
+		Name:      "PikPak",
+		RootID:    "",
+		Status:    "error",
+		LastError: attachError,
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	app := &App{cat: cat, registry: proxy.NewRegistry()}
+	if _, err := app.listDriveDirChildren(ctx, "pikpak-main", ""); err == nil || !strings.Contains(err.Error(), attachError) {
+		t.Fatalf("dirtree error = %v, want original attach failure", err)
+	}
+
+	got, err := cat.GetDrive(ctx, "pikpak-main")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if got.Status != "error" || got.LastError != attachError {
+		t.Fatalf("status=%q lastError=%q, want original attach failure preserved", got.Status, got.LastError)
+	}
+}
+
+func TestListDriveDirChildrenRecordsMissingAttachWithoutOriginalFailure(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:     "drive-id",
+		Kind:   "pikpak",
+		Name:   "PikPak",
+		RootID: "",
+		Status: "disconnected",
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	app := &App{cat: cat, registry: proxy.NewRegistry()}
+	if _, err := app.listDriveDirChildren(ctx, "drive-id", ""); err == nil {
+		t.Fatal("list directory succeeded, want missing-attach error")
+	}
+
+	got, err := cat.GetDrive(ctx, "drive-id")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if got.Status != "error" || !strings.Contains(got.LastError, "drive drive-id not attached") {
+		t.Fatalf("status=%q lastError=%q, want missing-attach failure recorded", got.Status, got.LastError)
 	}
 }
 
@@ -434,6 +636,577 @@ func TestUpdateScriptCrawlerRunStatePreservesCurrentTeaserSwitch(t *testing.T) {
 	}
 }
 
+func TestDriveRuntimeConfigUpdateDefersUntilActiveTaskExits(t *testing.T) {
+	app := &App{}
+	ctx := context.Background()
+
+	taskCtx, done, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0)
+	if !admitted {
+		t.Fatal("idle drive rejected task admission")
+	}
+	lease, reason := app.beginDriveConfigUpdate("drive-id")
+	if lease == nil || reason != "" {
+		t.Fatalf("begin config update = %#v/%q", lease, reason)
+	}
+	if reason := lease.Authorize(api.DriveConfigUpdateRuntime); reason != "" {
+		t.Fatalf("runtime update rejected while task was active: %s", reason)
+	}
+	applied := make(chan struct{}, 1)
+	deferred, err := lease.Commit(api.DriveConfigUpdateRuntime, func() error {
+		applied <- struct{}{}
+		return nil
+	})
+	if err != nil || !deferred {
+		t.Fatalf("commit deferred/error = %v/%v, want true/nil", deferred, err)
+	}
+	lease.Release()
+	if _, _, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0); admitted {
+		t.Fatal("new task started while configuration was pending")
+	}
+	select {
+	case <-applied:
+		t.Fatal("configuration applied before the active task exited")
+	default:
+	}
+
+	if canceled := app.cancelDriveTaskContexts("drive-id"); canceled != 1 {
+		t.Fatalf("canceled tasks = %d, want 1", canceled)
+	}
+	if taskCtx.Err() == nil {
+		t.Fatal("task context was not canceled")
+	}
+	select {
+	case <-applied:
+		t.Fatal("cancel signal applied configuration before task cleanup")
+	default:
+	}
+	done()
+	select {
+	case <-applied:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deferred configuration was not applied after task exit")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for app.driveConfigPending("drive-id") && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	_, done, admitted = app.registerDriveTaskContext(ctx, "drive-id", 0)
+	if !admitted {
+		t.Fatal("task admission did not recover after deferred apply")
+	}
+	done()
+
+	lease = nil
+	for time.Now().Before(deadline) && lease == nil {
+		lease, reason = app.beginDriveConfigUpdate("drive-id")
+		if lease == nil {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if lease == nil || reason != "" {
+		t.Fatalf("begin idle config update = %#v/%q", lease, reason)
+	}
+	if reason := lease.Authorize(api.DriveConfigUpdateRuntime); reason != "" {
+		t.Fatalf("idle runtime update rejected: %s", reason)
+	}
+	if second, reason := app.beginDriveConfigUpdate("drive-id"); second != nil || reason == "" {
+		t.Fatalf("concurrent config writer = %#v/%q, want rejection", second, reason)
+	}
+	immediate, err := lease.Commit(api.DriveConfigUpdateRuntime, nil)
+	if err != nil || immediate {
+		t.Fatalf("idle commit deferred/error = %v/%v", immediate, err)
+	}
+	lease.Release()
+}
+
+func TestDriveConfigUpdateAllowsNewDriveWithoutActiveSnapshot(t *testing.T) {
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+	app := &App{cat: cat}
+	lease, reason := app.beginDriveConfigUpdate("new-drive")
+	if lease == nil || reason != "" {
+		t.Fatalf("begin update = %#v/%q", lease, reason)
+	}
+	if reason := lease.Authorize(api.DriveConfigUpdateRuntime); reason != "" {
+		t.Fatalf("new drive update rejected: %s", reason)
+	}
+	if err := cat.UpsertDrive(context.Background(), &catalog.Drive{
+		ID: "new-drive", Kind: "onedrive", Name: "New", RootID: "root",
+	}); err != nil {
+		t.Fatalf("save new drive: %v", err)
+	}
+	if deferred, err := lease.Commit(api.DriveConfigUpdateRuntime, nil); err != nil || deferred {
+		t.Fatalf("new drive commit deferred/error = %v/%v", deferred, err)
+	}
+	lease.Release()
+}
+
+func TestDeferredDriveConfigKeepsTaskSnapshotUntilApply(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: "drive-id", Kind: "onedrive", Name: "Drive", RootID: "old-root",
+		Credentials: map[string]string{"refresh_token": "old-token"},
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	app := &App{cat: cat}
+	taskCtx, done, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0)
+	if !admitted {
+		t.Fatal("task admission rejected")
+	}
+	lease, _ := app.beginDriveConfigUpdate("drive-id")
+	if reason := lease.Authorize(api.DriveConfigUpdateRuntime); reason != "" {
+		t.Fatalf("authorize update: %s", reason)
+	}
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: "drive-id", Kind: "onedrive", Name: "Drive", RootID: "new-root",
+		Credentials: map[string]string{"refresh_token": "new-token"},
+	}); err != nil {
+		t.Fatalf("save desired config: %v", err)
+	}
+	deferred, err := lease.Commit(api.DriveConfigUpdateRuntime, nil)
+	if err != nil || !deferred {
+		t.Fatalf("commit deferred/error = %v/%v", deferred, err)
+	}
+	lease.Release()
+
+	active, err := app.activeDriveConfig(taskCtx, "drive-id")
+	if err != nil {
+		t.Fatalf("read active snapshot: %v", err)
+	}
+	if active.RootID != "old-root" || active.Credentials["refresh_token"] != "old-token" {
+		t.Fatalf("active config = root %q credentials %#v, want old snapshot", active.RootID, active.Credentials)
+	}
+	desired, err := cat.GetDrive(ctx, "drive-id")
+	if err != nil {
+		t.Fatalf("read desired config: %v", err)
+	}
+	if desired.RootID != "new-root" || desired.Credentials["refresh_token"] != "new-token" {
+		t.Fatalf("desired config = root %q credentials %#v", desired.RootID, desired.Credentials)
+	}
+
+	done()
+	deadline := time.Now().Add(2 * time.Second)
+	for app.driveConfigPending("drive-id") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if app.driveConfigPending("drive-id") {
+		t.Fatal("deferred configuration did not become active")
+	}
+	active, err = app.activeDriveConfig(ctx, "drive-id")
+	if err != nil {
+		t.Fatalf("read applied config: %v", err)
+	}
+	if active.RootID != "new-root" || active.Credentials["refresh_token"] != "new-token" {
+		t.Fatalf("applied config = root %q credentials %#v", active.RootID, active.Credentials)
+	}
+}
+
+func TestDriveConfigUpdateDefersEveryTaskSensitiveScope(t *testing.T) {
+	app := &App{}
+	ctx := context.Background()
+
+	for _, scope := range []api.DriveConfigUpdateScope{
+		api.DriveConfigUpdatePreview,
+		api.DriveConfigUpdateScan,
+	} {
+		_, taskDone, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0)
+		if !admitted {
+			t.Fatal("task admission rejected")
+		}
+		lease, beginReason := app.beginDriveConfigUpdate("drive-id")
+		deadline := time.Now().Add(2 * time.Second)
+		for lease == nil && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+			lease, beginReason = app.beginDriveConfigUpdate("drive-id")
+		}
+		if lease == nil {
+			t.Fatalf("scope %d could not begin config update: %s", scope, beginReason)
+		}
+		if reason := lease.Authorize(scope); reason != "" {
+			t.Fatalf("scope %d rejected during task: %s", scope, reason)
+		}
+		applied := make(chan struct{}, 1)
+		deferred, err := lease.Commit(scope, func() error {
+			applied <- struct{}{}
+			return nil
+		})
+		if err != nil || !deferred {
+			t.Fatalf("scope %d deferred/error = %v/%v", scope, deferred, err)
+		}
+		lease.Release()
+		taskDone()
+		select {
+		case <-applied:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("scope %d did not apply after task exit", scope)
+		}
+	}
+}
+
+func TestDeferredPreviewConfigRestoresWorkersStoppedDuringDrain(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: "drive-id", Kind: "fake", Name: "Drive", RootID: "root",
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	drv := &serverFakeDrive{}
+	registry := proxy.NewRegistry()
+	registry.Set("drive-id", drv)
+	gen := &serverFakeTeaserGenerator{}
+	oldWorker := preview.NewWorker(gen, cat, drv)
+	oldThumbWorker := preview.NewThumbWorker(gen, cat, drv)
+	oldFingerprintWorker := fingerprint.NewWorker(cat, drv, fingerprint.Config{})
+	app := &App{
+		cfg:                &config.Config{},
+		cat:                cat,
+		registry:           registry,
+		workers:            map[string]*preview.Worker{"drive-id": oldWorker},
+		thumbWorkers:       map[string]*preview.ThumbWorker{"drive-id": oldThumbWorker},
+		fingerprintWorkers: map[string]*fingerprint.Worker{"drive-id": oldFingerprintWorker},
+		cancels:            map[string]context.CancelFunc{"drive-id": func() {}},
+	}
+	taskCtx, taskDone, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0)
+	if !admitted {
+		t.Fatal("task admission rejected")
+	}
+	lease, _ := app.beginDriveConfigUpdate("drive-id")
+	if reason := lease.Authorize(api.DriveConfigUpdatePreview); reason != "" {
+		t.Fatalf("authorize preview update: %s", reason)
+	}
+	callbackSawWorkers := make(chan bool, 1)
+	deferred, err := lease.Commit(api.DriveConfigUpdatePreview, func() error {
+		app.mu.Lock()
+		ready := app.workers["drive-id"] != nil &&
+			app.thumbWorkers["drive-id"] != nil &&
+			app.fingerprintWorkers["drive-id"] != nil
+		app.mu.Unlock()
+		callbackSawWorkers <- ready
+		return nil
+	})
+	if err != nil || !deferred {
+		t.Fatalf("commit deferred/error = %v/%v, want true/nil", deferred, err)
+	}
+	lease.Release()
+
+	if !app.stopDriveTasks(ctx, "drive-id") {
+		t.Fatal("stopDriveTasks returned false")
+	}
+	if taskCtx.Err() == nil {
+		t.Fatal("active task was not canceled")
+	}
+	app.mu.Lock()
+	workersPresentWhilePending := app.workers["drive-id"] != nil ||
+		app.thumbWorkers["drive-id"] != nil || app.fingerprintWorkers["drive-id"] != nil
+	app.mu.Unlock()
+	if workersPresentWhilePending {
+		t.Fatal("generation workers were restarted before the old task drained")
+	}
+
+	taskDone()
+	select {
+	case ready := <-callbackSawWorkers:
+		if !ready {
+			t.Fatal("preview callback ran before stopped workers were restored")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("deferred preview update did not apply")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for app.driveConfigPending("drive-id") && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	app.mu.Lock()
+	newWorker := app.workers["drive-id"]
+	newThumbWorker := app.thumbWorkers["drive-id"]
+	newFingerprintWorker := app.fingerprintWorkers["drive-id"]
+	app.mu.Unlock()
+	if newWorker == nil || newWorker == oldWorker ||
+		newThumbWorker == nil || newThumbWorker == oldThumbWorker ||
+		newFingerprintWorker == nil || newFingerprintWorker == oldFingerprintWorker {
+		t.Fatal("stopped generation workers were not replaced after deferred apply")
+	}
+}
+
+func TestAbortedDeferredConfigRestoresWorkersBeforeUnblocking(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: "drive-id", Kind: "fake", Name: "Drive", RootID: "root",
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	registry := proxy.NewRegistry()
+	registry.Set("drive-id", &serverFakeDrive{})
+	app := &App{cfg: &config.Config{}, cat: cat, registry: registry}
+	_, taskDone, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0)
+	if !admitted {
+		t.Fatal("task admission rejected")
+	}
+	lease, _ := app.beginDriveConfigUpdate("drive-id")
+	if reason := lease.Authorize(api.DriveConfigUpdatePreview); reason != "" {
+		t.Fatalf("authorize preview update: %s", reason)
+	}
+	if !app.stopDriveTasks(ctx, "drive-id") {
+		t.Fatal("stopDriveTasks returned false")
+	}
+
+	// Releasing without Commit models persistence failing after authorization.
+	lease.Release()
+	if app.driveConfigPending("drive-id") {
+		t.Fatal("aborted configuration left the gate pending")
+	}
+	app.mu.Lock()
+	workersReady := app.workers["drive-id"] != nil &&
+		app.thumbWorkers["drive-id"] != nil &&
+		app.fingerprintWorkers["drive-id"] != nil
+	app.mu.Unlock()
+	if !workersReady {
+		t.Fatal("aborted configuration unblocked admissions without restoring workers")
+	}
+	taskDone()
+}
+
+func TestGenerationWorkerGuardKeepsOldRuntimeAliveUntilProviderCallReturns(t *testing.T) {
+	app := &App{}
+	worker, _, _ := app.newDriveGenerationWorkers(&serverFakeDrive{})
+	if worker.TaskGuard == nil {
+		t.Fatal("preview worker task guard is not configured")
+	}
+	providerCallDone := worker.TaskGuard()
+	if providerCallDone == nil {
+		t.Fatal("current worker generation was not admitted")
+	}
+
+	lease, _ := app.beginDriveConfigUpdate("drive-id")
+	if reason := lease.Authorize(api.DriveConfigUpdateRuntime); reason != "" {
+		t.Fatalf("runtime update rejected: %s", reason)
+	}
+	applied := make(chan struct{}, 1)
+	deferred, err := lease.Commit(api.DriveConfigUpdateRuntime, func() error {
+		applied <- struct{}{}
+		return nil
+	})
+	if err != nil || !deferred {
+		t.Fatalf("commit deferred/error = %v/%v", deferred, err)
+	}
+	lease.Release()
+	providerCallDone()
+	select {
+	case <-applied:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime did not switch after provider call returned")
+	}
+	if release := worker.TaskGuard(); release != nil {
+		release()
+		t.Fatal("retired worker generation was admitted after runtime switch")
+	}
+}
+
+func TestDriveConfigUpdateCoalescesPendingRuntimeCallbacks(t *testing.T) {
+	app := &App{}
+	ctx := context.Background()
+	_, done, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0)
+	if !admitted {
+		t.Fatal("task admission rejected")
+	}
+	var first, latest atomic.Int32
+	lease, _ := app.beginDriveConfigUpdate("drive-id")
+	if reason := lease.Authorize(api.DriveConfigUpdateRuntime); reason != "" {
+		t.Fatal(reason)
+	}
+	if deferred, err := lease.Commit(api.DriveConfigUpdateRuntime, func() error {
+		first.Add(1)
+		return nil
+	}); err != nil || !deferred {
+		t.Fatalf("first commit deferred/error = %v/%v", deferred, err)
+	}
+	lease.Release()
+
+	lease, _ = app.beginDriveConfigUpdate("drive-id")
+	if reason := lease.Authorize(api.DriveConfigUpdateRuntime); reason != "" {
+		t.Fatal(reason)
+	}
+	if deferred, err := lease.Commit(api.DriveConfigUpdateRuntime, func() error {
+		latest.Add(1)
+		return nil
+	}); err != nil || !deferred {
+		t.Fatalf("latest commit deferred/error = %v/%v", deferred, err)
+	}
+	lease.Release()
+	done()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for latest.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := first.Load(); got != 0 {
+		t.Fatalf("superseded callback ran %d time(s)", got)
+	}
+	if got := latest.Load(); got != 1 {
+		t.Fatalf("latest callback ran %d time(s), want 1", got)
+	}
+}
+
+func TestDriveDeleteStopsAndDrainsTasksAndSupersedesPendingConfig(t *testing.T) {
+	app := &App{}
+	ctx := context.Background()
+	oldGate := app.driveOperationGate("drive-id")
+	taskCtx, taskDone, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0)
+	if !admitted {
+		t.Fatal("task admission rejected")
+	}
+
+	configLease, _ := app.beginDriveConfigUpdate("drive-id")
+	if reason := configLease.Authorize(api.DriveConfigUpdateRuntime); reason != "" {
+		t.Fatalf("authorize pending config: %s", reason)
+	}
+	applied := make(chan struct{}, 1)
+	if deferred, err := configLease.Commit(api.DriveConfigUpdateRuntime, func() error {
+		applied <- struct{}{}
+		return nil
+	}); err != nil || !deferred {
+		t.Fatalf("pending config commit deferred/error = %v/%v", deferred, err)
+	}
+	configLease.Release()
+
+	deleteLease, reason := app.beginDriveConfigUpdate("drive-id")
+	if deleteLease == nil || reason != "" {
+		t.Fatalf("begin delete = %#v/%q", deleteLease, reason)
+	}
+	if reason := deleteLease.Authorize(api.DriveConfigUpdateDestructive); reason != "" {
+		t.Fatalf("delete rejected active task/pending config: %s", reason)
+	}
+	if _, _, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0); admitted {
+		t.Fatal("new task was admitted after deletion began")
+	}
+
+	exited := make(chan struct{})
+	go func() {
+		<-taskCtx.Done()
+		taskDone()
+		close(exited)
+	}()
+	if !app.stopDriveTasks(ctx, "drive-id") {
+		t.Fatal("delete preparation did not stop the active task")
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := app.waitDriveTasksStopped(waitCtx, "drive-id"); err != nil {
+		t.Fatalf("wait for task exit: %v", err)
+	}
+	select {
+	case <-exited:
+	default:
+		t.Fatal("drain returned before task cleanup completed")
+	}
+	select {
+	case <-applied:
+		t.Fatal("pending configuration applied while deletion was draining tasks")
+	default:
+	}
+	if deferred, err := deleteLease.Commit(api.DriveConfigUpdateDestructive, nil); err != nil || deferred {
+		t.Fatalf("complete delete deferred/error = %v/%v", deferred, err)
+	}
+	deleteLease.Release()
+
+	select {
+	case <-applied:
+		t.Fatal("pending configuration callback ran after deletion superseded it")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if newGate := app.driveOperationGate("drive-id"); newGate == oldGate {
+		t.Fatal("deleted drive kept its retired operation gate")
+	}
+}
+
+func TestCanceledDriveDeleteKeepsAdmissionsBlockedUntilOldTaskExits(t *testing.T) {
+	app := &App{}
+	ctx := context.Background()
+	_, taskDone, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0)
+	if !admitted {
+		t.Fatal("task admission rejected")
+	}
+	deleteLease, _ := app.beginDriveConfigUpdate("drive-id")
+	if reason := deleteLease.Authorize(api.DriveConfigUpdateDestructive); reason != "" {
+		t.Fatalf("authorize delete: %s", reason)
+	}
+	// Releasing without Commit models a canceled delete request before the
+	// cooperative task cancellation reached the task's deferred cleanup.
+	deleteLease.Release()
+	if _, _, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0); admitted {
+		t.Fatal("new task admitted while the canceled old task was still exiting")
+	}
+	taskDone()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, done, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0)
+		if admitted {
+			done()
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("task admissions did not recover after canceled delete drained")
+}
+
+func TestFailedDriveDeleteResumesPendingConfig(t *testing.T) {
+	app := &App{}
+	ctx := context.Background()
+	_, taskDone, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0)
+	if !admitted {
+		t.Fatal("task admission rejected")
+	}
+	configLease, _ := app.beginDriveConfigUpdate("drive-id")
+	if reason := configLease.Authorize(api.DriveConfigUpdateRuntime); reason != "" {
+		t.Fatal(reason)
+	}
+	applied := make(chan struct{}, 1)
+	if deferred, err := configLease.Commit(api.DriveConfigUpdateRuntime, func() error {
+		applied <- struct{}{}
+		return nil
+	}); err != nil || !deferred {
+		t.Fatalf("config commit deferred/error = %v/%v", deferred, err)
+	}
+	configLease.Release()
+
+	deleteLease, _ := app.beginDriveConfigUpdate("drive-id")
+	if reason := deleteLease.Authorize(api.DriveConfigUpdateDestructive); reason != "" {
+		t.Fatalf("authorize delete: %s", reason)
+	}
+	taskDone()
+	// No destructive Commit models cleanup/database failure. Release must allow
+	// the already persisted desired configuration to become active.
+	deleteLease.Release()
+	select {
+	case <-applied:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending configuration did not resume after delete failure")
+	}
+}
+
 func TestStopDriveTasksCancelsQueuedTasksAndReplacesWorkers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -472,7 +1245,10 @@ func TestStopDriveTasksCancelsQueuedTasksAndReplacesWorkers(t *testing.T) {
 		scanProgress:        map[string]driveScanProgress{"drive-id": {Scanned: 8, Added: 2}},
 		fingerprintQueueing: map[string]bool{"drive-id": true},
 	}
-	taskCtx, done := app.registerDriveTaskContext(ctx, "drive-id")
+	taskCtx, done, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0)
+	if !admitted {
+		t.Fatal("registerDriveTaskContext rejected idle drive")
+	}
 	defer done()
 
 	if !app.stopDriveTasks(ctx, "drive-id") {
@@ -616,6 +1392,17 @@ func TestDriveGenerationStatusIncludesScanCooldown(t *testing.T) {
 	}
 }
 
+func TestDriveGenerationStatusIncludesQueuedCrawlerUploadBeforeProgress(t *testing.T) {
+	app := &App{
+		crawlerUploadRunning: map[string]bool{"crawler-id": true},
+	}
+
+	status := app.driveGenerationStatuses()["crawler-id"].Upload
+	if status.State != "queued" {
+		t.Fatalf("upload status = %#v, want queued", status)
+	}
+}
+
 func TestGuangYaPanGenerationCooldowns(t *testing.T) {
 	drv := &serverFakeKindDrive{id: "gy", kind: "guangyapan"}
 	if got := generationCooldownForDrive(drv); got != 10*time.Minute {
@@ -623,9 +1410,6 @@ func TestGuangYaPanGenerationCooldowns(t *testing.T) {
 	}
 	if got := fingerprintConfigForDrive(drv).RateLimitCooldown; got != 10*time.Minute {
 		t.Fatalf("fingerprint cooldown = %s, want 10m", got)
-	}
-	if got := scanCooldownForDrive(drv); got != 10*time.Minute {
-		t.Fatalf("scan cooldown = %s, want 10m", got)
 	}
 }
 
@@ -680,84 +1464,61 @@ func TestRunCrawlerMigrationAfterManualCrawlRequiresCrawlerUploadTarget(t *testi
 	if migrator.called.Load() != 1 {
 		t.Fatalf("migration calls = %d, want 1", migrator.called.Load())
 	}
+	if got := migrator.lastDriveID(); got != "crawler-main" {
+		t.Fatalf("post-crawl migration drive = %q, want crawler-main", got)
+	}
 }
 
-func TestScheduleCrawlerUploadMigrationRunsForConfiguredCrawler(t *testing.T) {
-	ctx := context.Background()
-	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+func TestReloadDriveRuntimeDoesNotStartCrawlerUploadMigration(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	cat, err := catalog.Open(filepath.Join(root, "catalog.db"))
 	if err != nil {
 		t.Fatalf("open catalog: %v", err)
 	}
-	t.Cleanup(func() {
-		if err := cat.Close(); err != nil {
-			t.Fatalf("close catalog: %v", err)
-		}
-	})
+	t.Cleanup(func() { _ = cat.Close() })
+
+	scriptPath := filepath.Join(root, "crawler.py")
+	if err := os.WriteFile(scriptPath, []byte("CRAWLER_NAME = \"Saved Crawler\"\n"), 0o644); err != nil {
+		t.Fatalf("write crawler script: %v", err)
+	}
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:     "crawler-truvaze",
+		ID:     "crawler-saved",
 		Kind:   scriptcrawler.Kind,
-		Name:   "Truvaze",
+		Name:   "Saved Crawler",
 		RootID: "/",
 		Credentials: map[string]string{
-			"script_path":     "/tmp/Truvaze.py",
-			"upload_drive_id": "pikpak",
+			"script_path":     scriptPath,
+			"upload_drive_id": "pikpak-target",
 		},
+		TeaserEnabled: true,
 	}); err != nil {
 		t.Fatalf("seed crawler: %v", err)
 	}
-	registry := proxy.NewRegistry()
-	registry.Set("crawler-truvaze", &serverFakeKindDrive{id: "crawler-truvaze", kind: scriptcrawler.Kind})
+
 	migrator := &serverFakeCrawlerUploadRunner{}
 	app := &App{
-		cat:                cat,
-		registry:           registry,
-		crawlerUploader:    migrator,
-		workers:            map[string]*preview.Worker{},
-		thumbWorkers:       map[string]*preview.ThumbWorker{},
-		fingerprintWorkers: map[string]*fingerprint.Worker{},
+		cfg: &config.Config{
+			Storage: config.Storage{LocalPreviewDir: filepath.Join(root, "previews")},
+		},
+		cat:             cat,
+		registry:        proxy.NewRegistry(),
+		scriptCrawlers:  make(map[string]*scriptcrawler.Crawler),
+		crawlerUploader: migrator,
+	}
+	if err := app.reloadDriveRuntime(ctx, "crawler-saved"); err != nil {
+		t.Fatalf("reload saved crawler: %v", err)
+	}
+	if _, ok := app.registry.Get("crawler-saved"); !ok {
+		t.Fatal("saved crawler was not reattached")
 	}
 
-	if !app.scheduleCrawlerUploadMigration(ctx, "crawler-truvaze") {
-		t.Fatal("scheduleCrawlerUploadMigration returned false, want true")
-	}
-	deadline := time.After(time.Second)
-	for migrator.called.Load() == 0 {
-		select {
-		case <-deadline:
-			t.Fatalf("migration calls = %d, want 1", migrator.called.Load())
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-}
-
-func TestScheduleCrawlerUploadMigrationSkipsWithoutUploadTarget(t *testing.T) {
-	ctx := context.Background()
-	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
-	if err != nil {
-		t.Fatalf("open catalog: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := cat.Close(); err != nil {
-			t.Fatalf("close catalog: %v", err)
-		}
-	})
-	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:          "crawler-local",
-		Kind:        scriptcrawler.Kind,
-		Name:        "Local Only",
-		RootID:      "/",
-		Credentials: map[string]string{"script_path": "/tmp/local.py"},
-	}); err != nil {
-		t.Fatalf("seed crawler: %v", err)
-	}
-	migrator := &serverFakeCrawlerUploadRunner{}
-	app := &App{cat: cat, registry: proxy.NewRegistry(), crawlerUploader: migrator}
-
-	if app.scheduleCrawlerUploadMigration(ctx, "crawler-local") {
-		t.Fatal("scheduleCrawlerUploadMigration returned true without upload target")
-	}
+	// The old save hook scheduled migration asynchronously. Allow enough time
+	// for such a regression to reach the fake runner before asserting.
+	time.Sleep(100 * time.Millisecond)
 	if migrator.called.Load() != 0 {
-		t.Fatalf("migration calls = %d, want 0", migrator.called.Load())
+		t.Fatalf("saving crawler started %d upload migration(s), want 0", migrator.called.Load())
 	}
 }
 
@@ -826,6 +1587,26 @@ func TestScheduleManualCrawlerUploadMigrationRunsWhenAssetsReady(t *testing.T) {
 			t.Fatalf("migration calls = %d, want 1", migrator.called.Load())
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+	if got := migrator.lastDriveID(); got != "crawler-ready" {
+		t.Fatalf("migration drive = %q, want crawler-ready", got)
+	}
+
+	deadline = time.After(time.Second)
+	for app.driveHasActiveWork("crawler-ready") {
+		select {
+		case <-deadline:
+			t.Fatal("manual upload task did not finish")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	migrator.rejectStart.Store(true)
+	accepted, message = app.scheduleManualCrawlerUploadMigration(ctx, "crawler-ready")
+	if accepted {
+		t.Fatal("accepted = true while global uploader is busy")
+	}
+	if !strings.Contains(message, "其他爬虫上传任务") {
+		t.Fatalf("message = %q, want global upload busy reason", message)
 	}
 }
 
@@ -1055,6 +1836,66 @@ func TestRunScanStartsFingerprintBeforeThumbnailAndPreviewDrain(t *testing.T) {
 	t.Fatalf("fingerprint status=%q sampled=%q, want ready before thumbnail/preview drain", got.FingerprintStatus, got.SampledSHA256)
 }
 
+func TestRunScanBackfillsExistingFingerprintBeforeTaskReturns(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	seedDriveWithTeaser(t, cat, "drive-id", false)
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:                "existing-video",
+		DriveID:           "drive-id",
+		FileID:            "file-id",
+		FileName:          "existing.mp4",
+		ParentID:          "0",
+		AncestorDirIDs:    []string{"0"},
+		Title:             "existing",
+		Size:              123,
+		FingerprintStatus: "pending",
+		PublishedAt:       now,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}); err != nil {
+		t.Fatalf("seed pending fingerprint video: %v", err)
+	}
+
+	drv := &serverScanFingerprintFakeDrive{
+		entries: []drives.Entry{{
+			ID:   "file-id",
+			Name: "existing.mp4",
+			Size: 123,
+		}},
+	}
+	registry := proxy.NewRegistry()
+	registry.Set("drive-id", drv)
+	fingerprintWorker := fingerprint.NewWorker(cat, drv, fingerprint.Config{})
+	app := &App{
+		cfg: &config.Config{
+			Scanner: config.Scanner{VideoExtensions: []string{".mp4"}},
+		},
+		cat:                cat,
+		registry:           registry,
+		fingerprintWorkers: map[string]*fingerprint.Worker{"drive-id": fingerprintWorker},
+	}
+
+	app.runScan(ctx, "drive-id")
+
+	if got := fingerprintWorker.Status().QueueLength; got != 1 {
+		t.Fatalf("fingerprint queue length after scan = %d, want 1", got)
+	}
+	if app.fingerprintQueueingBusy("drive-id") {
+		t.Fatal("fingerprint backfill still marked active after scan returned")
+	}
+}
+
 func TestNightlyTargetsComeFromCatalogBeforeDriveAttach(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
@@ -1080,13 +1921,56 @@ func TestNightlyTargetsComeFromCatalogBeforeDriveAttach(t *testing.T) {
 	}
 
 	app := &App{cat: cat}
-	scanIDs := app.listScanTargetIDs(ctx)
+	scanIDs, err := app.listScanTargetIDs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(scanIDs) != 2 || scanIDs[0] != "115" || scanIDs[1] != "pikpak" {
 		t.Fatalf("scan target ids = %#v, want 115 and pikpak from catalog", scanIDs)
 	}
 	crawlerIDs := app.listCrawlerDriveIDs(ctx)
 	if len(crawlerIDs) != 1 || crawlerIDs[0] != "crawler-main" {
 		t.Fatalf("crawler ids = %#v, want crawler-page script drive", crawlerIDs)
+	}
+}
+
+func TestAttachDriveSkipsUnconfiguredScriptCrawler(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cat, err := catalog.Open(filepath.Join(root, "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	drive := &catalog.Drive{
+		ID:     "crawler-deleted",
+		Kind:   scriptcrawler.Kind,
+		Name:   "Deleted Crawler",
+		RootID: "/",
+		Credentials: map[string]string{
+			"upload_drive_id": "pikpak",
+		},
+		TeaserEnabled: true,
+	}
+	if err := cat.UpsertDrive(ctx, drive); err != nil {
+		t.Fatalf("seed deleted crawler: %v", err)
+	}
+	previewDir := filepath.Join(root, "previews")
+	app := &App{
+		cat:            cat,
+		cfg:            &config.Config{Storage: config.Storage{LocalPreviewDir: previewDir}},
+		registry:       proxy.NewRegistry(),
+		scriptCrawlers: make(map[string]*scriptcrawler.Crawler),
+	}
+	if err := app.attachDrive(ctx, drive); err != nil {
+		t.Fatalf("attach deleted crawler: %v", err)
+	}
+	if _, ok := app.registry.Get(drive.ID); ok {
+		t.Fatal("unconfigured crawler was registered")
+	}
+	if _, err := os.Stat(app.scriptCrawlerDriveDir(drive.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unconfigured crawler storage stat error = %v, want not exist", err)
 	}
 }
 
@@ -1351,6 +2235,268 @@ func TestEnqueueUploadedVideoQueuesLocalGenerationByDefault(t *testing.T) {
 	t.Fatalf("preview status = %q, thumbnail url = %q; want generated local teaser and thumbnail", got.PreviewStatus, got.ThumbnailURL)
 }
 
+func TestRestoreDeletedVideoQueuesDerivedAssetsAndInvalidatesTags(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	video := &catalog.Video{
+		ID: "local-upload-restored", DriveID: "local-upload", FileID: "restored.mp4",
+		FileName: "restored.mp4", Title: "Restored", Size: 4096,
+		ThumbnailURL: "/p/thumb/local-upload-restored", PreviewLocal: "/tmp/restored.mp4", PreviewStatus: "ready",
+		PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := cat.UpsertVideo(ctx, video); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if err := cat.DeleteVideoWithTombstone(ctx, video.ID); err != nil {
+		t.Fatalf("tombstone video: %v", err)
+	}
+
+	drv := &serverRestorableLocalUploadDrive{entry: &drives.Entry{
+		ID: video.FileID, Name: video.FileName, Size: video.Size, ModTime: now,
+	}}
+	registry := proxy.NewRegistry()
+	registry.Set(drv.ID(), drv)
+	gen := &serverFakeTeaserGenerator{}
+	worker := preview.NewWorker(gen, cat, drv)
+	thumbWorker := preview.NewThumbWorker(gen, cat, drv)
+	tagInvalidations := 0
+	app := &App{
+		cat:          cat,
+		registry:     registry,
+		workers:      map[string]*preview.Worker{"local-upload": worker},
+		thumbWorkers: map[string]*preview.ThumbWorker{"local-upload": thumbWorker},
+		onTagsChanged: func() {
+			tagInvalidations++
+		},
+	}
+
+	if err := app.restoreDeletedVideo(ctx, video.ID); err != nil {
+		t.Fatalf("restore deleted video: %v", err)
+	}
+	if got := worker.Status().QueueLength; got != 1 {
+		t.Fatalf("preview queue length = %d, want 1", got)
+	}
+	if got := thumbWorker.Status().QueueLength; got != 1 {
+		t.Fatalf("thumbnail queue length = %d, want 1", got)
+	}
+	if tagInvalidations != 1 {
+		t.Fatalf("tag cache invalidations = %d, want 1", tagInvalidations)
+	}
+	restored, err := cat.GetVideo(ctx, video.ID)
+	if err != nil {
+		t.Fatalf("get restored video: %v", err)
+	}
+	if restored.PreviewStatus != "pending" || restored.ThumbnailURL != "" {
+		t.Fatalf("restored derived state = preview:%q thumbnail:%q", restored.PreviewStatus, restored.ThumbnailURL)
+	}
+}
+
+func TestBlacklistSourceDeleteSkipsSnapshotRestoredBeforeProcessing(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	video := &catalog.Video{
+		ID: "local-upload-stale-delete", DriveID: "local-upload", FileID: "stale.mp4",
+		FileName: "stale.mp4", Title: "Stale", Size: 2048,
+		PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := cat.UpsertVideo(ctx, video); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if err := cat.DeleteVideoWithTombstone(ctx, video.ID); err != nil {
+		t.Fatalf("tombstone video: %v", err)
+	}
+	snapshot, err := cat.ListDeletedVideosPendingSourceDeletion(ctx)
+	if err != nil || len(snapshot) != 1 {
+		t.Fatalf("source deletion snapshot = %d err=%v, want one", len(snapshot), err)
+	}
+
+	drv := &serverRestorableLocalUploadDrive{entry: &drives.Entry{
+		ID: video.FileID, Name: video.FileName, Size: video.Size, ModTime: now,
+	}}
+	registry := proxy.NewRegistry()
+	registry.Set(drv.ID(), drv)
+	app := &App{cat: cat, registry: registry}
+	if err := app.restoreDeletedVideo(ctx, video.ID); err != nil {
+		t.Fatalf("restore deleted video: %v", err)
+	}
+	skipped, err := app.deleteBlacklistedVideoSource(ctx, snapshot[0])
+	if err != nil {
+		t.Fatalf("process stale source deletion snapshot: %v", err)
+	}
+	if !skipped {
+		t.Fatal("stale source deletion snapshot was not skipped")
+	}
+	drv.mu.Lock()
+	removeCalls := drv.removeCalls
+	drv.mu.Unlock()
+	if removeCalls != 0 {
+		t.Fatalf("source remove calls = %d, want 0", removeCalls)
+	}
+	if _, err := cat.GetVideo(ctx, video.ID); err != nil {
+		t.Fatalf("restored video was damaged by stale source deletion: %v", err)
+	}
+
+	// Reusing the same stable video ID must not let the old job claim a newer
+	// tombstone generation created after the restore.
+	time.Sleep(2 * time.Millisecond)
+	if err := cat.DeleteVideoWithTombstone(ctx, video.ID); err != nil {
+		t.Fatalf("create newer tombstone: %v", err)
+	}
+	skipped, err = app.deleteBlacklistedVideoSource(ctx, snapshot[0])
+	if err != nil {
+		t.Fatalf("process snapshot against newer tombstone: %v", err)
+	}
+	if !skipped {
+		t.Fatal("stale snapshot claimed a newer tombstone generation")
+	}
+	drv.mu.Lock()
+	removeCalls = drv.removeCalls
+	drv.mu.Unlock()
+	if removeCalls != 0 {
+		t.Fatalf("source remove calls after newer tombstone = %d, want 0", removeCalls)
+	}
+	if deleted, err := cat.IsVideoDeleted(ctx, video.ID); err != nil || !deleted {
+		t.Fatalf("newer tombstone changed: deleted=%v err=%v", deleted, err)
+	}
+}
+
+func TestBlacklistSourceDeleteAndRestoreAreSerializedPerVideo(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	video := &catalog.Video{
+		ID: "local-upload-delete-restore-race", DriveID: "local-upload", FileID: "race.mp4",
+		FileName: "race.mp4", Title: "Race", Size: 2048,
+		PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := cat.UpsertVideo(ctx, video); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if err := cat.DeleteVideoWithTombstone(ctx, video.ID); err != nil {
+		t.Fatalf("tombstone video: %v", err)
+	}
+	snapshot, err := cat.ListDeletedVideosPendingSourceDeletion(ctx)
+	if err != nil || len(snapshot) != 1 {
+		t.Fatalf("source deletion snapshot = %d err=%v, want one", len(snapshot), err)
+	}
+
+	removeStarted := make(chan struct{}, 1)
+	allowRemove := make(chan struct{})
+	var releaseRemoveOnce sync.Once
+	releaseRemove := func() { releaseRemoveOnce.Do(func() { close(allowRemove) }) }
+	t.Cleanup(releaseRemove)
+	drv := &serverRestorableLocalUploadDrive{
+		entry:         &drives.Entry{ID: video.FileID, Name: video.FileName, Size: video.Size, ModTime: now},
+		removeStarted: removeStarted,
+		allowRemove:   allowRemove,
+	}
+	registry := proxy.NewRegistry()
+	registry.Set(drv.ID(), drv)
+	app := &App{cat: cat, registry: registry}
+
+	type deleteResult struct {
+		skipped bool
+		err     error
+	}
+	deleteDone := make(chan deleteResult, 1)
+	go func() {
+		skipped, err := app.deleteBlacklistedVideoSource(ctx, snapshot[0])
+		deleteDone <- deleteResult{skipped: skipped, err: err}
+	}()
+	select {
+	case <-removeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("source deletion did not reach provider remove")
+	}
+
+	restoreDone := make(chan error, 1)
+	go func() { restoreDone <- app.restoreDeletedVideo(ctx, video.ID) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		app.blacklistVideoLocks.mu.Lock()
+		item := app.blacklistVideoLocks.items[video.ID]
+		refs := 0
+		if item != nil {
+			refs = item.refs
+		}
+		app.blacklistVideoLocks.mu.Unlock()
+		if refs == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("restore did not wait on the per-video operation lock")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	drv.mu.Lock()
+	statCalls := drv.statCalls
+	drv.mu.Unlock()
+	if statCalls != 0 {
+		t.Fatalf("restore inspected source during deletion: stat calls = %d", statCalls)
+	}
+
+	releaseRemove()
+	if result := <-deleteDone; result.err != nil || result.skipped {
+		t.Fatalf("source deletion result = skipped:%v err:%v", result.skipped, result.err)
+	}
+	if err := <-restoreDone; !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("restore after source deletion error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := cat.GetVideo(ctx, video.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("source-deleted video was restored: %v", err)
+	}
+}
+
+func TestRestoreDeletedVideoRejectsEmptySource(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	video := &catalog.Video{
+		ID: "local-upload-empty", DriveID: "local-upload", FileID: "empty.mp4",
+		FileName: "empty.mp4", Title: "Empty", Size: 100,
+		PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := cat.UpsertVideo(ctx, video); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if err := cat.DeleteVideoWithTombstone(ctx, video.ID); err != nil {
+		t.Fatalf("tombstone video: %v", err)
+	}
+	drv := &serverRestorableLocalUploadDrive{entry: &drives.Entry{ID: video.FileID, Name: video.FileName}}
+	registry := proxy.NewRegistry()
+	registry.Set(drv.ID(), drv)
+	app := &App{cat: cat, registry: registry}
+
+	if err := app.restoreDeletedVideo(ctx, video.ID); !errors.Is(err, catalog.ErrDeletedVideoSourceMissing) {
+		t.Fatalf("empty source restore error = %v, want ErrDeletedVideoSourceMissing", err)
+	}
+	if deleted, err := cat.IsVideoDeleted(ctx, video.ID); err != nil || !deleted {
+		t.Fatalf("empty source tombstone changed: deleted=%v err=%v", deleted, err)
+	}
+}
+
 func TestShouldScanDriveSkipsLocalUpload(t *testing.T) {
 	if shouldScanDrive(&serverLocalUploadFakeDrive{}) {
 		t.Fatal("local upload drive should not be scanned")
@@ -1423,12 +2569,40 @@ func TestCleanupMissingPikPakVideosRemovesDatabaseRowsAndLocalAssets(t *testing.
 		cfg: &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}},
 		cat: cat,
 	}
-	removed, err := app.cleanupMissingDriveVideos(ctx, "PikPak", map[string]struct{}{"kept": {}}, nil, true)
+	removed, err := app.cleanupMissingDriveVideos(
+		ctx,
+		"PikPak",
+		map[string]struct{}{"kept": {}},
+		catalog.ScanPresenceScope{PresenceAuthoritative: true},
+		catalog.MissingFileCleanupConfirmTwice,
+	)
 	if err != nil {
-		t.Fatalf("cleanup missing videos: %v", err)
+		t.Fatalf("first cleanup missing videos: %v", err)
+	}
+	if removed != 0 {
+		t.Fatalf("first removed = %d, want 0 before confirmation", removed)
+	}
+	if _, err := cat.GetVideo(ctx, "pikpak-PikPak-obsolete"); err != nil {
+		t.Fatalf("obsolete video removed after one scan: %v", err)
+	}
+	for _, path := range []string{obsoletePreview, obsoleteThumb} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("asset %s removed after one scan: %v", path, err)
+		}
+	}
+
+	removed, err = app.cleanupMissingDriveVideos(
+		ctx,
+		"PikPak",
+		map[string]struct{}{"kept": {}},
+		catalog.ScanPresenceScope{PresenceAuthoritative: true},
+		catalog.MissingFileCleanupConfirmTwice,
+	)
+	if err != nil {
+		t.Fatalf("confirmed cleanup missing videos: %v", err)
 	}
 	if removed != 1 {
-		t.Fatalf("removed = %d, want 1", removed)
+		t.Fatalf("confirmed removed = %d, want 1", removed)
 	}
 	if _, err := cat.GetVideo(ctx, "pikpak-PikPak-obsolete"); err != sql.ErrNoRows {
 		t.Fatalf("obsolete video lookup error = %v, want sql.ErrNoRows", err)
@@ -1446,6 +2620,868 @@ func TestCleanupMissingPikPakVideosRemovesDatabaseRowsAndLocalAssets(t *testing.
 	}
 	if _, err := os.Stat(keptPreview); err != nil {
 		t.Fatalf("kept preview missing: %v", err)
+	}
+}
+
+func TestRunScanImmediatelyRemovesMissingVideoAfterCleanScan(t *testing.T) {
+	ctx := context.Background()
+	localDir := t.TempDir()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	const (
+		driveID = "clean-scan-drive"
+		videoID = "stale-clean-video"
+	)
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: driveID, Kind: "fake", Name: "Clean Scan", RootID: "root",
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	previewPath := filepath.Join(localDir, "stale.mp4")
+	if err := os.WriteFile(previewPath, []byte("asset"), 0o644); err != nil {
+		t.Fatalf("write preview: %v", err)
+	}
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: videoID, DriveID: driveID, FileID: "stale-file", FileName: "stale.mp4",
+		ParentID: "root", AncestorDirIDs: []string{"root"}, Title: "Stale", Size: 1,
+		PreviewLocal: previewPath, PreviewStatus: "ready",
+		PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+
+	drv := &serverTreeScanDrive{id: driveID, entries: map[string][]drives.Entry{"root": {}}}
+	registry := proxy.NewRegistry()
+	registry.Set(driveID, drv)
+	app := &App{
+		cfg: &config.Config{
+			Scanner: config.Scanner{VideoExtensions: []string{".mp4"}},
+			Storage: config.Storage{LocalPreviewDir: localDir},
+		},
+		cat: cat, registry: registry,
+	}
+
+	app.runScan(ctx, driveID)
+	if _, err := cat.GetVideo(ctx, videoID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("stale video lookup after clean scan = %v, want sql.ErrNoRows", err)
+	}
+	if deleted, err := cat.IsVideoDeleted(ctx, videoID); err != nil || deleted {
+		t.Fatalf("clean-scan cleanup tombstone = %v, error = %v; want false/nil", deleted, err)
+	}
+	if _, err := os.Stat(previewPath); !os.IsNotExist(err) {
+		t.Fatalf("stale preview still exists after clean scan: %v", err)
+	}
+}
+
+func TestMissingFileCleanupModeUsesPresenceIntegrity(t *testing.T) {
+	discoveryIssue := scanner.Issue{Stage: scanner.IssueDiscovery, Err: errors.New("scan issue")}
+	authoritativeSnapshot := scanner.Snapshot{
+		StartDirID:       "configured-root",
+		EnumeratedDirIDs: map[string]struct{}{"configured-root": {}},
+	}
+	tests := []struct {
+		name     string
+		snapshot scanner.Snapshot
+		want     catalog.MissingFileCleanupMode
+	}{
+		{
+			name:     "complete configured scope",
+			snapshot: authoritativeSnapshot,
+			want:     catalog.MissingFileCleanupImmediate,
+		},
+		{
+			name: "failed directory",
+			snapshot: scanner.Snapshot{
+				StartDirID:       "configured-root",
+				EnumeratedDirIDs: map[string]struct{}{"configured-root": {}},
+				FailedDirIDs:     map[string]struct{}{"broken": {}},
+			},
+			want: catalog.MissingFileCleanupConfirmTwice,
+		},
+		{
+			name: "discovery issue",
+			snapshot: scanner.Snapshot{
+				StartDirID:       "configured-root",
+				EnumeratedDirIDs: map[string]struct{}{"configured-root": {}},
+				Issues:           []scanner.Issue{discoveryIssue},
+			},
+			want: catalog.MissingFileCleanupConfirmTwice,
+		},
+		{
+			name:     "scan start was not enumerated",
+			snapshot: scanner.Snapshot{StartDirID: "configured-root"},
+			want:     catalog.MissingFileCleanupConfirmTwice,
+		},
+		{
+			name: "excluded directory is intentional",
+			snapshot: scanner.Snapshot{
+				StartDirID:       "configured-root",
+				EnumeratedDirIDs: map[string]struct{}{"configured-root": {}},
+				ExcludedDirIDs:   map[string]struct{}{"skipped": {}},
+			},
+			want: catalog.MissingFileCleanupImmediate,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := missingFileCleanupMode(test.snapshot); got != test.want {
+				t.Fatalf("cleanup mode = %v, want %v", got, test.want)
+			}
+		})
+	}
+
+	// Reconciliation and policy-cleanup issues are intentionally absent from the
+	// mode input: they occur after discovery has finalized existence evidence.
+}
+
+func TestScanPolicyRemovesSkippedDirectoryVideoAndAssetsOnNextScan(t *testing.T) {
+	ctx := context.Background()
+	localDir := t.TempDir()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	const (
+		driveID = "skip-drive"
+		videoID = "fake-skip-drive-skipped-file"
+	)
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:         driveID,
+		Kind:       "fake",
+		Name:       "Skip Drive",
+		RootID:     "root",
+		SkipDirIDs: []string{"skip-dir"},
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	previewPath := filepath.Join(localDir, "skipped-preview.mp4")
+	thumbnailPath := filepath.Join(localDir, "thumbs", videoID+".jpg")
+	for _, assetPath := range []string{previewPath, thumbnailPath} {
+		if err := os.MkdirAll(filepath.Dir(assetPath), 0o755); err != nil {
+			t.Fatalf("mkdir asset directory: %v", err)
+		}
+		if err := os.WriteFile(assetPath, []byte("generated asset"), 0o644); err != nil {
+			t.Fatalf("write asset: %v", err)
+		}
+	}
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:             videoID,
+		DriveID:        driveID,
+		FileID:         "skipped-file",
+		FileName:       "skipped.mp4",
+		ParentID:       "nested-dir",
+		AncestorDirIDs: []string{"root", "skip-dir", "nested-dir"},
+		DirName:        "Skipped",
+		Title:          "Skipped",
+		Size:           123,
+		PreviewStatus:  "ready",
+		PreviewLocal:   previewPath,
+		ThumbnailURL:   "/p/thumb/" + videoID,
+		PublishedAt:    now,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("seed skipped video: %v", err)
+	}
+
+	drv := &serverTreeScanDrive{
+		id: driveID,
+		entries: map[string][]drives.Entry{
+			"root": {{ID: "skip-dir", Name: "Skipped", IsDir: true}},
+		},
+		listErrors: map[string]error{"skip-dir": errors.New("directory unavailable")},
+	}
+	registry := proxy.NewRegistry()
+	registry.Set(driveID, drv)
+	app := &App{
+		cfg: &config.Config{
+			Scanner: config.Scanner{VideoExtensions: []string{".mp4"}},
+			Storage: config.Storage{LocalPreviewDir: localDir},
+		},
+		cat:      cat,
+		registry: registry,
+	}
+
+	app.runScan(ctx, driveID)
+	if _, err := cat.GetVideo(ctx, videoID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("skipped video lookup after policy cleanup = %v, want sql.ErrNoRows", err)
+	}
+	if deleted, err := cat.IsVideoDeleted(ctx, videoID); err != nil || deleted {
+		t.Fatalf("policy cleanup tombstone = %v, error = %v; want false/nil", deleted, err)
+	}
+	for _, assetPath := range []string{previewPath, thumbnailPath} {
+		if _, err := os.Stat(assetPath); !os.IsNotExist(err) {
+			t.Fatalf("asset still exists after policy cleanup: %s: %v", assetPath, err)
+		}
+	}
+}
+
+func TestRunScanRefreshesMovedVideoBeforeSkipPolicyCleanup(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	const (
+		driveID = "moved-out-of-skip-drive"
+		videoID = "existing-moved-video"
+		fileID  = "moved-file"
+	)
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: driveID, Kind: "fake", Name: "Moved Out Of Skip", RootID: "root",
+		SkipDirIDs: []string{"skip-dir"},
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: videoID, DriveID: driveID, FileID: fileID, FileName: "clip.mp4",
+		ParentID: "moved-dir", AncestorDirIDs: []string{"root", "skip-dir", "moved-dir"},
+		DirName: "Moved", Title: "Clip", Size: 123,
+		PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	drv := &serverTreeScanDrive{id: driveID, entries: map[string][]drives.Entry{
+		"root":      {{ID: "moved-dir", Name: "Moved", IsDir: true}},
+		"moved-dir": {{ID: fileID, Name: "clip.mp4", Size: 123}},
+	}}
+	registry := proxy.NewRegistry()
+	registry.Set(driveID, drv)
+	app := &App{
+		cfg: &config.Config{Scanner: config.Scanner{VideoExtensions: []string{".mp4"}}},
+		cat: cat, registry: registry,
+	}
+
+	app.runScan(ctx, driveID)
+	video, err := cat.GetVideo(ctx, videoID)
+	if err != nil {
+		t.Fatalf("moved video was deleted and recreated: %v", err)
+	}
+	if !slices.Equal(video.AncestorDirIDs, []string{"root", "moved-dir"}) {
+		t.Fatalf("moved video ancestors = %#v, want refreshed chain", video.AncestorDirIDs)
+	}
+	if _, err := cat.GetVideo(ctx, "fake-"+driveID+"-"+fileID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("replacement row lookup = %v, want no delete/reinsert", err)
+	}
+}
+
+func TestRunScanProtectsSeenVideoWhenMovedAncestryUpdateFails(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "catalog.db")
+	cat, err := catalog.Open(databasePath)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	const (
+		driveID = "moved-update-failure-drive"
+		videoID = "existing-moved-video-with-stale-chain"
+		fileID  = "moved-file"
+	)
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: driveID, Kind: "fake", Name: "Moved Update Failure", RootID: "root",
+		SkipDirIDs: []string{"skip-dir"},
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: videoID, DriveID: driveID, FileID: fileID, FileName: "clip.mp4",
+		ParentID: "moved-dir", AncestorDirIDs: []string{"root", "skip-dir", "moved-dir"},
+		DirName: "Moved", Title: "Clip", Size: 123,
+		PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: "unrelated-stale-video", DriveID: driveID, FileID: "stale-file", FileName: "stale.mp4",
+		ParentID: "root", AncestorDirIDs: []string{"root"}, Title: "Stale", Size: 321,
+		PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed unrelated stale video: %v", err)
+	}
+	externalDB, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("open database for failure trigger: %v", err)
+	}
+	if _, err := externalDB.ExecContext(ctx, `
+CREATE TRIGGER fail_moved_video_update
+BEFORE UPDATE ON videos
+WHEN OLD.id = 'existing-moved-video-with-stale-chain'
+BEGIN
+  SELECT RAISE(FAIL, 'forced metadata update failure');
+END`); err != nil {
+		externalDB.Close()
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	if err := externalDB.Close(); err != nil {
+		t.Fatalf("close failure-trigger database: %v", err)
+	}
+
+	drv := &serverTreeScanDrive{id: driveID, entries: map[string][]drives.Entry{
+		"root":      {{ID: "moved-dir", Name: "Moved", IsDir: true}},
+		"moved-dir": {{ID: fileID, Name: "clip.mp4", Size: 123}},
+	}}
+	registry := proxy.NewRegistry()
+	registry.Set(driveID, drv)
+	app := &App{
+		cfg: &config.Config{Scanner: config.Scanner{VideoExtensions: []string{".mp4"}}},
+		cat: cat, registry: registry,
+	}
+
+	app.runScan(ctx, driveID)
+	video, err := cat.GetVideo(ctx, videoID)
+	if err != nil {
+		t.Fatalf("seen video was removed using stale ancestry: %v", err)
+	}
+	if !slices.Equal(video.AncestorDirIDs, []string{"root", "skip-dir", "moved-dir"}) {
+		t.Fatalf("forced-failure ancestors = %#v, want original chain", video.AncestorDirIDs)
+	}
+	if _, err := cat.GetVideo(ctx, "unrelated-stale-video"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("reconciliation error downgraded unrelated presence cleanup: %v", err)
+	}
+}
+
+func TestRunScanRemovesVideosOutsideChangedConfiguredRoot(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	const (
+		driveID = "changed-scan-root-drive"
+		videoID = "old-scope-video"
+	)
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: driveID, Kind: "fake", Name: "Changed Root", RootID: "new-root",
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: videoID, DriveID: driveID, FileID: "old-file", FileName: "old.mp4",
+		ParentID: "old-dir", AncestorDirIDs: []string{"root", "old-dir"},
+		Title: "Old", Size: 123,
+		PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed old-scope video: %v", err)
+	}
+
+	drv := &serverTreeScanDrive{id: driveID, entries: map[string][]drives.Entry{"new-root": {}}}
+	registry := proxy.NewRegistry()
+	registry.Set(driveID, drv)
+	app := &App{
+		cfg: &config.Config{Scanner: config.Scanner{VideoExtensions: []string{".mp4"}}},
+		cat: cat, registry: registry,
+	}
+
+	app.runScan(ctx, driveID)
+	if _, err := cat.GetVideo(ctx, videoID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("old-scope video lookup = %v, want immediate removal", err)
+	}
+}
+
+func TestRunScanCompletesCombinedSkipPolicyAfterReconciliation(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	const driveID = "skip-policy-order-drive"
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: driveID, Kind: "fake", Name: "Policy Order", RootID: "root",
+		SkipDirIDs: []string{"skip-dir"},
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	now := time.Now()
+	for _, video := range []*catalog.Video{
+		{
+			ID: "exact-skip-video", DriveID: driveID, FileID: "exact-file", FileName: "exact.mp4",
+			ParentID: "exact-deep", AncestorDirIDs: []string{"root", "skip-dir", "exact-deep"},
+			Title: "Exact", Size: 1,
+		},
+		{
+			ID: "legacy-skip-video", DriveID: driveID, FileID: "legacy-file", FileName: "legacy.mp4",
+			ParentID: "legacy-deep", Title: "Legacy", Size: 2,
+		},
+	} {
+		video.PublishedAt = now
+		video.CreatedAt = now
+		video.UpdatedAt = now
+		if err := cat.UpsertVideo(ctx, video); err != nil {
+			t.Fatalf("seed video %s: %v", video.ID, err)
+		}
+	}
+
+	drv := &serverTreeScanDrive{id: driveID, entries: map[string][]drives.Entry{
+		"skip-dir":    {{ID: "legacy-deep", Name: "Legacy Deep", IsDir: true}},
+		"legacy-deep": {},
+		"root":        {{ID: "skip-dir", Name: "Skipped", IsDir: true}},
+	}}
+	registry := proxy.NewRegistry()
+	registry.Set(driveID, drv)
+	app := &App{
+		cfg: &config.Config{Scanner: config.Scanner{VideoExtensions: []string{".mp4"}}},
+		cat: cat, registry: registry,
+	}
+	app.runScan(ctx, driveID)
+
+	if got, want := strings.Join(drv.listOrder, ","), "root,skip-dir,legacy-deep"; got != want {
+		t.Fatalf("directory list order = %q, want %q", got, want)
+	}
+	for _, videoID := range []string{"exact-skip-video", "legacy-skip-video"} {
+		if _, err := cat.GetVideo(ctx, videoID); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("skip-policy video %s lookup = %v, want sql.ErrNoRows", videoID, err)
+		}
+	}
+}
+
+func TestRunScanCleansHealthyAreasWhileFailedSubtreeIsProtected(t *testing.T) {
+	ctx := context.Background()
+	localDir := t.TempDir()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	const driveID = "partial-cleanup-drive"
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: driveID, Kind: "fake", Name: "Partial Cleanup", RootID: "root",
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	healthyPreview := filepath.Join(localDir, "healthy.mp4")
+	protectedPreview := filepath.Join(localDir, "protected.mp4")
+	for _, path := range []string{healthyPreview, protectedPreview} {
+		if err := os.WriteFile(path, []byte("asset"), 0o644); err != nil {
+			t.Fatalf("write asset %s: %v", path, err)
+		}
+	}
+	now := time.Now()
+	for _, video := range []*catalog.Video{
+		{
+			ID: "stale-healthy", DriveID: driveID, FileID: "healthy-file", FileName: "healthy.mp4",
+			ParentID: "healthy", AncestorDirIDs: []string{"root", "healthy"}, Title: "Healthy",
+			PreviewLocal: healthyPreview, PreviewStatus: "ready", Size: 1,
+		},
+		{
+			ID: "stale-removed-tree", DriveID: driveID, FileID: "removed-file", FileName: "removed.mp4",
+			ParentID: "removed-deep", AncestorDirIDs: []string{"root", "removed", "removed-deep"}, Title: "Removed",
+			Size: 2,
+		},
+		{
+			ID: "protected-failed-tree", DriveID: driveID, FileID: "protected-file", FileName: "protected.mp4",
+			ParentID: "broken-deep", AncestorDirIDs: []string{"root", "broken", "broken-deep"}, Title: "Protected",
+			PreviewLocal: protectedPreview, PreviewStatus: "ready", Size: 3,
+		},
+	} {
+		video.PublishedAt = now
+		video.CreatedAt = now
+		video.UpdatedAt = now
+		if err := cat.UpsertVideo(ctx, video); err != nil {
+			t.Fatalf("seed video %s: %v", video.ID, err)
+		}
+	}
+
+	drv := &serverTreeScanDrive{
+		id: driveID,
+		entries: map[string][]drives.Entry{
+			"root": {
+				{ID: "healthy", Name: "Healthy", IsDir: true},
+				{ID: "broken", Name: "Broken", IsDir: true},
+			},
+			"healthy": {},
+		},
+		listErrors: map[string]error{"broken": errors.New("temporary list failure")},
+	}
+	registry := proxy.NewRegistry()
+	registry.Set(driveID, drv)
+	app := &App{
+		cfg: &config.Config{
+			Scanner: config.Scanner{VideoExtensions: []string{".mp4"}},
+			Storage: config.Storage{LocalPreviewDir: localDir},
+		},
+		cat: cat, registry: registry,
+	}
+
+	app.runScan(ctx, driveID)
+	for _, videoID := range []string{"stale-healthy", "stale-removed-tree", "protected-failed-tree"} {
+		if _, err := cat.GetVideo(ctx, videoID); err != nil {
+			t.Fatalf("video %s removed before second confirmation: %v", videoID, err)
+		}
+	}
+
+	app.runScan(ctx, driveID)
+	for _, videoID := range []string{"stale-healthy", "stale-removed-tree"} {
+		if _, err := cat.GetVideo(ctx, videoID); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("eligible stale video %s lookup = %v, want sql.ErrNoRows", videoID, err)
+		}
+	}
+	if _, err := cat.GetVideo(ctx, "protected-failed-tree"); err != nil {
+		t.Fatalf("failed subtree video was removed: %v", err)
+	}
+	if _, err := os.Stat(healthyPreview); !os.IsNotExist(err) {
+		t.Fatalf("healthy stale preview still exists: %v", err)
+	}
+	if _, err := os.Stat(protectedPreview); err != nil {
+		t.Fatalf("failed subtree preview was removed: %v", err)
+	}
+}
+
+func TestSkipPolicyCanBeCanceledBeforeNextScan(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	const driveID = "skip-buffer-drive"
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: driveID, Kind: "fake", Name: "Skip Buffer", RootID: "root",
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: "buffered-video", DriveID: driveID, FileID: "video", FileName: "video.mp4",
+		ParentID: "skip-dir", AncestorDirIDs: []string{"root", "skip-dir"}, Title: "Buffered", Size: 123,
+		PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if err := cat.SetDriveSkipDirIDs(ctx, driveID, []string{"skip-dir"}); err != nil {
+		t.Fatalf("save skip directory: %v", err)
+	}
+	if err := cat.SetDriveSkipDirIDs(ctx, driveID, nil); err != nil {
+		t.Fatalf("cancel skip directory: %v", err)
+	}
+
+	drv := &serverTreeScanDrive{id: driveID, entries: map[string][]drives.Entry{
+		"root":     {{ID: "skip-dir", Name: "Kept", IsDir: true}},
+		"skip-dir": {{ID: "video", Name: "video.mp4", Size: 123}},
+	}}
+	registry := proxy.NewRegistry()
+	registry.Set(driveID, drv)
+	app := &App{
+		cfg: &config.Config{Scanner: config.Scanner{VideoExtensions: []string{".mp4"}}},
+		cat: cat, registry: registry,
+	}
+	app.runScan(ctx, driveID)
+	if _, err := cat.GetVideo(ctx, "buffered-video"); err != nil {
+		t.Fatalf("video was removed after skip policy was canceled: %v", err)
+	}
+}
+
+func TestSkipPolicyLegacyBackfillStaysPendingAfterIncompleteTraversal(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	const driveID = "legacy-skip-drive"
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: driveID, Kind: "fake", Name: "Legacy Skip", RootID: "root",
+		SkipDirIDs: []string{"skip-dir"},
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: "legacy-deep-video", DriveID: driveID, FileID: "legacy-file", FileName: "legacy.mp4",
+		ParentID: "legacy-deep", Title: "Legacy", Size: 123,
+		PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed legacy video: %v", err)
+	}
+
+	drv := &serverTreeScanDrive{
+		id: driveID,
+		entries: map[string][]drives.Entry{
+			"root":     {{ID: "skip-dir", Name: "Skipped", IsDir: true}},
+			"skip-dir": {{ID: "legacy-deep", Name: "Deep", IsDir: true}},
+		},
+		listErrors: map[string]error{"legacy-deep": errors.New("temporary list failure")},
+	}
+	registry := proxy.NewRegistry()
+	registry.Set(driveID, drv)
+	app := &App{
+		cfg: &config.Config{Scanner: config.Scanner{VideoExtensions: []string{".mp4"}}},
+		cat: cat, registry: registry,
+	}
+	app.runScan(ctx, driveID)
+
+	state, err := cat.GetDriveSkipCleanupState(ctx, driveID)
+	if err != nil {
+		t.Fatalf("read skip cleanup state: %v", err)
+	}
+	if !state.Initialized || !equalDirIDSets(state.DirIDs, []string{"skip-dir"}) {
+		t.Fatalf("cleanup directory state = %#v, want initialized skip-dir", state)
+	}
+	if len(state.LegacyDoneDirIDs) != 0 {
+		t.Fatal("incomplete legacy traversal was marked complete")
+	}
+	if _, err := cat.GetVideo(ctx, "legacy-deep-video"); err != nil {
+		t.Fatalf("unresolved legacy video was removed: %v", err)
+	}
+}
+
+func TestSkipPolicyBackfillsDeepLegacyRows(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	const driveID = "legacy-backfill-drive"
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: driveID, Kind: "fake", Name: "Legacy Backfill", RootID: "root",
+		SkipDirIDs: []string{"skip-dir"},
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: "deep-legacy-video", DriveID: driveID, FileID: "legacy-file", FileName: "legacy.mp4",
+		ParentID: "deep-dir", Title: "Legacy", Size: 123,
+		PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed legacy video: %v", err)
+	}
+
+	drv := &serverTreeScanDrive{id: driveID, entries: map[string][]drives.Entry{
+		"root":     {{ID: "skip-dir", Name: "Skipped", IsDir: true}},
+		"skip-dir": {{ID: "deep-dir", Name: "Deep", IsDir: true}},
+		"deep-dir": {},
+	}}
+	registry := proxy.NewRegistry()
+	registry.Set(driveID, drv)
+	app := &App{
+		cfg: &config.Config{Scanner: config.Scanner{VideoExtensions: []string{".mp4"}}},
+		cat: cat, registry: registry,
+	}
+	app.runScan(ctx, driveID)
+
+	if _, err := cat.GetVideo(ctx, "deep-legacy-video"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deep legacy video lookup = %v, want sql.ErrNoRows", err)
+	}
+	state, err := cat.GetDriveSkipCleanupState(ctx, driveID)
+	if err != nil {
+		t.Fatalf("read skip cleanup state: %v", err)
+	}
+	if !state.Initialized || !equalDirIDSets(state.LegacyDoneDirIDs, []string{"skip-dir"}) {
+		t.Fatalf("cleanup state = %#v, want initialized and completed skip-dir", state)
+	}
+}
+
+func TestSkipPolicyTracksLegacyCompletionPerDirectory(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	const driveID = "per-directory-legacy-drive"
+	driveConfig := &catalog.Drive{
+		ID: driveID, Kind: "fake", Name: "Per Directory", RootID: "root",
+		SkipDirIDs: []string{"good-skip", "broken-skip"},
+	}
+	if err := cat.UpsertDrive(ctx, driveConfig); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	now := time.Now()
+	for _, video := range []*catalog.Video{
+		{
+			ID: "good-legacy-video", DriveID: driveID, FileID: "good-file", FileName: "good.mp4",
+			ParentID: "good-deep", Title: "Good", Size: 1,
+		},
+		{
+			ID: "broken-legacy-video", DriveID: driveID, FileID: "broken-file", FileName: "broken.mp4",
+			ParentID: "broken-deep", Title: "Broken", Size: 2,
+		},
+	} {
+		video.PublishedAt = now
+		video.CreatedAt = now
+		video.UpdatedAt = now
+		if err := cat.UpsertVideo(ctx, video); err != nil {
+			t.Fatalf("seed video %s: %v", video.ID, err)
+		}
+	}
+
+	drv := &serverTreeScanDrive{
+		id: driveID,
+		entries: map[string][]drives.Entry{
+			"good-skip":   {{ID: "good-deep", Name: "Good Deep", IsDir: true}},
+			"good-deep":   {},
+			"broken-skip": {{ID: "broken-deep", Name: "Broken Deep", IsDir: true}},
+		},
+		listErrors: map[string]error{"broken-deep": errors.New("permanent list failure")},
+		listCalls:  map[string]int{},
+	}
+	app := &App{
+		cfg: &config.Config{Scanner: config.Scanner{VideoExtensions: []string{".mp4"}}},
+		cat: cat,
+	}
+
+	result, err := app.cleanupSkippedDriveVideos(ctx, drv, driveConfig, nil, scanner.NewRateLimitBudget())
+	if err != nil {
+		t.Fatalf("first policy cleanup: %v", err)
+	}
+	if !result.ProtectUnlocated {
+		t.Fatal("incomplete policy traversal did not protect unlocated videos")
+	}
+	if _, err := cat.GetVideo(ctx, "good-legacy-video"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("completed directory video lookup = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := cat.GetVideo(ctx, "broken-legacy-video"); err != nil {
+		t.Fatalf("incomplete directory video was removed: %v", err)
+	}
+	state, err := cat.GetDriveSkipCleanupState(ctx, driveID)
+	if err != nil {
+		t.Fatalf("read first cleanup state: %v", err)
+	}
+	if !equalDirIDSets(state.LegacyDoneDirIDs, []string{"good-skip"}) {
+		t.Fatalf("completed legacy directories = %#v, want good-skip", state.LegacyDoneDirIDs)
+	}
+	goodCalls := drv.listCalls["good-skip"]
+	brokenCalls := drv.listCalls["broken-skip"]
+
+	result, err = app.cleanupSkippedDriveVideos(ctx, drv, driveConfig, nil, scanner.NewRateLimitBudget())
+	if err != nil {
+		t.Fatalf("second policy cleanup: %v", err)
+	}
+	if !result.ProtectUnlocated {
+		t.Fatal("retried incomplete policy traversal did not protect unlocated videos")
+	}
+	if drv.listCalls["good-skip"] != goodCalls {
+		t.Fatalf("completed directory was traversed again: calls %d -> %d", goodCalls, drv.listCalls["good-skip"])
+	}
+	if drv.listCalls["broken-skip"] <= brokenCalls {
+		t.Fatalf("incomplete directory was not retried: calls %d -> %d", brokenCalls, drv.listCalls["broken-skip"])
+	}
+}
+
+func TestSkipPolicyAvoidsLegacyTraversalWhenNoLegacyVideosExist(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	const driveID = "new-drive-no-legacy"
+	driveConfig := &catalog.Drive{
+		ID: driveID, Kind: "fake", Name: "New Drive", RootID: "root",
+		SkipDirIDs: []string{"skip-dir"},
+	}
+	if err := cat.UpsertDrive(ctx, driveConfig); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	drv := &serverTreeScanDrive{
+		id:         driveID,
+		listErrors: map[string]error{"skip-dir": errors.New("must not be listed")},
+		listCalls:  map[string]int{},
+	}
+	app := &App{cfg: &config.Config{}, cat: cat}
+
+	result, err := app.cleanupSkippedDriveVideos(ctx, drv, driveConfig, nil, scanner.NewRateLimitBudget())
+	if err != nil {
+		t.Fatalf("policy cleanup: %v", err)
+	}
+	if result.ProtectUnlocated {
+		t.Fatal("policy cleanup protected unlocated videos when no legacy rows exist")
+	}
+	if drv.listCalls["skip-dir"] != 0 {
+		t.Fatalf("skip directory list calls = %d, want 0", drv.listCalls["skip-dir"])
+	}
+	state, err := cat.GetDriveSkipCleanupState(ctx, driveID)
+	if err != nil {
+		t.Fatalf("read cleanup state: %v", err)
+	}
+	if !equalDirIDSets(state.LegacyDoneDirIDs, []string{"skip-dir"}) {
+		t.Fatalf("completed legacy directories = %#v, want skip-dir", state.LegacyDoneDirIDs)
+	}
+}
+
+func TestRunScanContinuesAfterNonfatalSkipCleanupError(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "catalog.db")
+	cat, err := catalog.Open(databasePath)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	const driveID = "nonfatal-policy-error-drive"
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: driveID, Kind: "fake", Name: "Continue Scan", RootID: "root",
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: "stale-after-policy-error", DriveID: driveID, FileID: "stale-file", FileName: "stale.mp4",
+		ParentID: "root", AncestorDirIDs: []string{"root"}, Title: "Stale", Size: 1,
+		PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed stale video: %v", err)
+	}
+	externalDB, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("open database for malformed progress: %v", err)
+	}
+	if _, err := externalDB.ExecContext(ctx,
+		`UPDATE drives SET skip_cleanup_dir_ids = 'not-json' WHERE id = ?`, driveID); err != nil {
+		externalDB.Close()
+		t.Fatalf("malform cleanup progress: %v", err)
+	}
+	if err := externalDB.Close(); err != nil {
+		t.Fatalf("close progress database: %v", err)
+	}
+
+	drv := &serverTreeScanDrive{id: driveID, entries: map[string][]drives.Entry{
+		"root": {{ID: "new-video", Name: "new.mp4", Size: 123}},
+	}}
+	registry := proxy.NewRegistry()
+	registry.Set(driveID, drv)
+	app := &App{
+		cfg: &config.Config{Scanner: config.Scanner{VideoExtensions: []string{".mp4"}}},
+		cat: cat, registry: registry,
+	}
+	result := app.runScan(ctx, driveID)
+	if result.State != "partial" || result.ErrorCount == 0 {
+		t.Fatalf("cleanup failure was not reported: %+v", result)
+	}
+	if _, err := cat.GetVideo(ctx, "fake-"+driveID+"-new-video"); err != nil {
+		t.Fatalf("normal scan did not continue after policy error: %v", err)
+	}
+	if _, err := cat.GetVideo(ctx, "stale-after-policy-error"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("policy error downgraded authoritative presence cleanup: %v", err)
 	}
 }
 
@@ -2018,11 +4054,33 @@ func TestCleanupDriveVideosForDeleteScriptCrawlerRemovesOnlyLocalRows(t *testing
 		t.Fatalf("seed crawler drive: %v", err)
 	}
 
+	app := &App{
+		cfg:                &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}},
+		cat:                cat,
+		registry:           proxy.NewRegistry(),
+		workers:            make(map[string]*preview.Worker),
+		thumbWorkers:       make(map[string]*preview.ThumbWorker),
+		fingerprintWorkers: make(map[string]*fingerprint.Worker),
+	}
+	crawlerStorage := app.scriptCrawlerDriveDir(driveID)
+	localSource := filepath.Join(crawlerStorage, "videos", "source.mp4")
+	migratedSourceResidue := filepath.Join(crawlerStorage, "videos", "migrated.mp4")
+	sourceThumb := filepath.Join(crawlerStorage, "thumbs", "source.jpg")
+	crawlState := filepath.Join(crawlerStorage, ".crawl", "seen.txt")
 	localPreview := filepath.Join(localDir, "scriptcrawler-crawler-main-source.mp4")
 	localThumb := filepath.Join(localDir, "thumbs", "scriptcrawler-crawler-main-source.jpg")
 	migratedPreview := filepath.Join(localDir, "scriptcrawler-crawler-main-migrated.mp4")
 	migratedThumb := filepath.Join(localDir, "thumbs", "scriptcrawler-crawler-main-migrated.jpg")
-	for _, path := range []string{localPreview, localThumb, migratedPreview, migratedThumb} {
+	for _, path := range []string{
+		localSource,
+		migratedSourceResidue,
+		sourceThumb,
+		crawlState,
+		localPreview,
+		localThumb,
+		migratedPreview,
+		migratedThumb,
+	} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", path, err)
 		}
@@ -2067,14 +4125,6 @@ func TestCleanupDriveVideosForDeleteScriptCrawlerRemovesOnlyLocalRows(t *testing
 		}
 	}
 
-	app := &App{
-		cfg:                &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}},
-		cat:                cat,
-		registry:           proxy.NewRegistry(),
-		workers:            make(map[string]*preview.Worker),
-		thumbWorkers:       make(map[string]*preview.ThumbWorker),
-		fingerprintWorkers: make(map[string]*fingerprint.Worker),
-	}
 	removed, err := app.cleanupDriveVideosForDelete(ctx, driveID)
 	if err != nil {
 		t.Fatalf("cleanup crawler videos: %v", err)
@@ -2101,9 +4151,30 @@ func TestCleanupDriveVideosForDeleteScriptCrawlerRemovesOnlyLocalRows(t *testing
 			t.Fatalf("%s missing, stat err=%v", path, err)
 		}
 	}
+	if _, err := os.Stat(crawlerStorage); !os.IsNotExist(err) {
+		t.Fatalf("crawler storage still exists, stat err=%v", err)
+	}
 }
 
-func TestCleanupOrphanDriveVideosRemovesRowsAndGeneratedAssets(t *testing.T) {
+func TestRemoveScriptCrawlerStorageForDeleteRejectsPathsOutsideDriveRoot(t *testing.T) {
+	root := t.TempDir()
+	localDir := filepath.Join(root, "previews")
+	marker := filepath.Join(root, "keep.txt")
+	if err := os.WriteFile(marker, []byte("keep"), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	app := &App{cfg: &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}}}
+	for _, driveID := range []string{".", ".."} {
+		if err := app.removeScriptCrawlerStorageForDelete(driveID); err == nil {
+			t.Fatalf("drive %q cleanup succeeded, want unsafe path error", driveID)
+		}
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("marker was removed: %v", err)
+	}
+}
+
+func TestMissingDriveInspectionPreservesRowsAndGeneratedAssets(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	localDir := filepath.Join(root, "previews")
@@ -2167,26 +4238,22 @@ func TestCleanupOrphanDriveVideosRemovesRowsAndGeneratedAssets(t *testing.T) {
 		}
 	}
 
-	app := &App{
-		cfg: &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}},
-		cat: cat,
-	}
-	removed, err := app.cleanupOrphanDriveVideos(ctx)
+	orphans, err := cat.ListVideosWithMissingDrive(ctx)
 	if err != nil {
-		t.Fatalf("cleanup orphan videos: %v", err)
+		t.Fatalf("inspect orphan videos: %v", err)
 	}
-	if removed != 1 {
-		t.Fatalf("removed = %d, want 1", removed)
+	if len(orphans) != 1 || orphans[0].ID != "p123-123-orphan" {
+		t.Fatalf("orphans = %#v", orphans)
 	}
-	if _, err := cat.GetVideo(ctx, "p123-123-orphan"); err != sql.ErrNoRows {
-		t.Fatalf("orphan video lookup error = %v, want sql.ErrNoRows", err)
+	if _, err := cat.GetVideo(ctx, "p123-123-orphan"); err != nil {
+		t.Fatalf("orphan video was removed: %v", err)
 	}
 	if _, err := cat.GetVideo(ctx, "pikpak-active"); err != nil {
 		t.Fatalf("active video missing: %v", err)
 	}
 	for _, path := range []string{previewPath, thumbPath} {
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Fatalf("orphan asset %s still exists, stat err=%v", path, err)
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("orphan asset %s was removed: %v", path, err)
 		}
 	}
 }
@@ -2542,6 +4609,27 @@ func (d *serverListResultDrive) List(context.Context, string) ([]drives.Entry, e
 	return d.entries, d.err
 }
 
+type serverTreeScanDrive struct {
+	serverFakeDrive
+	id         string
+	entries    map[string][]drives.Entry
+	listErrors map[string]error
+	listCalls  map[string]int
+	listOrder  []string
+}
+
+func (d *serverTreeScanDrive) ID() string { return d.id }
+func (d *serverTreeScanDrive) List(_ context.Context, dirID string) ([]drives.Entry, error) {
+	d.listOrder = append(d.listOrder, dirID)
+	if d.listCalls != nil {
+		d.listCalls[dirID]++
+	}
+	if err := d.listErrors[dirID]; err != nil {
+		return nil, err
+	}
+	return d.entries[dirID], nil
+}
+
 type serverRemovableFakeDrive struct {
 	serverFakeDrive
 	id            string
@@ -2583,12 +4671,46 @@ func (d *serverSourceRemovableFakeDrive) Remove(ctx context.Context, fileID stri
 }
 
 type serverFakeCrawlerUploadRunner struct {
-	called atomic.Int32
+	called      atomic.Int32
+	rejectStart atomic.Bool
+	mu          sync.Mutex
+	driveIDs    []string
 }
 
 func (r *serverFakeCrawlerUploadRunner) RunOnce(context.Context) error {
 	r.called.Add(1)
 	return nil
+}
+
+func (r *serverFakeCrawlerUploadRunner) RunDrives(_ context.Context, driveIDs []string) error {
+	r.called.Add(1)
+	r.mu.Lock()
+	r.driveIDs = append(r.driveIDs, driveIDs...)
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *serverFakeCrawlerUploadRunner) StartDrive(_ context.Context, driveID string) (<-chan error, bool) {
+	if r.rejectStart.Load() {
+		return nil, false
+	}
+	r.called.Add(1)
+	r.mu.Lock()
+	r.driveIDs = append(r.driveIDs, driveID)
+	r.mu.Unlock()
+	done := make(chan error, 1)
+	done <- nil
+	close(done)
+	return done, true
+}
+
+func (r *serverFakeCrawlerUploadRunner) lastDriveID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.driveIDs) == 0 {
+		return ""
+	}
+	return r.driveIDs[len(r.driveIDs)-1]
 }
 
 type serverBlockingListDrive struct {
@@ -2653,6 +4775,54 @@ type serverLocalUploadFakeDrive struct {
 }
 
 func (d *serverLocalUploadFakeDrive) ID() string { return "local-upload" }
+
+type serverRestorableLocalUploadDrive struct {
+	serverFakeDrive
+	mu            sync.Mutex
+	entry         *drives.Entry
+	statCalls     int
+	removeCalls   int
+	removeStarted chan struct{}
+	allowRemove   <-chan struct{}
+}
+
+func (d *serverRestorableLocalUploadDrive) ID() string { return "local-upload" }
+
+func (d *serverRestorableLocalUploadDrive) Stat(context.Context, string) (*drives.Entry, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.statCalls++
+	if d.entry == nil {
+		return nil, os.ErrNotExist
+	}
+	copy := *d.entry
+	return &copy, nil
+}
+
+func (d *serverRestorableLocalUploadDrive) Remove(ctx context.Context, _ string) error {
+	d.mu.Lock()
+	d.removeCalls++
+	removeStarted := d.removeStarted
+	allowRemove := d.allowRemove
+	d.mu.Unlock()
+	if removeStarted != nil {
+		select {
+		case removeStarted <- struct{}{}:
+		default:
+		}
+	}
+	if allowRemove != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-allowRemove:
+		}
+	}
+	d.mu.Lock()
+	d.entry = nil
+	d.mu.Unlock()
+	return nil
+}
 
 // seedDriveWithTeaser 在 catalog 里 upsert 一个测试用的 drive 行，把 TeaserEnabled
 // 设为 enabled。teaser 入队判断现在按 per-drive 而不是全局 setting，所以涉及到

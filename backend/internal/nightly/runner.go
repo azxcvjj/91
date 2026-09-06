@@ -5,9 +5,11 @@
 // "扫描所有网盘" action uses TriggerScanAll and intentionally runs only the
 // cloud-scan and duplicate-maintenance stages.
 //
-//	Phase 1: for each non-crawler cloud drive
+//	Phase 1: concurrently for each non-crawler cloud drive
 //	           scan + delete-detection + enqueue thumb + enqueue preview video
-//	         wait until all thumb / preview-video queues are idle
+//	         wait for all scans, then all thumb / preview-video queues to be idle
+//	Phase 1b: reconcile generated thumbnails/previews against local storage
+//	          enqueue repaired pending rows and wait for their queues to drain
 //	Phase 2: if any script crawler configured
 //	           crawl + enqueue preview video for new videos
 //	         wait until preview-video queues are idle
@@ -15,7 +17,7 @@
 //	         honored within this call)
 //	Phase 4: scan crawler local directories and restore user-requested videos
 //	Phase 5: full-library duplicate video maintenance:
-//	         exact size+sampled_sha256 dedupe, then title/duration/thumbnail dedupe
+//	         exact size+sampled_sha256, title/duration/thumbnail, then content-frame dedupe
 //
 // The pipeline runs until all phases finish, the process exits, or an admin
 // stop request cancels the run. Provider cooldowns may make a single phase take
@@ -34,6 +36,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/video-site/backend/internal/scanjob"
+	"github.com/video-site/backend/internal/schedule"
 )
 
 const (
@@ -66,17 +71,24 @@ type Config struct {
 	Settings   SettingStore
 	CronHour   int // legacy/default hour; zero falls back to 1 unless StartTime is set
 	CronMinute int // default 0
+	// Disabled prevents natural daily triggers without affecting manual scan-all
+	// requests or canceling a pipeline that is already running.
+	Disabled bool
 	// StartTime is the preferred daily schedule in 24-hour HH:mm form. It can
 	// represent midnight and takes precedence over CronHour/CronMinute.
 	StartTime string
+	// Timezone is the explicit IANA timezone used to interpret StartTime and
+	// the persisted last-run calendar date. It never changes the host timezone.
+	Timezone string
 
-	// ListScanTargets returns the drive IDs to run Phase 1 on, in deterministic
-	// order. Should exclude crawler and localupload drives.
-	ListScanTargets func(ctx context.Context) []string
+	// ListScanTargets returns unique drive IDs to run Phase 1 on concurrently.
+	// Should exclude crawler and localupload drives.
+	ListScanTargets func(ctx context.Context) ([]string, error)
 
 	// RunScan synchronously runs scan + cleanup + enqueueDriveGeneration for
-	// one drive. Errors are expected to be logged inside, not surfaced.
-	RunScan func(ctx context.Context, driveID string)
+	// one drive, returning its final outcome even when it failed or was skipped.
+	// It must support concurrent calls for different drives and honor cancellation.
+	RunScan func(ctx context.Context, driveID string) scanjob.Result
 
 	// ListCrawlerDrives returns script crawler drive IDs to crawl in Phase 2.
 	// Returns empty slice when no crawler is configured.
@@ -90,6 +102,12 @@ type Config struct {
 	// across all drives are drained (queue empty + no in-flight task). It must
 	// honor ctx cancellation.
 	WaitPreviewQueuesIdle func(ctx context.Context) error
+
+	// RunLocalAssetReconciliation repairs catalog rows whose generated local
+	// thumbnail or preview file is missing. It must finish admitting repaired
+	// pending rows to registered worker queues before returning. The result is
+	// the number of generated asset references reset across both asset types.
+	RunLocalAssetReconciliation func(ctx context.Context) (int, error)
 
 	// RunMigration runs crawlerupload.Migrator.RunOnce for Phase 3.
 	RunMigration func(ctx context.Context) error
@@ -118,6 +136,9 @@ type Status struct {
 	Queued         bool
 	StartedAt      time.Time
 	LastFinishedAt time.Time
+	Outcome        scanjob.State
+	ScanResults    []scanjob.Result // completed scans, in completion order
+	Issues         []scanjob.Issue
 }
 
 // Runner drives the nightly pipeline.
@@ -126,7 +147,8 @@ type Runner struct {
 	trigger         chan runMode  // buffered(1); mutually exclusive manual requests
 	scheduleChanged chan struct{} // buffered(1); wake the natural scheduler
 	runMu           sync.Mutex    // prevents overlapping pipeline runs
-	scheduleMu      sync.RWMutex  // protects cfg CronHour/CronMinute/StartTime
+	scheduleMu      sync.RWMutex  // protects schedule fields and location
+	location        *time.Location
 
 	stateMu        sync.Mutex
 	running        bool
@@ -134,6 +156,9 @@ type Runner struct {
 	startedAt      time.Time
 	lastFinishedAt time.Time
 	currentCancel  context.CancelFunc
+	outcome        scanjob.State
+	scanResults    []scanjob.Result
+	issues         []scanjob.Issue
 }
 
 // New constructs a Runner. cfg is shallow-copied; defaults are applied.
@@ -161,8 +186,18 @@ func New(cfg Config) *Runner {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	timezone := strings.TrimSpace(cfg.Timezone)
+	if timezone == "" {
+		timezone = schedule.DefaultTimezone
+	}
+	timezone, location, err := schedule.LoadTimezone(timezone)
+	if err != nil {
+		timezone, location, _ = schedule.LoadTimezone(schedule.DefaultTimezone)
+	}
+	cfg.Timezone = timezone
 	return &Runner{
 		cfg:             cfg,
+		location:        location,
 		trigger:         make(chan runMode, 1),
 		scheduleChanged: make(chan struct{}, 1),
 	}
@@ -174,7 +209,8 @@ func New(cfg Config) *Runner {
 func (r *Runner) Run(ctx context.Context) {
 	t := time.NewTicker(pollInterval)
 	defer t.Stop()
-	log.Printf("[nightly] runner started; start_time=%s", r.StartTime())
+	startTime, timezone := r.Schedule()
+	log.Printf("[nightly] runner started; start_time=%s timezone=%s disabled=%t", startTime, timezone, r.Disabled())
 	for {
 		select {
 		case <-ctx.Done():
@@ -183,7 +219,8 @@ func (r *Runner) Run(ctx context.Context) {
 		case <-t.C:
 			r.tryNaturalRun(ctx)
 		case <-r.scheduleChanged:
-			log.Printf("[nightly] schedule updated; start_time=%s", r.StartTime())
+			startTime, timezone := r.Schedule()
+			log.Printf("[nightly] schedule updated; start_time=%s timezone=%s disabled=%t", startTime, timezone, r.Disabled())
 			// Re-evaluate immediately so saving the current minute does not have
 			// to wait for the next heartbeat and accidentally miss today's run.
 			r.tryNaturalRun(ctx)
@@ -207,11 +244,41 @@ func (r *Runner) UpdateStartTime(value string) error {
 	r.cfg.StartTime = normalized
 	r.scheduleMu.Unlock()
 
+	r.signalScheduleChanged()
+	return nil
+}
+
+// UpdateSchedule atomically changes the natural daily schedule and whether it
+// is disabled. Validation completes before the lock is acquired, so a rejected
+// update cannot leave a partially applied schedule behind.
+func (r *Runner) UpdateSchedule(startTime, timezone string, disabled bool) error {
+	hour, minute, normalizedStartTime, err := parseStartTime(startTime)
+	if err != nil {
+		return err
+	}
+	normalizedTimezone, location, err := schedule.LoadTimezone(timezone)
+	if err != nil {
+		return fmt.Errorf("invalid nightly timezone %q: %w", timezone, err)
+	}
+
+	r.scheduleMu.Lock()
+	r.cfg.CronHour = hour
+	r.cfg.CronMinute = minute
+	r.cfg.StartTime = normalizedStartTime
+	r.cfg.Timezone = normalizedTimezone
+	r.cfg.Disabled = disabled
+	r.location = location
+	r.scheduleMu.Unlock()
+
+	r.signalScheduleChanged()
+	return nil
+}
+
+func (r *Runner) signalScheduleChanged() {
 	select {
 	case r.scheduleChanged <- struct{}{}:
 	default:
 	}
-	return nil
 }
 
 // StartTime returns the current canonical HH:mm schedule.
@@ -221,10 +288,32 @@ func (r *Runner) StartTime() string {
 	return r.cfg.StartTime
 }
 
+// Timezone returns the current explicit IANA schedule timezone.
+func (r *Runner) Timezone() string {
+	r.scheduleMu.RLock()
+	defer r.scheduleMu.RUnlock()
+	return r.cfg.Timezone
+}
+
+// Disabled reports whether natural daily triggers are currently stopped.
+func (r *Runner) Disabled() bool {
+	r.scheduleMu.RLock()
+	defer r.scheduleMu.RUnlock()
+	return r.cfg.Disabled
+}
+
+// Schedule returns a consistent start-time/timezone pair.
+func (r *Runner) Schedule() (string, string) {
+	r.scheduleMu.RLock()
+	defer r.scheduleMu.RUnlock()
+	return r.cfg.StartTime, r.cfg.Timezone
+}
+
 // TriggerScanAll asks the runner to scan every configured non-crawler cloud
-// drive, wait for newly discovered video assets, and then run full-library
-// duplicate maintenance. It deliberately excludes crawler, migration, and
-// retained-video restore phases, and does not consume today's scheduled run.
+// drive, wait for newly discovered video assets, reconcile generated local
+// assets, and then run full-library duplicate maintenance. It deliberately
+// excludes crawler, migration, and retained-video restore phases, and does not
+// consume today's scheduled run.
 func (r *Runner) TriggerScanAll() bool {
 	return r.queueManualRun()
 }
@@ -277,6 +366,9 @@ func (r *Runner) Status() Status {
 	queued := r.queued
 	startedAt := r.startedAt
 	lastFinishedAt := r.lastFinishedAt
+	outcome := r.outcome
+	scanResults := append([]scanjob.Result(nil), r.scanResults...)
+	issues := append([]scanjob.Issue(nil), r.issues...)
 	r.stateMu.Unlock()
 
 	state := "idle"
@@ -295,15 +387,24 @@ func (r *Runner) Status() Status {
 		Queued:         queued,
 		StartedAt:      startedAt,
 		LastFinishedAt: lastFinishedAt,
+		Outcome:        outcome,
+		ScanResults:    scanResults,
+		Issues:         issues,
 	}
 }
 
 // tryNaturalRun checks the cron decision and runs the pipeline if due today.
 func (r *Runner) tryNaturalRun(ctx context.Context) {
-	now := r.cfg.Now()
 	r.scheduleMu.RLock()
+	disabled := r.cfg.Disabled
+	location := r.location
 	hour, minute := r.cfg.CronHour, r.cfg.CronMinute
 	r.scheduleMu.RUnlock()
+	if disabled {
+		return
+	}
+	instant := r.cfg.Now()
+	now := instant.In(location)
 	if now.Hour() != hour || now.Minute() != minute {
 		return
 	}
@@ -316,7 +417,7 @@ func (r *Runner) tryNaturalRun(ctx context.Context) {
 		return
 	}
 	log.Printf("[nightly] natural cron trigger at %s", now.Format(time.RFC3339))
-	r.runModeLocked(ctx, runModeScheduled)
+	r.runModeLockedForDate(ctx, runModeScheduled, now.Format(dateLayout))
 }
 
 func parseStartTime(value string) (hour, minute int, normalized string, err error) {
@@ -336,6 +437,10 @@ func shouldRun(now time.Time, lastRunDate string) bool {
 // runModeLocked guards both execution modes against overlap. Runs have no
 // fixed duration limit and stop only when canceled or their phases complete.
 func (r *Runner) runModeLocked(ctx context.Context, mode runMode) {
+	r.runModeLockedForDate(ctx, mode, "")
+}
+
+func (r *Runner) runModeLockedForDate(ctx context.Context, mode runMode, scheduledDate string) {
 	component := "nightly"
 	execution := "scheduled"
 	if mode == runModeScanAll {
@@ -358,11 +463,16 @@ func (r *Runner) runModeLocked(ctx context.Context, mode runMode) {
 	}
 
 	started := r.cfg.Now()
+	if mode == runModeScheduled && scheduledDate == "" {
+		r.scheduleMu.RLock()
+		scheduledDate = started.In(r.location).Format(dateLayout)
+		r.scheduleMu.RUnlock()
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	r.markStarted(started, cancel)
 	defer func() {
+		r.markFinished(r.cfg.Now(), runCtx.Err())
 		cancel()
-		r.markFinished(r.cfg.Now())
 		r.runMu.Unlock()
 	}()
 
@@ -384,8 +494,7 @@ func (r *Runner) runModeLocked(ctx context.Context, mode runMode) {
 	// Mark today as processed regardless of success/error. This is intentional:
 	// a partial / failing full pipeline should not automatically trigger again
 	// during the same scheduled minute. Scan-all returns above and never writes it.
-	dateStr := started.Format(dateLayout)
-	if err := r.cfg.Settings.SetSetting(ctx, settingLastRunDate, dateStr); err != nil {
+	if err := r.cfg.Settings.SetSetting(ctx, settingLastRunDate, scheduledDate); err != nil {
 		log.Printf("[nightly] persist last_run_date: %v", err)
 	}
 }
@@ -397,23 +506,72 @@ func (r *Runner) markStarted(started time.Time, cancel context.CancelFunc) {
 	r.queued = false
 	r.startedAt = started
 	r.currentCancel = cancel
+	r.outcome = ""
+	r.scanResults = nil
+	r.issues = nil
 }
 
-func (r *Runner) markFinished(finished time.Time) {
+func (r *Runner) markFinished(finished time.Time, err error) {
 	r.stateMu.Lock()
 	defer r.stateMu.Unlock()
 	r.running = false
 	r.startedAt = time.Time{}
 	r.lastFinishedAt = finished
 	r.currentCancel = nil
+	r.outcome = scanOutcome(r.scanResults, len(r.issues) > 0)
+	if err != nil {
+		r.outcome = scanjob.Canceled
+	}
+}
+
+func scanOutcome(results []scanjob.Result, phaseFailed bool) scanjob.State {
+	succeeded, failed, skipped, canceled := 0, 0, 0, 0
+	partial := false
+	for _, result := range results {
+		switch result.State {
+		case scanjob.Succeeded:
+			succeeded++
+		case scanjob.Partial:
+			partial = true
+		case scanjob.Skipped:
+			skipped++
+		case scanjob.Canceled:
+			canceled++
+		default:
+			failed++
+		}
+	}
+	switch {
+	case phaseFailed || failed > 0:
+		if succeeded > 0 || partial {
+			return scanjob.Partial
+		}
+		return scanjob.Failed
+	case partial || (succeeded > 0 && skipped+canceled > 0):
+		return scanjob.Partial
+	case canceled > 0:
+		return scanjob.Canceled
+	case skipped > 0 && succeeded == 0:
+		return scanjob.Skipped
+	default:
+		return scanjob.Succeeded
+	}
+}
+
+func (r *Runner) recordIssue(phase string, err error) {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+	r.issues = append(r.issues, scanjob.Issue{Stage: phase, Message: err.Error()})
 }
 
 // runPipeline executes the maintenance phases. It returns when the pipeline
-// finishes or ctx is done. Errors are logged but not propagated —
-// each phase is best-effort; downstream phases still attempt to run unless ctx
-// is dead.
+// finishes or ctx is done. Phase errors are retained in Status; downstream
+// phases still attempt to run unless ctx is canceled.
 func (r *Runner) runPipeline(ctx context.Context) {
 	if !r.runScanPhase(ctx, "nightly", "phase 1") {
+		return
+	}
+	if !r.runLocalAssetReconciliationPhase(ctx, "nightly", "phase 1b") {
 		return
 	}
 
@@ -453,6 +611,7 @@ func (r *Runner) runPipeline(ctx context.Context) {
 	if r.cfg.RunMigration != nil {
 		if err := r.cfg.RunMigration(ctx); err != nil {
 			log.Printf("[nightly] phase 3 migration: %v", err)
+			r.recordIssue("migration", err)
 		}
 	}
 
@@ -465,6 +624,7 @@ func (r *Runner) runPipeline(ctx context.Context) {
 		for _, id := range crawlerIDs {
 			if err := r.cfg.RestoreCrawlerVideos(ctx, id); err != nil {
 				log.Printf("[nightly] phase 4 restore drive=%s: %v", id, err)
+				r.recordIssue("restore", err)
 			}
 		}
 	}
@@ -481,6 +641,9 @@ func (r *Runner) runScanAllPipeline(ctx context.Context) {
 	if !r.runScanPhase(ctx, "scan-all", "scan") {
 		return
 	}
+	if !r.runLocalAssetReconciliationPhase(ctx, "scan-all", "asset reconciliation") {
+		return
+	}
 	r.runDedupeAssetCleanupPhase(ctx, "scan-all", "dedupe")
 }
 
@@ -490,26 +653,71 @@ func (r *Runner) runScanPhase(ctx context.Context, component, phase string) bool
 	}
 	scanIDs := []string{}
 	if r.cfg.ListScanTargets != nil {
-		scanIDs = r.cfg.ListScanTargets(ctx)
+		var err error
+		scanIDs, err = r.cfg.ListScanTargets(ctx)
+		if err != nil {
+			r.recordIssue(phase, err)
+			log.Printf("[%s] %s: list scan targets: %v", component, phase, err)
+			return false
+		}
 	}
 	if len(scanIDs) == 0 {
 		log.Printf("[%s] %s skipped: no cloud drives to scan", component, phase)
 	} else {
-		log.Printf("[%s] %s: scanning %d drive(s)", component, phase, len(scanIDs))
+		log.Printf("[%s] %s: scanning %d drive(s) concurrently", component, phase, len(scanIDs))
+		var scans sync.WaitGroup
 		for _, id := range scanIDs {
 			if ctx.Err() != nil {
-				log.Printf("[%s] %s aborted by ctx: %v", component, phase, ctx.Err())
-				return false
+				break
 			}
-			log.Printf("[%s] %s: scanning drive=%s", component, phase, id)
-			r.cfg.RunScan(ctx, id)
+			scans.Add(1)
+			go func() {
+				defer scans.Done()
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("[%s] %s: scanning drive=%s", component, phase, id)
+				result := r.cfg.RunScan(ctx, id)
+				r.stateMu.Lock()
+				r.scanResults = append(r.scanResults, result)
+				r.stateMu.Unlock()
+			}()
 		}
-		log.Printf("[%s] %s: waiting for preview queues to drain", component, phase)
-		if err := r.waitIdle(ctx, component, phase); err != nil {
-			return false
-		}
+		// Keep ownership of the pipeline until every admitted scan has returned,
+		// including saving its final result and releasing its drive task on stop.
+		scans.Wait()
+	}
+	if r.shouldStop(ctx, component, phase) {
+		return false
+	}
+	log.Printf("[%s] %s: waiting for preview queues to drain", component, phase)
+	if err := r.waitIdle(ctx, component, phase); err != nil {
+		return false
 	}
 	return true
+}
+
+func (r *Runner) runLocalAssetReconciliationPhase(ctx context.Context, component, phase string) bool {
+	if r.shouldStop(ctx, component, phase) {
+		return false
+	}
+	if r.cfg.RunLocalAssetReconciliation == nil {
+		return true
+	}
+	log.Printf("[%s] %s: reconciling generated local assets", component, phase)
+	resets, err := r.cfg.RunLocalAssetReconciliation(ctx)
+	if err != nil {
+		log.Printf("[%s] %s local asset reconciliation: %v", component, phase, err)
+		r.recordIssue(phase, err)
+	}
+	if r.shouldStop(ctx, component, phase) {
+		return false
+	}
+	if resets <= 0 {
+		return true
+	}
+	log.Printf("[%s] %s: waiting for %d repaired local asset(s)", component, phase, resets)
+	return r.waitIdle(ctx, component, phase) == nil
 }
 
 func (r *Runner) shouldStop(ctx context.Context, component, phase string) bool {
@@ -527,6 +735,7 @@ func (r *Runner) waitIdle(ctx context.Context, component, phase string) error {
 	}
 	if err := r.cfg.WaitPreviewQueuesIdle(ctx); err != nil {
 		log.Printf("[%s] %s: wait preview queues: %v", component, phase, err)
+		r.recordIssue(phase, err)
 		return err
 	}
 	return nil
@@ -542,6 +751,7 @@ func (r *Runner) runTagMaintenancePhase(ctx context.Context, component, phase st
 	log.Printf("[%s] %s: tag maintenance", component, phase)
 	if err := r.cfg.RunTagMaintenance(ctx); err != nil {
 		log.Printf("[%s] %s tag maintenance: %v", component, phase, err)
+		r.recordIssue(phase, err)
 	}
 }
 
@@ -555,6 +765,7 @@ func (r *Runner) runDedupeAssetCleanupPhase(ctx context.Context, component, phas
 	log.Printf("[%s] %s: duplicate video maintenance", component, phase)
 	if err := r.cfg.RunDedupeAssetCleanup(ctx); err != nil {
 		log.Printf("[%s] %s duplicate video maintenance: %v", component, phase, err)
+		r.recordIssue(phase, err)
 	}
 }
 

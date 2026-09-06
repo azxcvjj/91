@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router";
 import {
   ArrowLeft,
   Ban,
@@ -39,8 +39,14 @@ import {
 import { StorageSummary } from "./drive/StorageSummary";
 import { DriveDetailLoading, DriveListSkeleton } from "./DrivesPageLoading";
 import { DriveForm } from "./drive/DriveForm";
+import {
+  changedCredentialValues,
+  driveCredentialsForForm,
+  driveCredentialError,
+} from "./drive/credentials";
 import { DeleteDriveModal } from "./drive/DeleteDriveModal";
 import { SkipDirsPanel } from "./drive/SkipDirsPanel";
+import { isGenerationBusy } from "./drive/scanResults";
 import { AdminEmptyVisual } from "./AdminEmptyVisual";
 import { useAdminFloatingActionSpace } from "./useAdminFloatingActionSpace";
 import {
@@ -57,10 +63,9 @@ function isDriveBusy(d: api.AdminDrive) {
     d.thumbnailGenerationStatus,
     d.previewGenerationStatus,
     d.fingerprintGenerationStatus,
-    d.transcodeGenerationStatus,
   ].some((status) => {
     const state = status?.state || "idle";
-    return state !== "idle";
+    return isGenerationBusy(state);
   });
 }
 
@@ -86,7 +91,6 @@ export function DrivesPage() {
   const [regenFailedThumbId, setRegenFailedThumbId] = useState("");
   const [regenFailedFingerprintId, setRegenFailedFingerprintId] = useState("");
   const [togglingTeaserId, setTogglingTeaserId] = useState("");
-  const [togglingTranscodeId, setTogglingTranscodeId] = useState("");
   const [scanningAll, setScanningAll] = useState(false);
   const [stoppingAll, setStoppingAll] = useState(false);
   const [trackingScanAll, setTrackingScanAll] = useState(false);
@@ -97,6 +101,7 @@ export function DrivesPage() {
   const selectedDriveId = searchParams.get("drive") || null;
   const { show } = useToast();
   const pollConnectionLost = useRef(false);
+  const driveListRequestVersion = useRef(0);
   const maintenanceBusy = scanningAll || maintenanceStatus.running || maintenanceStatus.queued;
   const formDirty = form.id
     ? !sameForm(form, initialForm)
@@ -119,6 +124,7 @@ export function DrivesPage() {
   }
 
   async function refresh() {
+    const requestVersion = ++driveListRequestVersion.current;
     setLoading(true);
     setLoadError("");
     try {
@@ -127,24 +133,30 @@ export function DrivesPage() {
         api.getDriveStorage(),
         api.getScanAllJobStatus().catch(() => null),
       ]);
-      setList(data ?? []);
+      if (requestVersion === driveListRequestVersion.current) {
+        setList(data ?? []);
+      }
       setStorage(storageData);
       if (jobStatus) setMaintenanceStatus(jobStatus);
     } catch (e) {
-      const message = e instanceof Error ? e.message : "加载失败";
-      setLoadError(message);
-      show(message, "error");
+      if (requestVersion === driveListRequestVersion.current) {
+        const message = e instanceof Error ? e.message : "加载失败";
+        setLoadError(message);
+        show(message, "error");
+      }
     } finally {
       setLoading(false);
     }
   }
 
   async function refreshDriveList() {
+    const requestVersion = ++driveListRequestVersion.current;
     try {
       const [data, jobStatus] = await Promise.all([
         api.listDrives(),
         api.getScanAllJobStatus().catch(() => null),
       ]);
+      if (requestVersion !== driveListRequestVersion.current) return;
       setList(data ?? []);
       if (jobStatus) setMaintenanceStatus(jobStatus);
       if (pollConnectionLost.current) {
@@ -152,6 +164,7 @@ export function DrivesPage() {
         show("连接已恢复，网盘数据已更新", "success");
       }
     } catch {
+      if (requestVersion !== driveListRequestVersion.current) return;
       if (!pollConnectionLost.current) {
         pollConnectionLost.current = true;
         show("连接中断，网盘数据可能不是最新", "error");
@@ -206,7 +219,10 @@ export function DrivesPage() {
     setEditingCredentialsId(d.id);
     try {
       const result = await api.getDriveCredentials(d.id);
-      const creds = { ...(result.credentials ?? {}) };
+      const creds = driveCredentialsForForm(
+        d.kind,
+        result.credentials ?? {}
+      );
       if (d.kind === "localstorage" && !("strm_allow_outside_root" in creds)) {
         creds.strm_allow_outside_root = (d.strmAllowOutsideRoot ?? false) ? "true" : "false";
       }
@@ -259,16 +275,12 @@ export function DrivesPage() {
       show("请填写网盘名称", "error");
       return;
     }
+    const credentialError = driveCredentialError(form.kind, form.creds, !form.id);
+    if (credentialError) {
+      show(credentialError, "error");
+      return;
+    }
     if (!form.id) {
-      if (form.kind === "p123") {
-        const hasScannedToken = Boolean((form.creds.access_token ?? "").trim());
-        const hasUsername = Boolean((form.creds.username ?? "").trim());
-        const hasPassword = Boolean((form.creds.password ?? "").trim());
-        if (!hasScannedToken && (!hasUsername || !hasPassword)) {
-          show("请使用方式一扫码登录，或填写方式二的手机号/邮箱和密码", "error");
-          return;
-        }
-      }
       const missingField = credentialFields(form.kind).find(
         (field) =>
           field.required &&
@@ -283,6 +295,17 @@ export function DrivesPage() {
     const driveID = existing
       ? form.id
       : makeUniqueDriveId(form.kind, name, list);
+    const editableCredentialKeys = credentialFields(form.kind).map((field) => field.key);
+    // QR login writes a few values that do not have a standalone input field.
+    if (form.kind === "p123") editableCredentialKeys.push("access_token");
+    if (form.kind === "wopan") editableCredentialKeys.push("family_id");
+    const credentials = existing
+      ? changedCredentialValues(
+          form.creds,
+          initialForm.creds,
+          editableCredentialKeys
+        )
+      : form.creds;
     const rootId = usesRootDirectoryID(form.kind)
       ? form.rootId.trim() || defaultRootId(form.kind)
       : defaultRootId(form.kind);
@@ -293,13 +316,15 @@ export function DrivesPage() {
         kind: form.kind,
         name,
         rootId,
-        credentials: form.creds,
+        credentials,
       });
 
       if (resp.warning) {
         show(`已保存，但 driver 初始化失败：${resp.warning}`, "error");
+      } else if (resp.deferred) {
+        show(resp.message || "已保存，将在当前网盘任务结束后生效", "success");
       } else {
-        show("已保存", "success");
+        show("已保存并生效", "success");
       }
       setModalOpen(false);
       setInitialForm(form);
@@ -477,9 +502,11 @@ export function DrivesPage() {
     try {
       const resp = await api.setDriveTeaserEnabled(d.id, next);
       show(
-        resp.teaserEnabled
-          ? `已开启「${d.name || d.id}」的预览视频生成`
-          : `已关闭「${d.name || d.id}」的预览视频生成`,
+        resp.deferred
+          ? resp.message || "已保存，将在当前网盘任务结束后生效"
+          : resp.teaserEnabled
+            ? `已开启「${d.name || d.id}」的预览视频生成`
+            : `已关闭「${d.name || d.id}」的预览视频生成`,
         "success"
       );
       setList((prev) =>
@@ -497,41 +524,6 @@ export function DrivesPage() {
       show(e instanceof Error ? e.message : "切换失败", "error");
     } finally {
       setTogglingTeaserId("");
-    }
-  }
-
-  async function handleStartTranscode(d: api.AdminDrive) {
-    setTogglingTranscodeId(d.id);
-    try {
-      const resp = await api.startDriveTranscode(d.id);
-      if (resp.accepted) {
-        show(`已开始「${d.name || d.id}」的视频转码`, "success");
-      } else {
-        show(resp.message || "转码任务未能开启", "info");
-      }
-      refreshDriveList();
-    } catch (e) {
-      show(e instanceof Error ? e.message : "开启失败", "error");
-    } finally {
-      setTogglingTranscodeId("");
-    }
-  }
-
-  async function handleStopTranscode(d: api.AdminDrive) {
-    setTogglingTranscodeId(d.id);
-    try {
-      const resp = await api.stopDriveTranscode(d.id);
-      show(
-        resp.stopped
-          ? `已停止「${d.name || d.id}」的视频转码`
-          : `「${d.name || d.id}」没有正在运行的转码任务`,
-        "success"
-      );
-      refreshDriveList();
-    } catch (e) {
-      show(e instanceof Error ? e.message : "停止失败", "error");
-    } finally {
-      setTogglingTranscodeId("");
     }
   }
 
@@ -659,7 +651,7 @@ export function DrivesPage() {
                 </div>
                 <button
                   type="button"
-                  className="admin-btn"
+                  className="admin-btn admin-detail-actions__credentials"
                   onClick={() => openEdit(d)}
                   disabled={!!editingCredentialsId}
                 >
@@ -679,14 +671,17 @@ export function DrivesPage() {
             </div>
 
             <SkipDirsPanel
+              key={d.id}
               drive={d}
               onSaved={(saved) => {
+                // Invalidate list requests that began before this write. Their
+                // old snapshot must not overwrite the just-confirmed value.
+                driveListRequestVersion.current += 1;
                 setList((prev) =>
                   prev.map((item) =>
                     item.id === saved.id ? { ...item, skipDirIds: saved.skipDirIds } : item
                   )
                 );
-                refreshDriveList();
               }}
             />
           </div>
@@ -698,13 +693,10 @@ export function DrivesPage() {
               regenFailedThumbId={regenFailedThumbId}
               regenFailedFingerprintId={regenFailedFingerprintId}
               togglingTeaserId={togglingTeaserId}
-              togglingTranscodeId={togglingTranscodeId}
               onToggleTeaser={() => handleToggleTeaser(d)}
               onRegenFailed={() => handleRegenFailed(d)}
               onRegenFailedThumbnails={() => handleRegenFailedThumbnails(d)}
               onRegenFailedFingerprints={() => handleRegenFailedFingerprints(d)}
-              onStartTranscode={() => handleStartTranscode(d)}
-              onStopTranscode={() => handleStopTranscode(d)}
             />
 
             <div className="admin-detail-card">

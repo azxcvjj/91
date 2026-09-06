@@ -24,10 +24,10 @@ import (
 	"github.com/video-site/backend/internal/applog"
 	"github.com/video-site/backend/internal/auth"
 	"github.com/video-site/backend/internal/backup"
+	"github.com/video-site/backend/internal/backuptransfer"
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/crawlerupload"
-	"github.com/video-site/backend/internal/drives/localstorage"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
 	"github.com/video-site/backend/internal/fingerprint"
 	"github.com/video-site/backend/internal/nightly"
@@ -106,6 +106,15 @@ func main() {
 	if err := os.MkdirAll(cfg.Storage.LocalPreviewDir, 0o755); err != nil {
 		log.Fatalf("mkdir preview dir: %v", err)
 	}
+	assetLease, err := acquireAssetDirectoryLease(cfg.Storage.LocalPreviewDir, cfg.Storage.DBPath)
+	if err != nil {
+		log.Fatalf("acquire generated asset directory lease: %v", err)
+	}
+	defer func() {
+		if closeErr := assetLease.Close(); closeErr != nil {
+			log.Printf("release generated asset directory lease: %v", closeErr)
+		}
+	}()
 
 	cat, err := catalog.Open(cfg.Storage.DBPath)
 	if err != nil {
@@ -140,7 +149,7 @@ func main() {
 	if err := cat.DeleteSettings(
 		context.Background(),
 		legacyNightlyStartTimeSetting,
-		obsoleteDuplicateReviewEnabledSetting,
+		legacyBuiltinTagsEnabledSetting,
 	); err != nil {
 		log.Fatalf("remove migrated SQLite configuration: %v", err)
 	}
@@ -191,6 +200,7 @@ func main() {
 	app.crawlerUploader = crawlerupload.New(crawlerupload.Config{
 		Catalog:          cat,
 		Registry:         app.registry,
+		GetDrive:         app.activeDriveConfig,
 		CommonThumbDir:   app.commonThumbsDir(),
 		OnUploadProgress: app.updateCrawlerUploadProgress,
 	})
@@ -199,15 +209,35 @@ func main() {
 	// 登录态校验拖慢端口监听。
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if err := configManager.SetApply(func(settings config.LiveSettings) error {
+		return app.applyLiveConfig(ctx, settings)
+	}); err != nil {
+		log.Fatalf("apply initial live configuration: %v", err)
+	}
 
-	if _, err := app.normalizeLegacyThumbnailFiles(ctx); err != nil {
-		log.Printf("[thumbnail-maintenance] migration failed: %v", err)
+	legacyCrawlerStats, err := app.cleanupLegacyDeletedCrawlers(ctx)
+	if err != nil {
+		log.Printf(
+			"[scriptcrawler-maintenance] cleanup incomplete removed_crawlers=%d removed_videos=%d: %v",
+			legacyCrawlerStats.RemovedCrawlers,
+			legacyCrawlerStats.RemovedVideos,
+			err,
+		)
+	} else if legacyCrawlerStats.RemovedCrawlers > 0 {
+		log.Printf(
+			"[scriptcrawler-maintenance] removed legacy deleted crawlers=%d videos=%d",
+			legacyCrawlerStats.RemovedCrawlers,
+			legacyCrawlerStats.RemovedVideos,
+		)
 	}
 	app.loadTheme(ctx)
-	if removed, err := app.cleanupOrphanDriveVideos(ctx); err != nil {
-		log.Printf("[cleanup] orphan drive videos: %v", err)
-	} else if removed > 0 {
-		log.Printf("[cleanup] removed %d orphan drive videos", removed)
+	if orphans, err := app.cat.ListVideosWithMissingDrive(ctx); err != nil {
+		log.Printf("[catalog-maintenance] inspect orphan drive videos: %v", err)
+	} else if len(orphans) > 0 {
+		log.Printf(
+			"[catalog-maintenance] preserved %d videos with missing drive metadata; assets are removed only by an explicit drive deletion",
+			len(orphans),
+		)
 	}
 	if err := app.attachLocalUpload(ctx); err != nil {
 		log.Printf("[local-upload] attach failed: %v", err)
@@ -269,6 +299,21 @@ func main() {
 	}
 	backupManager.Start(ctx)
 	defer backupManager.Close()
+	backupTransferManager, err := backuptransfer.New(backuptransfer.Config{
+		Backups: backupManager,
+		RootDir: filepath.Join(filepath.Dir(cfg.Storage.DBPath), "backups", ".peer-transfer"),
+	})
+	if err != nil {
+		log.Fatalf("configure backup transfer service: %v", err)
+	}
+	backupTransferManager.Start(ctx)
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		if err := backupTransferManager.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[backup-transfer] shutdown: %v", err)
+		}
+	}()
 
 	apiServer := &api.Server{
 		Catalog:        cat,
@@ -289,11 +334,13 @@ func main() {
 		},
 		GetTheme: func() string { return app.Theme() },
 	}
+	app.onTagsChanged = apiServer.InvalidateTagCache
 
 	adminServer := &api.AdminServer{
 		Catalog:         cat,
 		Auth:            authr,
 		Backups:         backupManager,
+		BackupTransfers: backupTransferManager,
 		Logs:            logStore,
 		ConfigManager:   configManager,
 		VersionFilePath: versionFilePath,
@@ -328,25 +375,14 @@ func main() {
 			setupRequired = false
 			return nil
 		},
-		LocalPreviewDir: cfg.Storage.LocalPreviewDir,
-		OnDriveSaved: func(driveID string) error {
-			d, err := cat.GetDrive(ctx, driveID)
-			if err != nil {
-				return err
-			}
-			if err := app.attachDrive(ctx, d); err != nil {
-				return err
-			}
-			app.scheduleCrawlerUploadMigration(ctx, driveID)
-			// 本地存储开启 .strm 越root后，之前因 strm 指向目录外而失败的封面/
-			// 预览/指纹应自动重试，省得用户再手动点三个"重试失败"按钮。
-			if d.Kind == localstorage.Kind &&
-				parseBoolDefault(strings.TrimSpace(d.Credentials["strm_allow_outside_root"]), false) {
-				go app.regenFailedThumbnails(ctx, driveID)
-				go app.regenFailedPreviews(ctx, driveID)
-				go app.regenFailedFingerprints(ctx, driveID)
-			}
-			return nil
+		LocalPreviewDir:        cfg.Storage.LocalPreviewDir,
+		BeginDriveConfigUpdate: app.beginDriveConfigUpdate,
+		OnDriveRuntimeConfigChanged: func(driveID string) error {
+			return app.reloadDriveRuntime(ctx, driveID)
+		},
+		OnPrepareDriveDelete: func(deleteCtx context.Context, driveID string) error {
+			app.stopDriveTasks(ctx, driveID)
+			return app.waitDriveTasksStopped(deleteCtx, driveID)
 		},
 		OnDriveDeleteCleanup: func(cleanupCtx context.Context, driveID string) (int, error) {
 			return app.cleanupDriveVideosForDelete(cleanupCtx, driveID)
@@ -389,12 +425,6 @@ func main() {
 		OnRegenFailedFingerprints: func(driveID string) {
 			go app.regenFailedFingerprints(ctx, driveID)
 		},
-		OnStartDriveTranscode: func(driveID string) (bool, string) {
-			return app.startDriveTranscode(ctx, driveID)
-		},
-		OnStopDriveTranscode: func(driveID string) bool {
-			return app.stopDriveTranscode(driveID)
-		},
 		OnDeleteVideo: func(reqCtx context.Context, videoID string, deleteSource bool) (api.DeleteVideoResult, error) {
 			return app.deleteVideo(reqCtx, videoID, deleteSource)
 		},
@@ -403,6 +433,9 @@ func main() {
 		},
 		GetBlacklistSourceDeleteStatus: func() api.BlacklistSourceDeleteStatus {
 			return app.blacklistSourceDeleteStatus()
+		},
+		OnRemoveBlacklist: func(reqCtx context.Context, videoID string) error {
+			return app.restoreDeletedVideo(reqCtx, videoID)
 		},
 		OnStartTagRetag: func() bool {
 			return app.startTagRetag(ctx)
@@ -427,7 +460,7 @@ func main() {
 			worker := app.workers[driveID]
 			thumbWorker := app.thumbWorkers[driveID]
 			app.mu.Unlock()
-			go app.enqueueDriveGeneration(ctx, driveID, worker, thumbWorker)
+			app.scheduleDriveGenerationEnqueue(ctx, driveID, worker, thumbWorker)
 		},
 		GetTheme: func() string { return app.Theme() },
 		SetTheme: func(theme string) error {
@@ -454,6 +487,7 @@ func main() {
 		log.LstdFlags,
 	)
 	r.Use(requestLogMiddleware(accessLogger, log.Default(), logStore))
+	r.Use(responseCompressionMiddleware)
 	r.Use(middleware.Recoverer)
 	r.Use(corsMiddleware(cfg.Server.AllowedOrigins))
 
@@ -461,28 +495,32 @@ func main() {
 	adminServer.Register(r)
 	mountFrontend(r)
 
-	// 凌晨流水线：每天按后台可热更新的 HH:mm 触发一次，串行跑
-	//   Phase 1 扫所有非爬虫 / localupload 网盘 + 删除检测 + 入队封面/预览视频
+	// 凌晨流水线：每天按后台可热更新的 HH:mm + IANA 时区触发一次，依次运行以下阶段：
+	//   Phase 1 并行扫所有非爬虫 / localupload 网盘 + 跳过策略/缺失确认清理 + 入队封面/预览视频
+	//   Phase 1b 对账本地封面/预览文件 + 将丢失资产重置入队并等待补生成
 	//   Phase 2 脚本爬虫 + 入队预览视频
 	//   Phase 3 爬虫本地视频 → 云盘上传
 	//   Phase 4 扫描爬虫本地目录并恢复已取消拉黑的视频
 	//   Phase 5 全库重复视频维护：精确指纹去重 + 标题/时长/封面近似去重
 	// 标签匹配不在夜间流水线中全库重算；新视频入库和管理员修改标签规则时按事件刷新。
 	// admin "扫描所有网盘" 使用同一个 Runner 的独立 scan-all 模式，只运行
-	// Phase 1 和 Phase 5，不触发爬虫、迁移或恢复，也不占用当天的定时执行标记。
+	// 云盘扫描、本地资产对账和全库重复维护，不触发爬虫、迁移或恢复，也不占用当天的定时执行标记。
+	liveSettings := app.liveConfigSettings()
 	app.nightlyRunner = nightly.New(nightly.Config{
-		Settings:              cat,
-		StartTime:             app.liveConfigSettings().NightlyStartTime,
-		ListScanTargets:       app.listScanTargetIDs,
-		RunScan:               app.runScan,
-		ListCrawlerDrives:     app.listCrawlerDriveIDs,
-		RunCrawlerCrawl:       app.runScriptCrawlerCrawl,
-		WaitPreviewQueuesIdle: app.waitAllPreviewQueuesIdle,
-		RunMigration:          app.crawlerUploader.RunOnce,
-		RestoreCrawlerVideos:  app.restoreScriptCrawlerVideos,
-		RunDedupeAssetCleanup: app.cleanupDuplicateVideoAssets,
+		Settings:                    cat,
+		Disabled:                    liveSettings.NightlyDisabled,
+		StartTime:                   liveSettings.NightlyStartTime,
+		Timezone:                    liveSettings.NightlyTimezone,
+		ListScanTargets:             app.listScanTargetIDs,
+		RunScan:                     app.runScan,
+		ListCrawlerDrives:           app.listCrawlerDriveIDs,
+		RunCrawlerCrawl:             app.runScriptCrawlerCrawl,
+		WaitPreviewQueuesIdle:       app.waitAllPreviewQueuesIdle,
+		RunLocalAssetReconciliation: app.reconcileLocalGeneratedAssets,
+		RunMigration:                app.runCrawlerUploadMigration,
+		RestoreCrawlerVideos:        app.restoreScriptCrawlerVideos,
+		RunDedupeAssetCleanup:       app.cleanupDuplicateVideoAssets,
 	})
-	configManager.SetApply(app.applyLiveConfig)
 	go configManager.Watch(ctx)
 	go app.nightlyRunner.Run(ctx)
 
@@ -501,6 +539,7 @@ func main() {
 		}
 	}()
 	go app.attachExistingDrives(ctx)
+	go app.runStartupThumbnailNormalization(ctx)
 	go app.migrateHiddenVideosToTombstone(ctx)
 
 	// 等待退出信号或恢复任务要求的受控重启。
@@ -524,13 +563,13 @@ func main() {
 		log.Printf("[remote-upload] shutdown: %v", err)
 	}
 	if restoreRestart {
-		backupManager.Close()
-		if err := cat.Close(); err != nil {
-			log.Printf("[restore] close catalog before restart: %v", err)
-		}
+		// Keep the restore maintenance barrier held until process exit. Releasing
+		// it here would let canceled background workers write after the target
+		// snapshot that is about to replace the live database.
 		log.Printf("[restore] pending restore staged; exiting with restart code %d", backup.RestartExitCode)
 		os.Exit(backup.RestartExitCode)
 	}
+	backupManager.Close()
 }
 
 func loadApplicationConfig(path, workingDir string) (*config.Config, *config.Config, error) {

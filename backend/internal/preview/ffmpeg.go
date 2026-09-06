@@ -9,11 +9,11 @@ import (
 	"io"
 	"log"
 	"math"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,11 +24,13 @@ import (
 	"github.com/video-site/backend/internal/mediaasset"
 	"github.com/video-site/backend/internal/persistence"
 	"github.com/video-site/backend/internal/streamhttp"
+	"github.com/video-site/backend/internal/tasklimit"
 )
 
 type Config struct {
 	FFmpegPath      string
 	FFprobePath     string
+	FFmpegThreads   int
 	DurationSeconds int // 兼容旧配置；当前预览视频每段固定 3 秒
 	Width           int
 	Segments        int    // 兼容旧配置；当前 30 秒及以上视频固定使用 4 段
@@ -53,10 +55,13 @@ type TeaserGenerator interface {
 }
 
 type refreshingTeaserGenerator interface {
-	GenerateWithLinkProvider(ctx context.Context, first *drives.StreamLink, duration float64, refresh func(context.Context) (*drives.StreamLink, error)) (string, error)
+	GenerateWithLinkRefresh(ctx context.Context, first *drives.StreamLink, duration float64, refreshAfterFailure func(context.Context) (*drives.StreamLink, error)) (string, error)
 }
 
 func New(cfg Config) *Generator {
+	if cfg.FFmpegThreads < 1 {
+		cfg.FFmpegThreads = 1
+	}
 	if cfg.FFmpegPath == "" {
 		cfg.FFmpegPath = "ffmpeg"
 	}
@@ -321,11 +326,15 @@ func (g *Generator) generateThumbnailAtOffset(ctx context.Context, link *drives.
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "error",
+		"-filter_threads", strconv.Itoa(g.cfg.FFmpegThreads),
+		"-filter_complex_threads", strconv.Itoa(g.cfg.FFmpegThreads),
+		"-threads", strconv.Itoa(g.cfg.FFmpegThreads),
 		"-ss", fmt.Sprintf("%.2f", offset),
 	}
 	args = append(args, ffmpegHTTPInputOptions(ffmpegLink)...)
 	args = append(args,
 		"-i", ffmpegLink.URL,
+		"-threads", strconv.Itoa(g.cfg.FFmpegThreads),
 		"-frames:v", "1",
 		"-vf", thumbnailVideoFilter(g.cfg.Width),
 		"-q:v", "3",
@@ -351,17 +360,97 @@ func thumbnailVideoFilter(width int) string {
 	return fmt.Sprintf("scale=%d:-2:out_range=pc,format=yuvj420p", width)
 }
 
+func teaserSegmentVideoFilter(width int, fade bool, eachSec float64) string {
+	parts := []string{
+		fmt.Sprintf("scale=%d:-2", width),
+		"setsar=1",
+		// Input seeking against remote/VFR media can leave the decoded segment with
+		// the source file's original PTS. The sequential generator later concat-copies
+		// individually encoded segments, so every segment file must start at zero;
+		// otherwise players fill the timestamp gap with black frames.
+		"setpts=PTS-STARTPTS",
+	}
+	if fade {
+		fadeOutStart := eachSec - 0.2
+		if fadeOutStart < 0 {
+			fadeOutStart = 0
+		}
+		parts = append(parts,
+			"fade=t=in:st=0:d=0.20",
+			fmt.Sprintf("fade=t=out:st=%.2f:d=0.2", fadeOutStart),
+		)
+	}
+	return strings.Join(parts, ",")
+}
+
 func thumbnailOffsetFallbackAllowed(err error) bool {
 	if err == nil {
 		return false
 	}
 	text := strings.ToLower(err.Error())
+	if transientRemoteMediaReadText(text) || strings.Contains(text, "moov atom not found") {
+		return true
+	}
+	if deterministicMediaInputError(text) {
+		return false
+	}
 	return strings.Contains(text, "produced empty file") ||
-		strings.Contains(text, "signal: killed") ||
 		strings.Contains(text, "context deadline exceeded")
 }
 
 // --- 时长 ---
+
+const (
+	durationSanityMinFileSize       = int64(1 << 20)
+	minimumMediaBytesPerSecond      = 16.0
+	maximumAcceptedMediaDurationSec = 10 * 365 * 24 * 60 * 60
+)
+
+// plausibleMediaDuration intentionally uses an extremely permissive minimum
+// bitrate. Its purpose is to reject unit/corruption mistakes (for example a
+// 24 MB file recorded as several million seconds), not to judge media quality.
+func plausibleMediaDuration(size int64, duration float64) bool {
+	if duration <= 0 || math.IsNaN(duration) || math.IsInf(duration, 0) || duration > maximumAcceptedMediaDurationSec {
+		return false
+	}
+	if size < durationSanityMinFileSize {
+		return true
+	}
+	return float64(size)/duration >= minimumMediaBytesPerSecond
+}
+
+func normalizedStoredDuration(ctx context.Context, cat *catalog.Catalog, v *catalog.Video) float64 {
+	if v == nil || v.DurationSeconds <= 0 {
+		return 0
+	}
+	duration := float64(v.DurationSeconds)
+	if plausibleMediaDuration(v.Size, duration) {
+		return duration
+	}
+	log.Printf("[preview] discard implausible duration video=%s size=%d duration=%d", v.ID, v.Size, v.DurationSeconds)
+	v.DurationSeconds = 0
+	if cat != nil {
+		_ = cat.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
+			DurationSeconds:    0,
+			DurationSecondsSet: true,
+		})
+	}
+	return 0
+}
+
+func storeProbedDuration(ctx context.Context, cat *catalog.Catalog, v *catalog.Video, duration float64) float64 {
+	if v == nil || !plausibleMediaDuration(v.Size, duration) {
+		if v != nil && duration > 0 {
+			log.Printf("[preview] ignore implausible probed duration video=%s size=%d duration=%.1f", v.ID, v.Size, duration)
+		}
+		return 0
+	}
+	v.DurationSeconds = int(duration)
+	if cat != nil {
+		_ = cat.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{DurationSeconds: int(duration)})
+	}
+	return duration
+}
 
 // Probe 用 ffprobe 拿视频时长（秒，浮点）
 func (g *Generator) Probe(ctx context.Context, link *drives.StreamLink) (float64, error) {
@@ -376,8 +465,8 @@ func (g *Generator) Probe(ctx context.Context, link *drives.StreamLink) (float64
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "error",
-		"-show_entries", "format=duration",
-		"-of", "default=noprint_wrappers=1:nokey=1",
+		"-show_entries", "stream=codec_type,duration:format=duration",
+		"-of", "json",
 	}
 	args = append(args, ffmpegHTTPInputOptions(ffmpegLink)...)
 	args = append(args, ffmpegLink.URL)
@@ -393,11 +482,39 @@ func (g *Generator) Probe(ctx context.Context, link *drives.StreamLink) (float64
 		}
 		return 0, ffmpegCommandError("ffprobe", err, errOut)
 	}
-	raw := strings.TrimSpace(string(out))
-	if raw == "" || raw == "N/A" {
+	if len(bytes.TrimSpace(out)) == 0 {
 		return 0, nil
 	}
-	return strconv.ParseFloat(raw, 64)
+	var probe localMediaProbe
+	if err := json.Unmarshal(out, &probe); err != nil {
+		return 0, fmt.Errorf("ffprobe duration output: %w", err)
+	}
+	return preferredSourceDuration(probe), nil
+}
+
+// preferredSourceDuration avoids trusting a container timeline that was
+// stretched by a late auxiliary stream. Stream duration measures the coded
+// span itself, so the longest usable video stream is the best lightweight
+// representation of the source video. Containers without a usable video
+// duration retain the format-level fallback used previously.
+func preferredSourceDuration(probe localMediaProbe) float64 {
+	var videoDuration float64
+	for _, stream := range probe.Streams {
+		if !strings.EqualFold(stream.CodecType, "video") {
+			continue
+		}
+		if duration := parseProbeDuration(stream.Duration); duration > videoDuration {
+			videoDuration = duration
+		}
+	}
+	if videoDuration > 0 {
+		return videoDuration
+	}
+	formatDuration := parseProbeDuration(probe.Format.Duration)
+	if formatDuration > 0 {
+		return formatDuration
+	}
+	return 0
 }
 
 // --- 预览视频 ---
@@ -405,21 +522,34 @@ func (g *Generator) Probe(ctx context.Context, link *drives.StreamLink) (float64
 // Generate 拉取预览视频到本地临时文件，返回路径。
 // 根据 Config.Segments 和视频时长决定是单段还是多段拼接。
 func (g *Generator) Generate(ctx context.Context, link *drives.StreamLink, duration float64) (string, error) {
-	return g.generate(ctx, duration, func(int) (*drives.StreamLink, error) {
-		return link, nil
-	})
+	return g.generateSerialWithRefresh(ctx, duration, link, nil)
 }
 
-func (g *Generator) GenerateWithLinkProvider(ctx context.Context, first *drives.StreamLink, duration float64, refresh func(context.Context) (*drives.StreamLink, error)) (string, error) {
-	return g.generateSequential(ctx, duration, func(index int) (*drives.StreamLink, error) {
-		if index == 0 || refresh == nil {
-			return first, nil
-		}
-		return refresh(ctx)
-	})
+func (g *Generator) GenerateWithLinkRefresh(ctx context.Context, first *drives.StreamLink, duration float64, refreshAfterFailure func(context.Context) (*drives.StreamLink, error)) (string, error) {
+	return g.generateSerialWithRefresh(ctx, duration, first, refreshAfterFailure)
 }
 
-func (g *Generator) generate(ctx context.Context, duration float64, linkForInput func(int) (*drives.StreamLink, error)) (string, error) {
+type teaserSegmentCandidate struct {
+	index int
+	start float64
+}
+
+type teaserSegmentResult struct {
+	teaserSegmentCandidate
+	path string
+	err  error
+}
+
+// generateSerialWithRefresh generates at most one teaser segment at a time.
+// A healthy source link is reused for the whole task. When a concrete remote
+// read failure occurs, the current segment gets one attempt with a refreshed
+// link; a successful replacement then becomes the source for later segments.
+func (g *Generator) generateSerialWithRefresh(
+	ctx context.Context,
+	duration float64,
+	initialLink *drives.StreamLink,
+	refreshAfterFailure func(context.Context) (*drives.StreamLink, error),
+) (string, error) {
 	if err := os.MkdirAll(g.cfg.LocalDir, 0o755); err != nil {
 		return "", err
 	}
@@ -434,164 +564,96 @@ func (g *Generator) generate(ctx context.Context, duration float64, linkForInput
 	ctx2, cancel := context.WithTimeout(ctx, 4*time.Minute)
 	defer cancel()
 
-	// 用 ffmpeg 的 concat 滤镜一次输出：多个 -ss input 再 concat + fade
-	tmp, err := os.CreateTemp(g.cfg.LocalDir, "teaser-*.mp4")
-	if err != nil {
-		return "", err
-	}
-	tmpPath := tmp.Name()
-	tmp.Close()
-
-	args := []string{
-		"-hide_banner",
-		"-loglevel", "error",
-	}
-
-	// 每段独立 -ss + -i，精确 seek 重新解码保证拼接帧准
-	var cleanups []func()
-	defer func() {
-		for i := len(cleanups) - 1; i >= 0; i-- {
-			cleanups[i]()
-		}
-	}()
-	for i, s := range starts {
-		link, err := linkForInput(i)
-		if err != nil {
-			os.Remove(tmpPath)
-			return "", err
-		}
-		ffmpegLink, cleanup, err := prepareFFmpegLink(ctx2, link)
-		if err != nil {
-			os.Remove(tmpPath)
-			return "", err
-		}
-		cleanups = append(cleanups, cleanup)
-		args = append(args, ffmpegHTTPInputOptions(ffmpegLink)...)
-		args = append(args,
-			"-ss", fmt.Sprintf("%.2f", s),
-			"-t", fmt.Sprintf("%.2f", eachSec),
-			"-i", ffmpegLink.URL,
-		)
-	}
-
-	if len(starts) == 1 {
-		// 单段：无需 concat，直接缩放 + 无音
-		args = append(args,
-			"-an",
-			"-vf", fmt.Sprintf("scale=%d:-2,setsar=1", g.cfg.Width),
-			"-c:v", "libx264",
-			"-preset", "veryfast",
-			"-crf", "28",
-			"-movflags", "+faststart",
-			"-y", tmpPath,
-		)
-	} else {
-		// 多段：各段缩放 + 0.2s 黑场淡入淡出，concat 拼接
-		// filter_complex: [0:v]scale,fade=in:0:5,fade=out:start=eachSec-0.2:d=0.2[v0]; ...; [v0][v1][v2]concat=n=3:v=1:a=0[v]
-		fadeIn := 0.2
-		fadeOutStart := eachSec - 0.2
-		if fadeOutStart < 0 {
-			fadeOutStart = 0
-		}
-		var filter strings.Builder
-		for i := range starts {
-			if i > 0 {
-				filter.WriteString(";")
-			}
-			fmt.Fprintf(&filter,
-				"[%d:v]scale=%d:-2,setsar=1,fade=t=in:st=0:d=%.2f,fade=t=out:st=%.2f:d=0.2[v%d]",
-				i, g.cfg.Width, fadeIn, fadeOutStart, i)
-		}
-		filter.WriteString(";")
-		for i := range starts {
-			fmt.Fprintf(&filter, "[v%d]", i)
-		}
-		fmt.Fprintf(&filter, "concat=n=%d:v=1:a=0[v]", len(starts))
-
-		args = append(args,
-			"-filter_complex", filter.String(),
-			"-map", "[v]",
-			"-an",
-			"-c:v", "libx264",
-			"-preset", "veryfast",
-			"-crf", "28",
-			"-movflags", "+faststart",
-			"-y", tmpPath,
-		)
-	}
-
-	cmd := exec.CommandContext(ctx2, g.cfg.FFmpegPath, args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		os.Remove(tmpPath)
-		return "", ffmpegCommandError("ffmpeg", err, out)
-	}
-
-	if info, statErr := os.Stat(tmpPath); statErr != nil || info.Size() == 0 {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("ffmpeg produced empty file, stderr: %s", string(out))
-	}
-	if err := g.validateGeneratedTeaser(ctx2, tmpPath); err != nil {
-		os.Remove(tmpPath)
-		return "", err
-	}
-	return tmpPath, nil
-}
-
-func (g *Generator) generateSequential(ctx context.Context, duration float64, linkForInput func(int) (*drives.StreamLink, error)) (string, error) {
-	if err := os.MkdirAll(g.cfg.LocalDir, 0o755); err != nil {
-		return "", err
-	}
-
-	plan := buildTeaserPlan(g.cfg, duration)
-	starts := plan.starts
-	eachSec := plan.eachSec
-	if len(starts) == 0 {
-		return "", fmt.Errorf("video too short for %.0fs teaser segment", eachSec)
-	}
-
-	ctx2, cancel := context.WithTimeout(ctx, 4*time.Minute)
-	defer cancel()
-
-	segmentPaths := make([]string, 0, len(starts))
+	generatedPaths := make([]string, 0, len(starts))
 	success := false
 	defer func() {
 		if success {
 			return
 		}
-		for _, p := range segmentPaths {
+		for _, p := range generatedPaths {
 			_ = os.Remove(p)
 		}
 	}()
 
 	candidates := teaserCandidateStarts(duration, starts, eachSec)
 	targetSegments := len(starts)
+	fadeSegments := targetSegments > 1
 	requiredSegments := requiredTeaserSegments(duration, targetSegments, false)
+	segmentResults := make([]teaserSegmentResult, 0, targetSegments)
+	currentLink := initialLink
+	nextCandidate := 0
 	var lastErr error
-	for i, start := range candidates {
-		if len(segmentPaths) >= targetSegments {
-			break
+	for nextCandidate < len(candidates) && len(segmentResults) < targetSegments {
+		candidate := teaserSegmentCandidate{
+			index: nextCandidate,
+			start: candidates[nextCandidate],
 		}
-		seg, err := g.generateSingleSegment(ctx2, i, start, eachSec, linkForInput)
-		if err != nil {
-			if !teaserSegmentFallbackAllowed(err) {
-				return "", err
+		nextCandidate++
+
+		result := teaserSegmentResult{teaserSegmentCandidate: candidate}
+		result.path, result.err = g.generateSingleSegment(
+			ctx2,
+			candidate.index,
+			candidate.start,
+			eachSec,
+			fadeSegments,
+			currentLink,
+		)
+		if refreshAfterFailure != nil && directMediaLinkRefreshAllowed(result.err) {
+			refreshed, refreshErr := refreshAfterFailure(ctx2)
+			if refreshErr == nil && (refreshed == nil || strings.TrimSpace(refreshed.URL) == "") {
+				refreshErr = fmt.Errorf("%w: empty refreshed direct link", drives.ErrGenerationStreamUnavailable)
 			}
-			lastErr = err
+			switch {
+			case refreshErr == nil:
+				currentLink = refreshed
+				result.path, result.err = g.generateSingleSegment(
+					ctx2,
+					candidate.index,
+					candidate.start,
+					eachSec,
+					fadeSegments,
+					currentLink,
+				)
+			case !errors.Is(refreshErr, drives.ErrGenerationStreamUnavailable):
+				return "", refreshErr
+			}
+		}
+
+		if result.err != nil {
+			if !teaserSegmentFallbackAllowed(result.err) {
+				return "", result.err
+			}
+			lastErr = result.err
 			continue
 		}
-		segmentPaths = append(segmentPaths, seg)
+		generatedPaths = append(generatedPaths, result.path)
+		segmentResults = append(segmentResults, result)
 	}
-	if len(segmentPaths) < requiredSegments {
+	if len(segmentResults) < requiredSegments {
 		degradedRequired := requiredTeaserSegments(duration, targetSegments, true)
-		if lastErr == nil || len(segmentPaths) < degradedRequired {
+		if lastErr == nil || len(segmentResults) < degradedRequired {
 			if lastErr != nil {
-				return "", fmt.Errorf("only generated %d/%d teaser segments: %w", len(segmentPaths), targetSegments, lastErr)
+				return "", fmt.Errorf("only generated %d/%d teaser segments: %w", len(segmentResults), targetSegments, lastErr)
 			}
-			return "", fmt.Errorf("only generated %d/%d teaser segments", len(segmentPaths), targetSegments)
+			return "", fmt.Errorf("only generated %d/%d teaser segments", len(segmentResults), targetSegments)
 		}
 		log.Printf("[preview] degraded teaser accepted segments=%d/%d duration=%.1fs: %v",
-			len(segmentPaths), targetSegments, duration, lastErr)
+			len(segmentResults), targetSegments, duration, lastErr)
+	}
+
+	// Fallback candidates are attempted after the primary plan and are not
+	// necessarily later on the source timeline. Restore timeline order before
+	// writing the concat list.
+	sort.SliceStable(segmentResults, func(i, j int) bool {
+		if segmentResults[i].start == segmentResults[j].start {
+			return segmentResults[i].index < segmentResults[j].index
+		}
+		return segmentResults[i].start < segmentResults[j].start
+	})
+	segmentPaths := make([]string, len(segmentResults))
+	for i, result := range segmentResults {
+		segmentPaths[i] = result.path
 	}
 
 	if len(segmentPaths) == 1 {
@@ -672,14 +734,10 @@ func requiredTeaserSegments(duration float64, targetSegments int, degraded bool)
 	return targetSegments
 }
 
-func (g *Generator) generateSingleSegment(ctx context.Context, index int, start, eachSec float64, linkForInput func(int) (*drives.StreamLink, error)) (string, error) {
+func (g *Generator) generateSingleSegment(ctx context.Context, index int, start, eachSec float64, fade bool, link *drives.StreamLink) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, teaserSegmentTimeout)
 	defer cancel()
 
-	link, err := linkForInput(index)
-	if err != nil {
-		return "", err
-	}
 	ffmpegLink, cleanup, err := prepareFFmpegLink(ctx, link)
 	if err != nil {
 		return "", err
@@ -693,22 +751,21 @@ func (g *Generator) generateSingleSegment(ctx context.Context, index int, start,
 	segPath := seg.Name()
 	seg.Close()
 
-	fadeIn := 0.2
-	fadeOutStart := eachSec - 0.2
-	if fadeOutStart < 0 {
-		fadeOutStart = 0
-	}
-	filter := fmt.Sprintf("scale=%d:-2,setsar=1,fade=t=in:st=0:d=%.2f,fade=t=out:st=%.2f:d=0.2", g.cfg.Width, fadeIn, fadeOutStart)
+	filter := teaserSegmentVideoFilter(g.cfg.Width, fade, eachSec)
 
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "error",
+		"-filter_threads", strconv.Itoa(g.cfg.FFmpegThreads),
+		"-filter_complex_threads", strconv.Itoa(g.cfg.FFmpegThreads),
+		"-threads", strconv.Itoa(g.cfg.FFmpegThreads),
 	}
 	args = append(args, ffmpegHTTPInputOptions(ffmpegLink)...)
 	args = append(args,
 		"-ss", fmt.Sprintf("%.2f", start),
 		"-t", fmt.Sprintf("%.2f", eachSec),
 		"-i", ffmpegLink.URL,
+		"-threads", strconv.Itoa(g.cfg.FFmpegThreads),
 		"-an",
 		"-vf", filter,
 		"-c:v", "libx264",
@@ -750,6 +807,9 @@ func teaserSegmentFallbackAllowed(err error) bool {
 		strings.Contains(text, "访问被阻断") {
 		return false
 	}
+	if deterministicMediaInputError(text) && !transientRemoteMediaReadText(text) {
+		return false
+	}
 	return strings.Contains(text, "generated teaser has no video stream") ||
 		strings.Contains(text, "generated teaser has invalid duration") ||
 		strings.Contains(text, "generated teaser is empty") ||
@@ -758,13 +818,63 @@ func teaserSegmentFallbackAllowed(err error) bool {
 		strings.Contains(text, "ffprobe teaser:")
 }
 
+func deterministicMediaInputError(text string) bool {
+	text = strings.ToLower(text)
+	return strings.Contains(text, "invalid data found when processing input") ||
+		strings.Contains(text, "could not find codec parameters") ||
+		strings.Contains(text, "unknown format")
+}
+
+func transientRemoteMediaReadText(text string) bool {
+	text = strings.ToLower(text)
+	return strings.Contains(text, "partial file") ||
+		strings.Contains(text, "after eof") ||
+		strings.Contains(text, "end of file") ||
+		strings.Contains(text, "connection reset") ||
+		strings.Contains(text, "connection timed out") ||
+		strings.Contains(text, "i/o timeout") ||
+		strings.Contains(text, "tls handshake timeout") ||
+		strings.Contains(text, "context deadline exceeded") ||
+		strings.Contains(text, "signal: killed")
+}
+
+// directMediaLinkRefreshAllowed identifies failures for which a newly signed
+// ordinary download URL can materially change the result. Container/codec
+// errors are deliberately excluded: refreshing those links only repeats a
+// deterministic failure and increases pressure on the provider API.
+func directMediaLinkRefreshAllowed(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	if drives.ErrorMentionsHTTPStatus(err,
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusMethodNotAllowed,
+		http.StatusGone,
+		http.StatusRequestedRangeNotSatisfiable,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	) || transientRemoteMediaReadText(text) || strings.Contains(text, "moov atom not found") {
+		return true
+	}
+	if deterministicMediaInputError(text) {
+		return false
+	}
+	return false
+}
+
 type localMediaProbe struct {
 	Streams []struct {
 		CodecType string `json:"codec_type"`
 		Duration  string `json:"duration"`
 	} `json:"streams"`
 	Format struct {
-		Duration string `json:"duration"`
+		Duration  string `json:"duration"`
+		StartTime string `json:"start_time"`
 	} `json:"format"`
 }
 
@@ -781,7 +891,7 @@ func (g *Generator) validateGeneratedTeaser(ctx context.Context, path string) er
 	defer cancel()
 	args := []string{
 		"-v", "error",
-		"-show_entries", "stream=codec_type,duration:format=duration",
+		"-show_entries", "stream=codec_type,duration:format=start_time,duration",
 		"-of", "json",
 		path,
 	}
@@ -793,6 +903,11 @@ func (g *Generator) validateGeneratedTeaser(ctx context.Context, path string) er
 	var probe localMediaProbe
 	if err := json.Unmarshal(out, &probe); err != nil {
 		return fmt.Errorf("ffprobe teaser output: %w", err)
+	}
+
+	startTime := parseProbeDuration(probe.Format.StartTime)
+	if startTime > 0.5 {
+		return fmt.Errorf("generated teaser starts too late %.3fs", startTime)
 	}
 
 	duration := parseProbeDuration(probe.Format.Duration)
@@ -820,7 +935,7 @@ func parseProbeDuration(raw string) float64 {
 		return 0
 	}
 	d, err := strconv.ParseFloat(raw, 64)
-	if err != nil {
+	if err != nil || math.IsNaN(d) || math.IsInf(d, 0) {
 		return 0
 	}
 	return d
@@ -857,6 +972,9 @@ func shouldProxyFFmpegLink(link *drives.StreamLink) bool {
 	if link.PassThroughRedirects {
 		return true
 	}
+	if streamhttp.HasSensitiveHeaders(link.Headers) {
+		return true
+	}
 	if strings.Contains(raw, "115cdn") {
 		return true
 	}
@@ -864,80 +982,13 @@ func shouldProxyFFmpegLink(link *drives.StreamLink) bool {
 }
 
 func startLocalFFmpegProxy(ctx context.Context, link *drives.StreamLink) (*drives.StreamLink, func(), error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	localURL, cleanup, err := streamhttp.StartLoopbackRelay(ctx, link.URL, link.Headers)
 	if err != nil {
 		return nil, nil, err
 	}
-	client := &http.Client{Timeout: 0}
-	if link.PassThroughRedirects {
-		client = streamhttp.NewClient(0)
-	}
-	srv := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/stream" {
-				http.NotFound(w, r)
-				return
-			}
-			if r.Method != http.MethodGet && r.Method != http.MethodHead {
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			req, err := http.NewRequestWithContext(r.Context(), r.Method, link.URL, nil)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return
-			}
-			for k, vs := range link.Headers {
-				for _, v := range vs {
-					req.Header.Add(k, v)
-				}
-			}
-			if rng := r.Header.Get("Range"); rng != "" {
-				req.Header.Set("Range", rng)
-			}
-
-			resp, err := client.Do(req)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return
-			}
-			defer resp.Body.Close()
-
-			for _, k := range []string{
-				"Content-Type", "Content-Length", "Content-Range",
-				"Accept-Ranges", "Last-Modified", "Etag",
-			} {
-				if v := resp.Header.Get(k); v != "" {
-					w.Header().Set(k, v)
-				}
-			}
-			w.WriteHeader(resp.StatusCode)
-			if r.Method != http.MethodHead {
-				_, _ = io.Copy(w, resp.Body)
-			}
-		}),
-	}
-	go func() {
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("[preview] local ffmpeg proxy: %v", err)
-		}
-	}()
-
-	var once sync.Once
-	cleanup := func() {
-		once.Do(func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			_ = srv.Shutdown(shutdownCtx)
-		})
-	}
-	go func() {
-		<-ctx.Done()
-		cleanup()
-	}()
 
 	proxied := *link
-	proxied.URL = "http://" + ln.Addr().String() + "/stream"
+	proxied.URL = localURL
 	proxied.Headers = nil
 	proxied.PassThroughRedirects = false
 	return &proxied, cleanup, nil
@@ -1049,12 +1100,21 @@ type Worker struct {
 	Gen     TeaserGenerator
 	Catalog *catalog.Catalog
 	Drive   drives.Drive
+	// OnPreviewReady lets the application schedule dependent local-asset work
+	// without coupling this worker to a concrete thumbnail worker.
+	OnPreviewReady func(*catalog.Video)
+	// TaskGuard holds application-level task admission for the complete provider
+	// operation. A nil release means this worker belongs to a retired runtime
+	// generation and the queued item must remain pending for its replacement.
+	TaskGuard func() func()
+	// Limiter is shared by all preview workers in the application.
+	Limiter *tasklimit.Limiter
 	ch      chan *catalog.Video
 	queue   videoQueue
 
 	RateLimitCooldown time.Duration
 	rateLimit         rateLimitState
-	activity          taskActivity
+	activities        taskActivities
 }
 
 func NewWorker(gen TeaserGenerator, cat *catalog.Catalog, drv drives.Drive) *Worker {
@@ -1062,6 +1122,9 @@ func NewWorker(gen TeaserGenerator, cat *catalog.Catalog, drv drives.Drive) *Wor
 		Gen:     gen,
 		Catalog: cat,
 		Drive:   drv,
+		// Standalone workers default to one slot. The application injects its
+		// shared preview budget before Run starts.
+		Limiter: tasklimit.New(1),
 		ch:      make(chan *catalog.Video, defaultWorkerQueueSize),
 	}
 }
@@ -1099,11 +1162,22 @@ func (w *Worker) EnqueueBlocking(ctx context.Context, v *catalog.Video) bool {
 }
 
 type ThumbWorker struct {
-	Gen     ThumbnailGenerator
-	Catalog *catalog.Catalog
-	Drive   drives.Drive
+	Gen       ThumbnailGenerator
+	Catalog   *catalog.Catalog
+	Drive     drives.Drive
+	TaskGuard func() func()
+	// Limiter is shared by all thumbnail workers in the application.
+	Limiter *tasklimit.Limiter
 	ch      chan *catalog.Video
 	queue   videoQueue
+
+	// followUps preserves a state-change notification that arrives while the
+	// same video is already being processed. A plain deduplicating enqueue
+	// cannot express this: it would report success while silently folding the
+	// notification into the attempt that started before the state changed.
+	followUpMu    sync.Mutex
+	activeVideoID string
+	followUps     map[string]*catalog.Video
 
 	RateLimitCooldown time.Duration
 	rateLimit         rateLimitState
@@ -1134,6 +1208,11 @@ type taskActivity struct {
 	mu           sync.Mutex
 	currentID    string
 	currentTitle string
+}
+
+type taskActivities struct {
+	mu     sync.Mutex
+	titles map[string]string
 }
 
 type videoQueue struct {
@@ -1183,11 +1262,18 @@ func (q *videoQueue) idsSnapshot() []string {
 }
 
 func (q *videoQueue) lengthExcluding(currentID string) int {
+	if currentID == "" {
+		return q.lengthExcludingIDs(nil)
+	}
+	return q.lengthExcludingIDs([]string{currentID})
+}
+
+func (q *videoQueue) lengthExcludingIDs(activeIDs []string) int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	n := len(q.ids)
-	if currentID != "" {
-		if _, ok := q.ids[currentID]; ok {
+	for _, activeID := range activeIDs {
+		if _, ok := q.ids[activeID]; ok {
 			n--
 		}
 	}
@@ -1220,6 +1306,44 @@ func (a *taskActivity) current() (string, string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.currentID, a.currentTitle
+}
+
+func (a *taskActivities) start(v *catalog.Video) {
+	if v == nil || v.ID == "" {
+		return
+	}
+	a.mu.Lock()
+	if a.titles == nil {
+		a.titles = make(map[string]string)
+	}
+	a.titles[v.ID] = v.Title
+	a.mu.Unlock()
+}
+
+func (a *taskActivities) done(videoID string) {
+	if videoID == "" {
+		return
+	}
+	a.mu.Lock()
+	delete(a.titles, videoID)
+	a.mu.Unlock()
+}
+
+func (a *taskActivities) snapshot() (string, []string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.titles) == 0 {
+		return "", nil
+	}
+	activeIDs := make([]string, 0, len(a.titles))
+	currentTitle := ""
+	for id, title := range a.titles {
+		activeIDs = append(activeIDs, id)
+		if currentTitle == "" {
+			currentTitle = title
+		}
+	}
+	return currentTitle, activeIDs
 }
 
 func (s *rateLimitState) active(now time.Time) (time.Time, bool, bool) {
@@ -1301,12 +1425,35 @@ func (w *ThumbWorker) EnqueueBlocking(ctx context.Context, v *catalog.Video) boo
 	}
 }
 
+// EnqueueFollowUp schedules thumbnail work after the currently running
+// attempt when necessary. It is intended for catalog state changes (for
+// example a preview becoming ready) that grant a failed thumbnail a new
+// attempt. Ordinary duplicate queue submissions should continue to use
+// Enqueue or EnqueueBlocking.
+func (w *ThumbWorker) EnqueueFollowUp(v *catalog.Video) bool {
+	if v == nil {
+		return false
+	}
+	w.followUpMu.Lock()
+	if v.ID != "" && w.activeVideoID == v.ID {
+		if w.followUps == nil {
+			w.followUps = make(map[string]*catalog.Video)
+		}
+		copy := *v
+		w.followUps[v.ID] = &copy
+		w.followUpMu.Unlock()
+		return true
+	}
+	w.followUpMu.Unlock()
+	return w.Enqueue(v)
+}
+
 func (w *Worker) Status() TaskStatus {
 	if w == nil {
 		return TaskStatus{State: "idle"}
 	}
-	currentID, _ := w.activity.current()
-	return taskStatus(&w.activity, &w.rateLimit, w.queue.lengthExcluding(currentID))
+	currentTitle, activeIDs := w.activities.snapshot()
+	return taskStatus(currentTitle, len(activeIDs) > 0, &w.rateLimit, w.queue.lengthExcludingIDs(activeIDs))
 }
 
 func (w *Worker) ActiveVideoIDs() []string {
@@ -1320,8 +1467,8 @@ func (w *ThumbWorker) Status() TaskStatus {
 	if w == nil {
 		return TaskStatus{State: "idle"}
 	}
-	currentID, _ := w.activity.current()
-	return taskStatus(&w.activity, &w.rateLimit, w.queue.lengthExcluding(currentID))
+	currentID, currentTitle := w.activity.current()
+	return taskStatus(currentTitle, currentID != "", &w.rateLimit, w.queue.lengthExcluding(currentID))
 }
 
 // WaitIdle 阻塞直到 worker 队列为空且当前没有正在处理的任务。
@@ -1366,7 +1513,7 @@ func waitQueueIdle(ctx context.Context, q *videoQueue) error {
 	}
 }
 
-func taskStatus(activity *taskActivity, rateLimit *rateLimitState, queueLength int) TaskStatus {
+func taskStatus(currentTitle string, active bool, rateLimit *rateLimitState, queueLength int) TaskStatus {
 	if queueLength < 0 {
 		queueLength = 0
 	}
@@ -1379,10 +1526,9 @@ func taskStatus(activity *taskActivity, rateLimit *rateLimitState, queueLength i
 		status.CooldownUntil = until
 		return status
 	}
-	_, title := activity.current()
-	if title != "" {
+	if active {
 		status.State = "generating"
-		status.CurrentTitle = title
+		status.CurrentTitle = currentTitle
 		return status
 	}
 	if queueLength > 0 {
@@ -1393,12 +1539,27 @@ func taskStatus(activity *taskActivity, rateLimit *rateLimitState, queueLength i
 
 // Run 阻塞运行直到 ctx 取消
 func (w *Worker) Run(ctx context.Context) {
+	var tasks sync.WaitGroup
+	defer tasks.Wait()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case v := <-w.ch:
-			w.processQueued(ctx, v)
+			// Each drive has at most one task waiting for a global slot. FIFO
+			// admission lets other drives advance without a per-drive limit or
+			// a goroutine for every queued video.
+			run := w.prepareQueued(ctx, v)
+			if run == nil {
+				continue
+			}
+			tasks.Add(1)
+			go func() {
+				defer tasks.Done()
+				run()
+			}()
+			// Pace this drive's dispatch without occupying a global slot after
+			// processing or accumulating goroutines that only wait on a timer.
 			select {
 			case <-ctx.Done():
 				return
@@ -1426,33 +1587,137 @@ func (w *ThumbWorker) Run(ctx context.Context) {
 }
 
 func (w *Worker) processQueued(ctx context.Context, v *catalog.Video) {
-	defer w.queue.release(v)
-	if w.Catalog == nil || v == nil || v.ID == "" {
-		return
+	if run := w.prepareQueued(ctx, v); run != nil {
+		run()
+	}
+}
+
+// prepareQueued waits in the dispatcher and transfers admission/resource
+// ownership to the returned task. No processing goroutine exists before this
+// succeeds, even when a drive has thousands of queued videos.
+func (w *Worker) prepareQueued(ctx context.Context, v *catalog.Video) func() {
+	if v == nil {
+		return nil
+	}
+	prepared := false
+	taskRelease := func() {}
+	defer func() {
+		if !prepared {
+			w.queue.release(v)
+			taskRelease()
+		}
+	}()
+	if w.Catalog == nil || v.ID == "" || ctx.Err() != nil {
+		return nil
+	}
+	if w.TaskGuard != nil {
+		release := w.TaskGuard()
+		if release == nil {
+			return nil
+		}
+		taskRelease = release
 	}
 	current, err := w.Catalog.GetVideo(ctx, v.ID)
 	if err != nil || current.Hidden {
-		return
+		return nil
 	}
-	w.activity.start(current)
-	defer w.activity.done()
-	if !waitForRateLimitCooldown(ctx, &w.rateLimit, "preview", w.Drive) {
-		return
+	release, ok := acquireGenerationSlot(ctx, w.Limiter, &w.rateLimit, "preview", w.Drive)
+	if !ok {
+		return nil
 	}
-	w.process(ctx, current)
+	prepared = true
+	return func() {
+		defer taskRelease()
+		defer release()
+		if ctx.Err() != nil {
+			w.queue.release(v)
+			return
+		}
+		w.activities.start(current)
+		defer w.activities.done(current.ID)
+		retry := w.process(ctx, current)
+		release()
+		// Release before requeueing because videoQueue deduplicates reserved
+		// IDs. Keep activity visible throughout the transition for admission.
+		w.queue.release(v)
+		if retry && ctx.Err() == nil {
+			w.EnqueueBlocking(ctx, current)
+		}
+	}
 }
 
 func (w *ThumbWorker) processQueued(ctx context.Context, v *catalog.Video) {
-	w.activity.start(v)
+	if v == nil {
+		return
+	}
+	w.followUpMu.Lock()
+	w.activeVideoID = v.ID
+	w.followUpMu.Unlock()
+
 	retry := false
-	if waitForRateLimitCooldown(ctx, &w.rateLimit, "thumb", w.Drive) {
+	activityStarted := false
+	var taskRelease func()
+	defer func() {
+		w.finishQueued(ctx, v, retry)
+		if activityStarted {
+			w.activity.done()
+		}
+		if taskRelease != nil {
+			taskRelease()
+		}
+	}()
+
+	if w.TaskGuard != nil {
+		taskRelease = w.TaskGuard()
+		if taskRelease == nil {
+			return
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	if release, ok := acquireGenerationSlot(ctx, w.Limiter, &w.rateLimit, "thumb", w.Drive); ok {
+		w.activity.start(v)
+		activityStarted = true
 		retry = w.process(ctx, v)
+		release()
 	}
-	w.activity.done()
+}
+
+func (w *ThumbWorker) finishQueued(ctx context.Context, v *catalog.Video, retry bool) {
+	// Keep activity non-idle across release-and-requeue. Configuration admission
+	// checks worker status while holding its queue gate; an idle gap here could
+	// otherwise let a runtime update start just before this retry is queued.
+	w.followUpMu.Lock()
+	followUp := w.followUps[v.ID]
+	delete(w.followUps, v.ID)
+	if w.activeVideoID == v.ID {
+		w.activeVideoID = ""
+	}
 	w.queue.release(v)
-	if retry && ctx.Err() == nil {
-		w.EnqueueBlocking(ctx, v)
+	if ctx.Err() == nil && (retry || followUp != nil) {
+		if followUp == nil {
+			followUp = v
+		}
+		w.EnqueueBlocking(ctx, followUp)
 	}
+	w.followUpMu.Unlock()
+}
+
+// Cooldown can begin while another task waits for the global budget. Recheck
+// after acquisition and release immediately if this drive must still wait.
+func acquireGenerationSlot(ctx context.Context, limiter *tasklimit.Limiter, state *rateLimitState, label string, drive drives.Drive) (func(), bool) {
+	for waitForRateLimitCooldown(ctx, state, label, drive) {
+		release, err := limiter.Acquire(ctx)
+		if err != nil {
+			return nil, false
+		}
+		if _, cooling := state.coolingUntil(time.Now()); !cooling {
+			return release, true
+		}
+		release()
+	}
+	return nil, false
 }
 
 func waitForRateLimitCooldown(ctx context.Context, state *rateLimitState, label string, drive drives.Drive) bool {
@@ -1605,16 +1870,13 @@ func (w *ThumbWorker) process(ctx context.Context, v *catalog.Video) bool {
 	if w.Catalog == nil || v == nil || v.ID == "" {
 		return false
 	}
-	queued := v
 	loaded, err := w.Catalog.GetVideo(ctx, v.ID)
 	if err != nil || loaded.Hidden {
 		return false
 	}
-	if loaded.PreviewLocal == "" {
-		loaded.PreviewLocal = queued.PreviewLocal
-	}
 	current := loaded
 	v = loaded
+	normalizedStoredDuration(ctx, w.Catalog, v)
 	if loaded.ThumbnailURL != "" && loaded.DurationSeconds > 0 {
 		_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "ready"})
 		return false
@@ -1658,14 +1920,6 @@ func (w *ThumbWorker) process(ctx context.Context, v *catalog.Video) bool {
 	}
 
 	if err := w.generateThumbnailWithFallback(ctx, v, link, optimized); err != nil {
-		if localLink, ok := localPreviewLink(v); ok && link.URL != localLink.URL {
-			if w.probeDuration(ctx, v, localLink) {
-				return true
-			}
-			if localErr := w.generateThumbnailFromLink(ctx, v, localLink); localErr == nil {
-				return false
-			}
-		}
 		if w.pauseForRecoverableError(ctx, v, err, "generate") {
 			return true
 		}
@@ -1677,14 +1931,7 @@ func (w *ThumbWorker) process(ctx context.Context, v *catalog.Video) bool {
 }
 
 func (w *ThumbWorker) streamLink(ctx context.Context, v *catalog.Video) (*drives.StreamLink, bool, error) {
-	link, optimized, err := preferredGenerationStreamLink(ctx, w.Drive, v.FileID)
-	if err == nil {
-		return link, optimized, nil
-	}
-	if localLink, ok := localPreviewLink(v); ok {
-		return localLink, false, nil
-	}
-	return nil, false, err
+	return preferredGenerationStreamLink(ctx, w.Drive, v.FileID)
 }
 
 func (w *ThumbWorker) probeDuration(ctx context.Context, v *catalog.Video, link *drives.StreamLink) bool {
@@ -1693,12 +1940,7 @@ func (w *ThumbWorker) probeDuration(ctx context.Context, v *catalog.Video, link 
 	}
 	dur, err := w.Gen.Probe(ctx, link)
 	if err == nil {
-		if dur > 0 {
-			v.DurationSeconds = int(dur)
-			_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
-				DurationSeconds: int(dur),
-			})
-		}
+		storeProbedDuration(ctx, w.Catalog, v, dur)
 		return false
 	}
 	if w.pauseForRecoverableError(ctx, v, err, "probe") {
@@ -1708,10 +1950,10 @@ func (w *ThumbWorker) probeDuration(ctx context.Context, v *catalog.Video, link 
 	return false
 }
 
-func (w *ThumbWorker) generateThumbnailFromLink(ctx context.Context, v *catalog.Video, link *drives.StreamLink) error {
+func (w *ThumbWorker) generateThumbnailFromLink(ctx context.Context, v *catalog.Video, link *drives.StreamLink, duration float64) error {
 	persistence.RLock()
 	defer persistence.RUnlock()
-	local, err := w.Gen.GenerateThumbnail(ctx, link, v.ID, float64(v.DurationSeconds))
+	local, err := w.Gen.GenerateThumbnail(ctx, link, v.ID, duration)
 	if err != nil {
 		return err
 	}
@@ -1728,15 +1970,19 @@ func (w *ThumbWorker) generateThumbnailFromLink(ctx context.Context, v *catalog.
 }
 
 func (w *ThumbWorker) generateThumbnailWithFallback(ctx context.Context, v *catalog.Video, link *drives.StreamLink, optimized bool) error {
-	err := w.generateThumbnailFromLink(ctx, v, link)
-	if err == nil || !optimized {
-		return err
+	duration := float64(v.DurationSeconds)
+	err := w.generateThumbnailFromLink(ctx, v, link, duration)
+	if err == nil {
+		return nil
+	}
+	if !optimized {
+		return w.retryThumbnailWithFreshOriginal(ctx, v, err, duration)
 	}
 	if generationStreamForbidden(err) {
 		refreshed, refreshErr := refreshGenerationStreamLink(ctx, w.Drive, v.FileID)
 		switch {
 		case refreshErr == nil:
-			err = w.generateThumbnailFromLink(ctx, v, refreshed)
+			err = w.generateThumbnailFromLink(ctx, v, refreshed, duration)
 			if err == nil || generationStreamForbidden(err) || isRateLimitError(err) {
 				return err
 			}
@@ -1751,45 +1997,45 @@ func (w *ThumbWorker) generateThumbnailWithFallback(ctx context.Context, v *cata
 	if originalErr != nil {
 		return originalErr
 	}
-	return w.generateThumbnailFromLink(ctx, v, original)
+	err = w.generateThumbnailFromLink(ctx, v, original, duration)
+	return w.retryThumbnailWithFreshOriginal(ctx, v, err, duration)
 }
 
-func localPreviewLink(v *catalog.Video) (*drives.StreamLink, bool) {
-	if v.PreviewLocal == "" {
-		return nil, false
+func (w *ThumbWorker) retryThumbnailWithFreshOriginal(ctx context.Context, v *catalog.Video, cause error, duration float64) error {
+	if cause == nil || w.Drive == nil || w.Drive.Kind() != "p115" || !directMediaLinkRefreshAllowed(cause) {
+		return cause
 	}
-	clean := filepath.Clean(v.PreviewLocal)
-	info, err := os.Stat(clean)
-	if err != nil || info.IsDir() || info.Size() == 0 {
-		return nil, false
+	refreshed, err := w.Drive.StreamURL(ctx, v.FileID)
+	if err != nil {
+		return err
 	}
-	return &drives.StreamLink{URL: clean}, true
+	return w.generateThumbnailFromLink(ctx, v, refreshed, duration)
 }
 
-func (w *Worker) process(ctx context.Context, v *catalog.Video) {
+// process returns true when the current video must be retried after the shared
+// drive cooldown. Permanent media errors transition to failed and return
+// false; successful work also returns false.
+func (w *Worker) process(ctx context.Context, v *catalog.Video) bool {
 	if w.skipIfRateLimited(v) {
-		return
+		return true
 	}
 	link, optimized, err := preferredGenerationStreamLink(ctx, w.Drive, v.FileID)
 	if err != nil {
 		if w.pauseForRecoverableError(err, "streamURL", v.Title) {
-			return
+			return true
 		}
 		log.Printf("[preview] streamURL %s: %v", v.Title, err)
 		w.Catalog.UpdatePreview(ctx, v.ID, "", "failed")
-		return
+		return false
 	}
 
 	// 1) 探时长（失败用 0 继续）
-	duration := float64(v.DurationSeconds)
+	duration := normalizedStoredDuration(ctx, w.Catalog, v)
 	if duration <= 0 {
 		if dur, err := w.Gen.Probe(ctx, link); err == nil && dur > 0 {
-			duration = dur
-			_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
-				DurationSeconds: int(dur),
-			})
+			duration = storeProbedDuration(ctx, w.Catalog, v, dur)
 		} else if err != nil && w.pauseForRecoverableError(err, "probe", v.Title) {
-			return
+			return true
 		}
 	}
 
@@ -1797,11 +2043,11 @@ func (w *Worker) process(ctx context.Context, v *catalog.Video) {
 	tmp, err := w.generateTeaser(ctx, v, link, duration, optimized)
 	if err != nil {
 		if w.pauseForRecoverableError(err, "generate", v.Title) {
-			return
+			return true
 		}
 		log.Printf("[preview] generate %s: %v", v.Title, err)
 		w.Catalog.UpdatePreview(ctx, v.ID, "", "failed")
-		return
+		return false
 	}
 	persistence.RLock()
 	defer persistence.RUnlock()
@@ -1809,16 +2055,23 @@ func (w *Worker) process(ctx context.Context, v *catalog.Video) {
 	if err != nil {
 		log.Printf("[preview] move %s: %v", v.Title, err)
 		w.Catalog.UpdatePreview(ctx, v.ID, "", "failed")
-		return
+		return false
 	}
 
 	removePreviousLocalTeaser(v.PreviewLocal, local)
 	if err := w.Catalog.UpdatePreview(ctx, v.ID, local, "ready"); err != nil {
 		removePreviousLocalTeaser(local, "")
 		log.Printf("[preview] update %s after generate: %v", v.Title, err)
-		return
+		return false
+	}
+	if w.OnPreviewReady != nil && v.ThumbnailURL == "" {
+		ready := *v
+		ready.PreviewLocal = local
+		ready.PreviewStatus = "ready"
+		w.OnPreviewReady(&ready)
 	}
 	log.Printf("[preview] ready %s (duration=%.1fs)", v.Title, duration)
+	return false
 }
 
 func (w *Worker) generateTeaser(ctx context.Context, v *catalog.Video, link *drives.StreamLink, duration float64, optimized bool) (string, error) {
@@ -1856,7 +2109,7 @@ func (w *Worker) generateTeaserFromOriginal(ctx context.Context, v *catalog.Vide
 	if !ok || w.Drive == nil || w.Drive.Kind() != "p115" {
 		return w.Gen.Generate(ctx, link, duration)
 	}
-	return gen.GenerateWithLinkProvider(ctx, link, duration, func(ctx context.Context) (*drives.StreamLink, error) {
+	return gen.GenerateWithLinkRefresh(ctx, link, duration, func(ctx context.Context) (*drives.StreamLink, error) {
 		return w.Drive.StreamURL(ctx, v.FileID)
 	})
 }
@@ -1922,7 +2175,10 @@ func buildHeaders(h map[string][]string) string {
 	}
 	var sb strings.Builder
 	for k, vs := range h {
-		if strings.EqualFold(k, "User-Agent") {
+		if strings.EqualFold(k, "User-Agent") ||
+			strings.EqualFold(k, "Authorization") ||
+			strings.EqualFold(k, "Proxy-Authorization") ||
+			strings.EqualFold(k, "Cookie") {
 			continue
 		}
 		for _, v := range vs {

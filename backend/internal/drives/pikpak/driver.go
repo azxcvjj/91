@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-resty/resty/v2"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/scopedproxy"
 )
 
 const (
@@ -48,6 +49,14 @@ type Driver struct {
 	onTokenUpdate   func(access, refresh, captcha, deviceID string)
 	uploadToOSSFunc func(context.Context, *s3Params, io.Reader) error
 	uploadTempDir   string
+
+	// authMu protects request snapshots. refreshMu serializes rotating refresh
+	// tokens, while authUpdateMu preserves mutation/callback order so an older
+	// credential snapshot can never be persisted after a newer one.
+	authMu          sync.RWMutex
+	refreshMu       sync.Mutex
+	authUpdateMu    sync.Mutex
+	tokenGeneration uint64
 
 	// captchaMu serializes captcha-token refreshes triggered by 4002 / 9
 	// recovery in requestOnce. Without it, N concurrent callers all hitting
@@ -117,7 +126,9 @@ func New(c Config) *Driver {
 		disableMediaLink: c.DisableMediaLink,
 		onTokenUpdate:    c.OnTokenUpdate,
 		uploadTempDir:    strings.TrimSpace(c.UploadTempDir),
+		tokenGeneration:  1,
 		client: resty.New().
+			SetTransport(scopedproxy.NewTransport(nil)).
 			SetTimeout(30*time.Second).
 			SetHeader("Accept", "application/json, text/plain, */*"),
 		listInterval: 1 * time.Second,
@@ -130,21 +141,39 @@ func (d *Driver) Kind() string   { return "pikpak" }
 func (d *Driver) ID() string     { return d.id }
 func (d *Driver) RootID() string { return d.rootID }
 
-func (d *Driver) Init(ctx context.Context) error {
-	clearPersistedCaptcha := func() {
-		if d.captchaToken == "" {
-			return
-		}
-		d.captchaToken = ""
-		d.persistTokens()
-	}
+type authStateSnapshot struct {
+	accessToken     string
+	refreshToken    string
+	captchaToken    string
+	userID          string
+	userAgent       string
+	tokenGeneration uint64
+}
 
-	if d.refreshToken != "" {
-		if err := d.refresh(ctx, d.refreshToken); err != nil {
+func (d *Driver) authSnapshot() authStateSnapshot {
+	d.authMu.RLock()
+	defer d.authMu.RUnlock()
+	return d.authSnapshotLocked()
+}
+
+func (d *Driver) authSnapshotLocked() authStateSnapshot {
+	return authStateSnapshot{
+		accessToken:     d.accessToken,
+		refreshToken:    d.refreshToken,
+		captchaToken:    d.captchaToken,
+		userID:          d.userID,
+		userAgent:       d.userAgent,
+		tokenGeneration: d.tokenGeneration,
+	}
+}
+
+func (d *Driver) Init(ctx context.Context) error {
+	if d.authSnapshot().refreshToken != "" {
+		if err := d.refresh(ctx); err != nil {
 			if !IsCaptchaError(err) || d.username == "" || d.password == "" {
 				return err
 			}
-			clearPersistedCaptcha()
+			d.clearCaptchaToken()
 			if err := d.login(ctx); err != nil {
 				return fmt.Errorf("pikpak refresh captcha recovery login: %w", err)
 			}
@@ -152,14 +181,14 @@ func (d *Driver) Init(ctx context.Context) error {
 			// Persisted captcha tokens are short-lived. With a refresh token we can
 			// safely request a fresh captcha token after auth, and avoiding the
 			// stored value prevents known-stale tokens from poisoning startup.
-			clearPersistedCaptcha()
+			d.clearCaptchaToken()
 		}
 	} else {
 		if err := d.login(ctx); err != nil {
 			return err
 		}
 	}
-	if err := d.refreshCaptchaTokenAtLogin(ctx, getAction(http.MethodGet, filesURL), d.userID); err != nil {
+	if err := d.refreshCaptchaTokenAtLogin(ctx, getAction(http.MethodGet, filesURL), d.authSnapshot().userID); err != nil {
 		return err
 	}
 	d.persistTokens()
@@ -323,13 +352,14 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 		return nil, errors.New("pikpak download url: empty")
 	}
 	headers := http.Header{}
-	if d.userAgent != "" {
-		headers.Set("User-Agent", d.userAgent)
+	if userAgent := d.authSnapshot().userAgent; userAgent != "" {
+		headers.Set("User-Agent", userAgent)
 	}
 	return &drives.StreamLink{
-		URL:     url,
-		Headers: headers,
-		Expires: expires,
+		URL:                url,
+		Headers:            headers,
+		Expires:            expires,
+		ClientRedirectSafe: true,
 	}, nil
 }
 
@@ -472,13 +502,14 @@ func (d *Driver) request(ctx context.Context, url, method string, configure func
 }
 
 func (d *Driver) requestOnce(ctx context.Context, url, method string, configure func(*resty.Request), out any, retry bool) error {
+	auth := d.authSnapshot()
 	req := d.client.R().
 		SetContext(ctx).
-		SetHeader("User-Agent", d.userAgent).
+		SetHeader("User-Agent", auth.userAgent).
 		SetHeader("X-Device-ID", d.deviceID).
-		SetHeader("X-Captcha-Token", d.captchaToken)
-	if d.accessToken != "" {
-		req.SetHeader("Authorization", "Bearer "+d.accessToken)
+		SetHeader("X-Captcha-Token", auth.captchaToken)
+	if auth.accessToken != "" {
+		req.SetHeader("Authorization", "Bearer "+auth.accessToken)
 	}
 	if configure != nil {
 		configure(req)
@@ -497,34 +528,23 @@ func (d *Driver) requestOnce(ctx context.Context, url, method string, configure 
 		switch e.ErrorCode {
 		case 4122, 4121, 16:
 			if retry {
-				if err := d.refresh(ctx, d.refreshToken); err != nil {
+				if err := d.refresh(ctx, auth); err != nil {
 					return err
 				}
 				return d.requestOnce(ctx, url, method, configure, out, false)
 			}
 		case 9, 4002:
 			if retry {
-				// Snapshot the token we *just used* (which the server rejected).
-				// Then take captchaMu so concurrent recovery attempts are
-				// serialized. Once we hold the lock, if d.captchaToken has
-				// already moved past staleToken, another goroutine has refreshed
-				// it for us — we skip the refresh and just retry. Otherwise we
-				// clear the cached token before asking /v1/shield/captcha/init
-				// for a fresh one. PikPak may report stale captcha as either
-				// 4002 or 9, and sending the rejected token into captcha init can
-				// keep returning captcha_invalid.
-				staleToken := d.captchaToken
-				d.captchaMu.Lock()
-				var refreshErr error
-				if d.captchaToken == staleToken {
-					if d.captchaToken != "" {
-						d.captchaToken = ""
-					}
-					refreshErr = d.refreshCaptchaTokenAtLogin(ctx, getAction(method, url), d.userID)
-				}
-				d.captchaMu.Unlock()
-				if refreshErr != nil {
-					return refreshErr
+				// Recover only if the exact captcha token used by this request is
+				// still current. The helper serializes every captcha-init path,
+				// including login fallback, so concurrent failures share one token.
+				if err := d.recoverCaptchaTokenAtLogin(
+					ctx,
+					getAction(method, url),
+					auth.userID,
+					auth.captchaToken,
+				); err != nil {
+					return err
 				}
 				return d.requestOnce(ctx, url, method, configure, out, false)
 			}

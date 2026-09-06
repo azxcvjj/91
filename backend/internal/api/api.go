@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
@@ -68,9 +69,17 @@ type Server struct {
 	shortsFeeds   map[string]*shortsFeedSession
 	shortsFeedNow func() time.Time
 
+	videoFeedMu     sync.Mutex
+	videoFeeds      map[string]*videoFeedSession
+	videoFeedShared map[videoFeedSnapshotKey]string
+	videoFeedNow    func() time.Time
+
 	homeRecommendationMu       sync.Mutex
 	homeRecommendationSessions map[string]*homeRecommendationSession
 	homeRecommendationNow      func() time.Time
+	homeLatestSnapshotMu       sync.Mutex
+	homeLatestSnapshot         []string
+	homeLatestSnapshotUntil    time.Time
 
 	// shareNow is injectable so one-time share expiry behavior can be tested
 	// without sleeping. Production leaves it nil and uses time.Now.
@@ -122,7 +131,6 @@ type VideoDTO struct {
 	PreviewStrategy string   `json:"previewStrategy"`
 	Duration        string   `json:"duration"`
 	Badges          []string `json:"badges"`
-	Quality         string   `json:"quality,omitempty"`
 	SourceLabel     string   `json:"sourceLabel,omitempty"`
 	Author          string   `json:"author"`
 	Views           int      `json:"views"`
@@ -134,6 +142,24 @@ type VideoDTO struct {
 	Tags            []string `json:"tags,omitempty"`
 }
 
+// VideoCardDTO is the compact transport used by infinite listing feeds. The
+// omitted reaction, tag, storage and processing fields are loaded by the video
+// detail endpoint when the user actually opens a card.
+type VideoCardDTO struct {
+	ID              string   `json:"id"`
+	Href            string   `json:"href"`
+	Title           string   `json:"title"`
+	Thumbnail       string   `json:"thumbnail"`
+	PreviewSrc      string   `json:"previewSrc"`
+	PreviewDuration int      `json:"previewDuration"`
+	PreviewStrategy string   `json:"previewStrategy"`
+	Duration        string   `json:"duration"`
+	Badges          []string `json:"badges"`
+	Author          string   `json:"author"`
+	Views           int      `json:"views"`
+	PublishedAt     string   `json:"publishedAt"`
+}
+
 type TagDTO struct {
 	ID    string `json:"id"`
 	Label string `json:"label"`
@@ -142,15 +168,40 @@ type TagDTO struct {
 
 type VideoDetailDTO struct {
 	VideoDTO
-	VideoSrc      string        `json:"videoSrc"`
-	MediaType     string        `json:"mediaType,omitempty"`
-	Poster        string        `json:"poster"`
-	Description   string        `json:"description"`
-	EmbedURL      string        `json:"embedUrl"`
-	Points        int           `json:"points,omitempty"`
-	AuthorProfile AuthorProfile `json:"authorProfile"`
-	RelatedVideos []VideoDTO    `json:"relatedVideos"`
-	CommentsList  []Comment     `json:"commentsList"`
+	VideoSrc            string        `json:"videoSrc"`
+	MediaType           string        `json:"mediaType,omitempty"`
+	Poster              string        `json:"poster"`
+	Description         string        `json:"description"`
+	EmbedURL            string        `json:"embedUrl"`
+	Points              int           `json:"points,omitempty"`
+	AuthorProfile       AuthorProfile `json:"authorProfile"`
+	CollectionCandidate bool          `json:"collectionCandidate,omitempty"`
+	CommentsList        []Comment     `json:"commentsList"`
+}
+
+type VideoCollectionSummary struct {
+	Name         string `json:"name"`
+	Total        int    `json:"total"`
+	CurrentIndex int    `json:"currentIndex"`
+}
+
+type VideoCollectionDTO struct {
+	VideoCollectionSummary
+	Items []VideoCollectionItemDTO `json:"items"`
+}
+
+// VideoCollectionItemDTO stays compact for the mobile sheet. Desktop callers
+// can explicitly request PreviewSrc without pulling reactions, tags, badges or
+// the rest of VideoDTO for every item in a large provider directory.
+type VideoCollectionItemDTO struct {
+	ID          string `json:"id"`
+	Href        string `json:"href"`
+	Title       string `json:"title"`
+	Thumbnail   string `json:"thumbnail"`
+	PreviewSrc  string `json:"previewSrc,omitempty"`
+	Duration    string `json:"duration"`
+	Views       int    `json:"views"`
+	PublishedAt string `json:"publishedAt"`
 }
 
 type SubtitleDTO struct {
@@ -197,8 +248,13 @@ func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
 	r.Group(func(r chi.Router) {
 		r.Use(a.Required)
 		r.Get("/api/home", s.handleHome)
+		r.Get("/api/home/latest", s.handleHomeLatest)
 		r.Get("/api/list", s.handleList)
+		r.Get("/api/feed", s.handleVideoFeed)
 		r.Get("/api/video/{id}", s.handleVideoDetail)
+		r.Get("/api/video/{id}/recommendations", s.handleVideoRecommendations)
+		r.Get("/api/video/{id}/collection/summary", s.handleVideoCollectionSummary)
+		r.Get("/api/video/{id}/collection", s.handleVideoCollection)
 		r.Get("/api/video/{id}/subtitles", s.handleVideoSubtitles)
 		r.Post("/api/video/{id}/share", s.handleCreateVideoShare)
 		r.Put("/api/video/{id}/reaction", s.handleSetVideoReaction)
@@ -248,12 +304,7 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	recommendationSession := &homeRecommendationSession{}
-	persistentSession := false
-	if identity, ok := auth.SessionIdentityFromContext(r.Context()); ok {
-		recommendationSession = s.homeRecommendationSession(identity)
-		persistentSession = true
-	}
+	recommendationSession, persistentSession := s.homeSessionFromContext(r.Context())
 	recommendationSession.requestMu.Lock()
 	defer recommendationSession.requestMu.Unlock()
 
@@ -275,6 +326,42 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, mapVideos(items))
 }
 
+func (s *Server) handleHomeLatest(w http.ResponseWriter, r *http.Request) {
+	count, err := homeRecommendationCount(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	session, persistentSession := s.homeSessionFromContext(r.Context())
+	session.latestRequestMu.Lock()
+	defer session.latestRequestMu.Unlock()
+
+	items, latestVideoIDs, latestCursor, err := s.nextHomeLatestBatch(
+		r.Context(),
+		session,
+		count,
+	)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	session.latestVideoIDs = latestVideoIDs
+	session.latestCursor = latestCursor
+	if persistentSession {
+		s.touchHomeRecommendationSession(session)
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, mapVideos(items))
+}
+
+func (s *Server) homeSessionFromContext(ctx context.Context) (*homeRecommendationSession, bool) {
+	if identity, ok := auth.SessionIdentityFromContext(ctx); ok {
+		return s.homeRecommendationSession(identity), true
+	}
+	return &homeRecommendationSession{}, false
+}
+
 func homeRecommendationCount(r *http.Request) (int, error) {
 	raw := strings.TrimSpace(r.URL.Query().Get("count"))
 	if raw == "" {
@@ -288,24 +375,7 @@ func homeRecommendationCount(r *http.Request) (int, error) {
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	page, _ := strconv.Atoi(q.Get("page"))
-	size, _ := strconv.Atoi(q.Get("size"))
-	if size <= 0 {
-		size = 24
-	}
-	sort := q.Get("sort")
-	params := catalog.ListParams{
-		Keyword:   q.Get("q"),
-		Tag:       q.Get("tag"),
-		Sort:      sort,
-		Page:      page,
-		PageSize:  size,
-		SkipTotal: strings.EqualFold(q.Get("count"), "false"),
-	}
-	if sort == "" || sort == "latest" {
-		params.PreferReadyThumbnails = true
-	}
+	params := publicListParams(r)
 	items, total, err := s.Catalog.ListVideos(r.Context(), params)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -320,14 +390,39 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// publicListParams is shared by the paginated compatibility endpoint and the
+// snapshot feed so both expose the same filters and ordering semantics.
+func publicListParams(r *http.Request) catalog.ListParams {
+	q := r.URL.Query()
+	page, _ := strconv.Atoi(q.Get("page"))
+	size, _ := strconv.Atoi(q.Get("size"))
+	if size <= 0 {
+		size = 24
+	}
+	sortKey := strings.TrimSpace(q.Get("sort"))
+	switch sortKey {
+	case "", "latest", "hot", "recent":
+	default:
+		sortKey = ""
+	}
+	return catalog.ListParams{
+		Keyword:               strings.TrimSpace(q.Get("q")),
+		Tag:                   strings.TrimSpace(q.Get("tag")),
+		Sort:                  sortKey,
+		Page:                  page,
+		PageSize:              size,
+		SkipTotal:             strings.EqualFold(q.Get("count"), "false"),
+		PreferReadyThumbnails: sortKey == "" || sortKey == "latest",
+	}
+}
+
 func (s *Server) handleVideoDetail(w http.ResponseWriter, r *http.Request) {
 	id := routeParam(r, "id")
 	v, err := s.availableVideo(r.Context(), id)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, err)
+		writeCatalogLookupError(w, r, err)
 		return
 	}
-	related := s.pickRelatedVideos(r.Context(), v, 6)
 	dto := mapVideo(v)
 	if d, err := s.Catalog.GetDrive(r.Context(), v.DriveID); err == nil {
 		dto.SourceLabel = driveKindLabel(d.Kind)
@@ -346,41 +441,327 @@ func (s *Server) handleVideoDetail(w http.ResponseWriter, r *http.Request) {
 			Href:   "/author/" + v.Author,
 			Badges: []string{},
 		},
-		RelatedVideos: mapVideos(related),
-		CommentsList:  []Comment{},
+		CollectionCandidate: strings.TrimSpace(v.ParentID) != "",
+		CommentsList:        []Comment{},
 	}
-	// 推荐每次随机生成，禁止浏览器和中间层缓存详情响应
+	// Reactions and editable metadata must stay fresh across detail navigations.
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, detail)
 }
 
+func (s *Server) handleVideoRecommendations(w http.ResponseWriter, r *http.Request) {
+	v, err := s.availableVideo(r.Context(), routeParam(r, "id"))
+	if err != nil {
+		writeCatalogLookupError(w, r, err)
+		return
+	}
+	related, err := s.pickRelatedVideos(r.Context(), v, 6)
+	if err != nil {
+		writeServiceUnavailable(w, r, "load video recommendations", err)
+		return
+	}
+	// Recommendations are randomized per uncached request. Keep their cache
+	// policy independent from the core detail resource.
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, mapVideoSummaries(related))
+}
+
+func (s *Server) handleVideoCollectionSummary(w http.ResponseWriter, r *http.Request) {
+	v, err := s.availableVideo(r.Context(), routeParam(r, "id"))
+	if err != nil {
+		writeCatalogLookupError(w, r, err)
+		return
+	}
+	summary, err := s.videoCollectionSummary(r.Context(), v)
+	if err != nil {
+		writeServiceUnavailable(w, r, "load video collection summary", err)
+		return
+	}
+	if summary == nil {
+		summary = &VideoCollectionSummary{}
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, summary)
+}
+
+func (s *Server) handleVideoCollection(w http.ResponseWriter, r *http.Request) {
+	v, err := s.availableVideo(r.Context(), routeParam(r, "id"))
+	if err != nil {
+		writeCatalogLookupError(w, r, err)
+		return
+	}
+	summary, items, err := s.videoCollection(r.Context(), v)
+	if err != nil {
+		writeServiceUnavailable(w, r, "load video collection", err)
+		return
+	}
+	if summary == nil {
+		summary = &VideoCollectionSummary{}
+		items = []*catalog.Video{}
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, VideoCollectionDTO{
+		VideoCollectionSummary: *summary,
+		Items: mapVideoCollectionItems(
+			items,
+			r.URL.Query().Get("preview") == "1",
+		),
+	})
+}
+
+// videoCollection builds the complete directory-backed collection only for
+// collection UIs. The detail endpoint never calls this full-object path.
+func (s *Server) videoCollection(ctx context.Context, current *catalog.Video) (*VideoCollectionSummary, []*catalog.Video, error) {
+	if current == nil || strings.TrimSpace(current.ParentID) == "" {
+		return nil, nil, nil
+	}
+	items, err := s.Catalog.ListVisibleVideosByDirectory(ctx, current.DriveID, current.ParentID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(items) < 2 {
+		return nil, items, nil
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return naturalVideoCollectionLess(items[i], items[j])
+	})
+	currentIndex := 0
+	for index, item := range items {
+		if item != nil && item.ID == current.ID {
+			currentIndex = index + 1
+			break
+		}
+	}
+	if currentIndex == 0 {
+		return nil, items, nil
+	}
+	name := strings.TrimSpace(current.DirName)
+	if name == "" {
+		for _, item := range items {
+			if item != nil && strings.TrimSpace(item.DirName) != "" {
+				name = strings.TrimSpace(item.DirName)
+				break
+			}
+		}
+	}
+	if name == "" {
+		name = "同目录视频"
+	}
+	return &VideoCollectionSummary{
+		Name:         name,
+		Total:        len(items),
+		CurrentIndex: currentIndex,
+	}, items, nil
+}
+
+// videoCollectionSummary keeps collection ordering work outside the video
+// detail request and hydrates only the fields needed for the summary.
+func (s *Server) videoCollectionSummary(ctx context.Context, current *catalog.Video) (*VideoCollectionSummary, error) {
+	if current == nil || strings.TrimSpace(current.ParentID) == "" {
+		return nil, nil
+	}
+	items, err := s.Catalog.ListVisibleVideoCollectionOrderByDirectory(
+		ctx,
+		current.DriveID,
+		current.ParentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) < 2 {
+		return nil, nil
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return naturalVideoCollectionFieldsLess(
+			items[i].FileName,
+			items[i].Title,
+			items[i].ID,
+			items[i].CreatedAt,
+			items[j].FileName,
+			items[j].Title,
+			items[j].ID,
+			items[j].CreatedAt,
+		)
+	})
+	currentIndex := 0
+	for index, item := range items {
+		if item.ID == current.ID {
+			currentIndex = index + 1
+			break
+		}
+	}
+	if currentIndex == 0 {
+		return nil, nil
+	}
+	name := strings.TrimSpace(current.DirName)
+	if name == "" {
+		for _, item := range items {
+			if strings.TrimSpace(item.DirName) != "" {
+				name = strings.TrimSpace(item.DirName)
+				break
+			}
+		}
+	}
+	if name == "" {
+		name = "同目录视频"
+	}
+	return &VideoCollectionSummary{
+		Name:         name,
+		Total:        len(items),
+		CurrentIndex: currentIndex,
+	}, nil
+}
+
+func naturalVideoCollectionLess(left, right *catalog.Video) bool {
+	if left == nil || right == nil {
+		return left != nil
+	}
+	return naturalVideoCollectionFieldsLess(
+		left.FileName,
+		left.Title,
+		left.ID,
+		left.CreatedAt,
+		right.FileName,
+		right.Title,
+		right.ID,
+		right.CreatedAt,
+	)
+}
+
+func naturalVideoCollectionFieldsLess(
+	leftFileName, leftTitle, leftID string,
+	leftCreatedAt time.Time,
+	rightFileName, rightTitle, rightID string,
+	rightCreatedAt time.Time,
+) bool {
+	leftName := firstNonEmptyString(leftFileName, leftTitle, leftID)
+	rightName := firstNonEmptyString(rightFileName, rightTitle, rightID)
+	if compared := naturalCompare(leftName, rightName); compared != 0 {
+		return compared < 0
+	}
+	if !leftCreatedAt.Equal(rightCreatedAt) {
+		return leftCreatedAt.Before(rightCreatedAt)
+	}
+	return leftID < rightID
+}
+
+// naturalCompare compares ASCII digit runs numerically while keeping all other
+// Unicode runes in a deterministic case-insensitive order (episode 2 < 10).
+func naturalCompare(left, right string) int {
+	leftRunes := []rune(strings.ToLower(strings.TrimSpace(left)))
+	rightRunes := []rune(strings.ToLower(strings.TrimSpace(right)))
+	for li, ri := 0, 0; li < len(leftRunes) && ri < len(rightRunes); {
+		if isASCIIDigit(leftRunes[li]) && isASCIIDigit(rightRunes[ri]) {
+			leftEnd, rightEnd := li, ri
+			for leftEnd < len(leftRunes) && isASCIIDigit(leftRunes[leftEnd]) {
+				leftEnd++
+			}
+			for rightEnd < len(rightRunes) && isASCIIDigit(rightRunes[rightEnd]) {
+				rightEnd++
+			}
+			leftSignificant, rightSignificant := li, ri
+			for leftSignificant < leftEnd-1 && leftRunes[leftSignificant] == '0' {
+				leftSignificant++
+			}
+			for rightSignificant < rightEnd-1 && rightRunes[rightSignificant] == '0' {
+				rightSignificant++
+			}
+			leftDigits := leftRunes[leftSignificant:leftEnd]
+			rightDigits := rightRunes[rightSignificant:rightEnd]
+			if len(leftDigits) != len(rightDigits) {
+				if len(leftDigits) < len(rightDigits) {
+					return -1
+				}
+				return 1
+			}
+			for index := range leftDigits {
+				if leftDigits[index] < rightDigits[index] {
+					return -1
+				}
+				if leftDigits[index] > rightDigits[index] {
+					return 1
+				}
+			}
+			// Numerically equal runs use the shorter spelling first: 2 before 02.
+			if leftEnd-li != rightEnd-ri {
+				if leftEnd-li < rightEnd-ri {
+					return -1
+				}
+				return 1
+			}
+			li, ri = leftEnd, rightEnd
+			continue
+		}
+		if leftRunes[li] < rightRunes[ri] {
+			return -1
+		}
+		if leftRunes[li] > rightRunes[ri] {
+			return 1
+		}
+		li++
+		ri++
+	}
+	if len(leftRunes) < len(rightRunes) {
+		return -1
+	}
+	if len(leftRunes) > len(rightRunes) {
+		return 1
+	}
+	return 0
+}
+
+func isASCIIDigit(value rune) bool {
+	return value >= '0' && value <= '9'
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+const recommendationCandidateWindow = 48
+
 // pickRelatedVideos 选 total 个推荐视频。
 // 一半来自同标签命中，剩下用全库随机补齐；两段都优先取已有封面的视频，
-// 不够时再回退到未生成封面的候选。结果不会重复，也不会包含当前视频。
-func (s *Server) pickRelatedVideos(ctx context.Context, current *catalog.Video, total int) []*catalog.Video {
+// 不够时再回退到未生成封面的候选。每一段只读取一个固定大小的卡片摘要池，
+// 结果不会重复，也不会包含当前视频。
+func (s *Server) pickRelatedVideos(ctx context.Context, current *catalog.Video, total int) ([]*catalog.VideoSummary, error) {
 	if total <= 0 || current == nil {
-		return nil
+		return nil, nil
 	}
 	tagQuota := total / 2
 	if tagQuota <= 0 && len(current.Tags) > 0 {
 		tagQuota = 1
 	}
 
-	picked := make([]*catalog.Video, 0, total)
+	picked := make([]*catalog.VideoSummary, 0, total)
 	seen := map[string]struct{}{current.ID: {}}
+	candidateLimit := max(total, recommendationCandidateWindow)
 
-	// 1) 同标签候选：先取已有封面的候选，数量不够再从全部候选里补。
+	// 1) 所有标签合并成一次候选查询；不再按标签重复查询公共列表。
 	if tagQuota > 0 && len(current.Tags) > 0 {
+		pool, err := s.recommendationPool(ctx, current.Tags, seen, true, candidateLimit)
+		if err != nil {
+			return nil, err
+		}
 		picked = appendRandomRelated(
 			picked,
-			s.relatedTagPool(ctx, current.Tags, seen, true),
+			pool,
 			tagQuota,
 			seen,
 		)
 		if len(picked) < tagQuota {
+			pool, err = s.recommendationPool(ctx, current.Tags, seen, false, candidateLimit)
+			if err != nil {
+				return nil, err
+			}
 			picked = appendRandomRelated(
 				picked,
-				s.relatedTagPool(ctx, current.Tags, seen, false),
+				pool,
 				tagQuota,
 				seen,
 			)
@@ -389,85 +770,61 @@ func (s *Server) pickRelatedVideos(ctx context.Context, current *catalog.Video, 
 
 	// 2) 随机补齐：同样优先已有封面的全库候选，不够再回退。
 	if len(picked) < total {
+		pool, err := s.recommendationPool(ctx, nil, seen, true, candidateLimit)
+		if err != nil {
+			return nil, err
+		}
 		picked = appendRandomRelated(
 			picked,
-			s.relatedListPool(ctx, seen, true, 200),
+			pool,
 			total,
 			seen,
 		)
 	}
 	if len(picked) < total {
+		pool, err := s.recommendationPool(ctx, nil, seen, false, candidateLimit)
+		if err != nil {
+			return nil, err
+		}
 		picked = appendRandomRelated(
 			picked,
-			s.relatedListPool(ctx, seen, false, 200),
+			pool,
 			total,
 			seen,
 		)
 	}
 
-	return picked
+	return picked, nil
 }
 
-func (s *Server) relatedTagPool(ctx context.Context, tags []string, seen map[string]struct{}, readyOnly bool) []*catalog.Video {
-	var pool []*catalog.Video
-	poolSeen := make(map[string]struct{})
-	for _, tag := range tags {
-		if tag == "" {
-			continue
-		}
-		items, _, err := s.Catalog.ListVideos(ctx, catalog.ListParams{
-			Tag:                   tag,
-			Sort:                  "latest",
-			Page:                  1,
-			PageSize:              30,
-			ThumbnailReadyOnly:    readyOnly,
-			PreferReadyThumbnails: !readyOnly,
-		})
-		if err != nil {
-			continue
-		}
-		for _, v := range items {
-			if v == nil {
-				continue
-			}
-			if _, ok := seen[v.ID]; ok {
-				continue
-			}
-			if _, ok := poolSeen[v.ID]; ok {
-				continue
-			}
-			poolSeen[v.ID] = struct{}{}
-			pool = append(pool, v)
-		}
-	}
-	return pool
-}
-
-func (s *Server) relatedListPool(ctx context.Context, seen map[string]struct{}, readyOnly bool, pageSize int) []*catalog.Video {
-	items, _, err := s.Catalog.ListVideos(ctx, catalog.ListParams{
-		Sort:                  "latest",
-		Page:                  1,
-		PageSize:              pageSize,
-		ThumbnailReadyOnly:    readyOnly,
-		PreferReadyThumbnails: !readyOnly,
+func (s *Server) recommendationPool(
+	ctx context.Context,
+	tags []string,
+	seen map[string]struct{},
+	readyOnly bool,
+	limit int,
+) ([]*catalog.VideoSummary, error) {
+	items, err := s.Catalog.ListRecommendationCandidates(ctx, catalog.RecommendationCandidateParams{
+		Tags:               tags,
+		ExcludeIDs:         recommendationSeenIDs(seen),
+		ThumbnailReadyOnly: readyOnly,
+		Limit:              limit,
 	})
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	pool := make([]*catalog.Video, 0, len(items))
-	for _, v := range items {
-		if v == nil {
-			continue
-		}
-		if _, ok := seen[v.ID]; ok {
-			continue
-		}
-		pool = append(pool, v)
-	}
-	return pool
+	return items, nil
 }
 
-func appendRandomRelated(picked []*catalog.Video, pool []*catalog.Video, targetLen int, seen map[string]struct{}) []*catalog.Video {
+func recommendationSeenIDs(seen map[string]struct{}) []string {
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func appendRandomRelated(picked []*catalog.VideoSummary, pool []*catalog.VideoSummary, targetLen int, seen map[string]struct{}) []*catalog.VideoSummary {
 	if len(picked) >= targetLen || len(pool) == 0 {
 		return picked
 	}
@@ -870,8 +1227,12 @@ func (s *Server) handleSubtitleFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) visibleVideo(w http.ResponseWriter, r *http.Request, id string) (*catalog.Video, bool) {
-	v, err := s.Catalog.GetVideo(r.Context(), id)
-	if err != nil || v.Hidden {
+	v, err := s.videoByPublicID(r.Context(), id)
+	if err != nil {
+		writeCatalogLookupError(w, r, err)
+		return nil, false
+	}
+	if v.Hidden {
 		writeErr(w, http.StatusNotFound, sql.ErrNoRows)
 		return nil, false
 	}
@@ -880,8 +1241,12 @@ func (s *Server) visibleVideo(w http.ResponseWriter, r *http.Request, id string)
 
 func (s *Server) handleUploadedVideo(w http.ResponseWriter, r *http.Request) {
 	videoID := routeParam(r, "videoID")
-	v, err := s.Catalog.GetVideo(r.Context(), videoID)
-	if err != nil || v.Hidden || v.DriveID != localUploadDriveID {
+	v, err := s.videoByPublicID(r.Context(), videoID)
+	if err != nil {
+		writeCatalogLookupError(w, r, err)
+		return
+	}
+	if v.Hidden || v.DriveID != localUploadDriveID {
 		http.NotFound(w, r)
 		return
 	}
@@ -890,16 +1255,22 @@ func (s *Server) handleUploadedVideo(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	videoID := routeParam(r, "videoID")
-	v, err := s.Catalog.GetVideo(r.Context(), videoID)
+	v, err := s.videoByPublicID(r.Context(), videoID)
 	if err != nil {
-		http.NotFound(w, r)
+		writeCatalogLookupError(w, r, err)
 		return
 	}
 	s.servePreviewVideo(w, r, v)
 }
 
 func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
-	s.serveVideoThumb(w, r, routeParam(r, "videoID"))
+	videoID := routeParam(r, "videoID")
+	if s.Catalog != nil {
+		if resolvedID, err := s.Catalog.ResolveVideoID(r.Context(), videoID); err == nil {
+			videoID = resolvedID
+		}
+	}
+	s.serveVideoThumb(w, r, videoID)
 }
 
 // ---------- helpers ----------
@@ -923,7 +1294,6 @@ func mapVideo(v *catalog.Video) VideoDTO {
 		PreviewStrategy: "teaser-file",
 		Duration:        formatDuration(v.DurationSeconds),
 		Badges:          badges,
-		Quality:         v.Quality,
 		Author:          v.Author,
 		Views:           v.Views,
 		Favorites:       v.Favorites,
@@ -1211,34 +1581,33 @@ func normalizeSubtitleExt(ext string) string {
 }
 
 func previewURL(v *catalog.Video) string {
-	base := "/p/preview/" + pathSegment(v.ID)
-	if v.UpdatedAt.IsZero() {
+	return previewURLFor(v.ID, v.PreviewUpdatedAt)
+}
+
+func previewURLFor(videoID string, updatedAt time.Time) string {
+	base := "/p/preview/" + pathSegment(videoID)
+	if updatedAt.IsZero() {
 		return base
 	}
-	return base + "?v=" + strconv.FormatInt(v.UpdatedAt.UnixMilli(), 10)
+	return base + "?v=" + strconv.FormatInt(updatedAt.UnixMilli(), 10)
 }
 
 func thumbnailURL(v *catalog.Video) string {
-	base := "/p/thumb/" + pathSegment(v.ID)
-	if v.ThumbnailURL != "" {
-		base = v.ThumbnailURL
-		if thumbnailURLMatchesVideoID(base, v.ID) {
-			base = "/p/thumb/" + pathSegment(v.ID)
-		}
-	}
-	if !strings.HasPrefix(base, "/p/thumb/") || v.UpdatedAt.IsZero() {
-		return base
-	}
-	return base + "?v=" + strconv.FormatInt(v.UpdatedAt.UnixMilli(), 10)
+	return thumbnailURLFor(v.ID, v.ThumbnailURL, v.ThumbnailUpdatedAt)
 }
 
-// transcodedSource 在视频有就绪的浏览器兼容性转码产物时返回产物的播放地址。
-// 产物和原始文件在同一个 drive 上，走同一条 /p/stream 代理/302 链路。
-func transcodedSource(v *catalog.Video) (string, bool) {
-	if v.TranscodeStatus == "ready" && v.TranscodedFileID != "" && v.DriveID != localUploadDriveID {
-		return fmt.Sprintf("/p/stream/%s/%s", pathSegment(v.DriveID), pathSegment(v.TranscodedFileID)), true
+func thumbnailURLFor(videoID, thumbnail string, updatedAt time.Time) string {
+	base := strings.TrimSpace(thumbnail)
+	if base == "" {
+		return ""
 	}
-	return "", false
+	if thumbnailURLMatchesVideoID(base, videoID) {
+		base = "/p/thumb/" + pathSegment(videoID)
+	}
+	if !strings.HasPrefix(base, "/p/thumb/") || updatedAt.IsZero() {
+		return base
+	}
+	return base + "?v=" + strconv.FormatInt(updatedAt.UnixMilli(), 10)
 }
 
 func (s *Server) videoSource(v *catalog.Video) string {
@@ -1246,14 +1615,10 @@ func (s *Server) videoSource(v *catalog.Video) string {
 	return src
 }
 
-// playbackMediaType describes the resource selected by videoSource. A ready
-// transcode is always an MP4 even when the original catalog entry was MKV/AVI.
+// playbackMediaType describes the original resource selected by videoSource.
 func playbackMediaType(v *catalog.Video) string {
 	if v == nil {
 		return ""
-	}
-	if v.TranscodeStatus == "ready" && v.TranscodedFileID != "" {
-		return "video/mp4"
 	}
 	switch strings.ToLower(strings.TrimPrefix(strings.TrimSpace(v.Ext), ".")) {
 	case "mp4", "m4v":
@@ -1263,33 +1628,24 @@ func playbackMediaType(v *catalog.Video) string {
 	}
 }
 
-// videoSourceAndSize 返回实际播放资源的地址和同一资源的字节数。转码就绪时
-// 播放的是转码产物，因此不能继续沿用原文件大小来估算码率。
+// videoSourceAndSize 返回原始播放资源的地址和字节数。
 func (s *Server) videoSourceAndSize(v *catalog.Video) (string, int64) {
 	if v.DriveID == localUploadDriveID {
 		return "/p/upload/" + pathSegment(v.ID), v.Size
 	}
 	if driveID, fileID, ok := videoStreamTarget(v); ok {
-		size := v.Size
-		if v.TranscodeStatus == "ready" && fileID == v.TranscodedFileID && v.TranscodedFileID != "" {
-			size = v.TranscodedSize
-		}
-		return fmt.Sprintf("/p/stream/%s/%s", pathSegment(driveID), pathSegment(fileID)), size
+		return fmt.Sprintf("/p/stream/%s/%s", pathSegment(driveID), pathSegment(fileID)), v.Size
 	}
 	return fmt.Sprintf("/p/stream/%s/%s", pathSegment(v.DriveID), pathSegment(v.FileID)), v.Size
 }
 
-// videoStreamTarget returns the exact drive/file pair used by the browser-facing
-// /p/stream URL. Shorts link prewarming must use the transcoded file when present,
-// otherwise it would warm a different cache entry from the one playback requests.
+// videoStreamTarget returns the original drive/file pair used by the
+// browser-facing /p/stream URL.
 func videoStreamTarget(v *catalog.Video) (driveID, fileID string, ok bool) {
 	if v == nil || v.DriveID == localUploadDriveID || v.DriveID == "" {
 		return "", "", false
 	}
 	fileID = v.FileID
-	if v.TranscodeStatus == "ready" && v.TranscodedFileID != "" {
-		fileID = v.TranscodedFileID
-	}
 	if fileID == "" {
 		return "", "", false
 	}
@@ -1301,9 +1657,6 @@ func videoStreamTarget(v *catalog.Video) (driveID, fileID string, ok bool) {
 func videoSource(v *catalog.Video) string {
 	if v.DriveID == localUploadDriveID {
 		return "/p/upload/" + pathSegment(v.ID)
-	}
-	if src, ok := transcodedSource(v); ok {
-		return src
 	}
 	return fmt.Sprintf("/p/stream/%s/%s", pathSegment(v.DriveID), pathSegment(v.FileID))
 }
@@ -1355,7 +1708,7 @@ func driveKindLabel(kind string) string {
 	case "quark":
 		return "夸克网盘"
 	case "p115":
-		return "115 网盘"
+		return "115网盘"
 	case "p123":
 		return "123网盘"
 	case "pikpak":
@@ -1508,6 +1861,54 @@ func mapVideos(vs []*catalog.Video) []VideoDTO {
 	return out
 }
 
+func mapVideoSummaries(videos []*catalog.VideoSummary) []VideoCardDTO {
+	out := make([]VideoCardDTO, 0, len(videos))
+	for _, video := range videos {
+		badges := video.Badges
+		if badges == nil {
+			badges = []string{}
+		}
+		out = append(out, VideoCardDTO{
+			ID:              video.ID,
+			Href:            "/video/" + pathSegment(video.ID),
+			Title:           video.Title,
+			Thumbnail:       thumbnailURLFor(video.ID, video.ThumbnailURL, video.ThumbnailUpdatedAt),
+			PreviewSrc:      previewURLFor(video.ID, video.PreviewUpdatedAt),
+			PreviewDuration: 12,
+			PreviewStrategy: "teaser-file",
+			Duration:        formatDuration(video.DurationSeconds),
+			Badges:          badges,
+			Author:          video.Author,
+			Views:           video.Views,
+			PublishedAt:     video.PublishedAt.Format("2006-01-02"),
+		})
+	}
+	return out
+}
+
+func mapVideoCollectionItems(videos []*catalog.Video, includePreview bool) []VideoCollectionItemDTO {
+	items := make([]VideoCollectionItemDTO, 0, len(videos))
+	for _, video := range videos {
+		if video == nil {
+			continue
+		}
+		item := VideoCollectionItemDTO{
+			ID:          video.ID,
+			Href:        "/video/" + pathSegment(video.ID),
+			Title:       video.Title,
+			Thumbnail:   thumbnailURL(video),
+			Duration:    formatDuration(video.DurationSeconds),
+			Views:       video.Views,
+			PublishedAt: video.PublishedAt.Format("2006-01-02"),
+		}
+		if includePreview {
+			item.PreviewSrc = previewURL(video)
+		}
+		items = append(items, item)
+	}
+	return items
+}
+
 func formatDuration(sec int) string {
 	if sec <= 0 {
 		return "00:00"
@@ -1525,4 +1926,22 @@ func writeJSON(w http.ResponseWriter, code int, body any) {
 
 func writeErr(w http.ResponseWriter, code int, err error) {
 	writeJSON(w, code, map[string]string{"error": err.Error()})
+}
+
+func writeCatalogLookupError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, sql.ErrNoRows) {
+		writeErr(w, http.StatusNotFound, sql.ErrNoRows)
+		return
+	}
+	writeServiceUnavailable(w, r, "query catalog", err)
+}
+
+func writeServiceUnavailable(w http.ResponseWriter, r *http.Request, operation string, err error) {
+	if r.Context().Err() != nil {
+		return
+	}
+	log.Printf("[api] %s method=%s path=%s: %v", operation, r.Method, r.URL.Path, err)
+	writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+		"error": "service temporarily unavailable",
+	})
 }

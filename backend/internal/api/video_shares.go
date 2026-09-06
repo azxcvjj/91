@@ -47,7 +47,7 @@ func (s *Server) handleCreateVideoShare(w http.ResponseWriter, r *http.Request) 
 	videoID := routeParam(r, "id")
 	v, err := s.availableVideo(r.Context(), videoID)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, sql.ErrNoRows)
+		writeCatalogLookupError(w, r, err)
 		return
 	}
 
@@ -72,7 +72,7 @@ func (s *Server) handleCreateVideoShare(w http.ResponseWriter, r *http.Request) 
 			writeErr(w, http.StatusNotFound, sql.ErrNoRows)
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, err)
+		writeServiceUnavailable(w, r, "create video share", err)
 		return
 	}
 
@@ -124,14 +124,18 @@ func (s *Server) handleConsumeVideoShare(w http.ResponseWriter, r *http.Request)
 		case errors.Is(err, catalog.ErrVideoShareUnavailable):
 			writeErr(w, http.StatusNotFound, err)
 		default:
-			writeErr(w, http.StatusInternalServerError, err)
+			writeServiceUnavailable(w, r, "claim video share", err)
 		}
 		return
 	}
 
 	v, err := s.availableVideo(r.Context(), share.VideoID)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, catalog.ErrVideoShareUnavailable)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, http.StatusNotFound, catalog.ErrVideoShareUnavailable)
+		} else {
+			writeServiceUnavailable(w, r, "load shared video", err)
+		}
 		return
 	}
 	setVideoShareSessionCookie(w, r, sessionValue, share.SessionExpiresAt, now)
@@ -186,11 +190,7 @@ func (s *Server) handleSharedVideoStream(w http.ResponseWriter, r *http.Request)
 		http.NotFound(w, r)
 		return
 	}
-	fileID := v.FileID
-	if v.TranscodeStatus == "ready" && v.TranscodedFileID != "" {
-		fileID = v.TranscodedFileID
-	}
-	s.Proxy.ServeStream(w, r, v.DriveID, fileID)
+	s.Proxy.ServeStream(w, r, v.DriveID, v.FileID)
 }
 
 func (s *Server) handleSharedVideoPreview(w http.ResponseWriter, r *http.Request) {
@@ -235,12 +235,20 @@ func (s *Server) activeSharedVideo(w http.ResponseWriter, r *http.Request) (*cat
 		s.shareCurrentTime(),
 	)
 	if err != nil {
-		http.NotFound(w, r)
+		if errors.Is(err, catalog.ErrVideoShareUnavailable) {
+			http.NotFound(w, r)
+		} else {
+			writeServiceUnavailable(w, r, "validate video share", err)
+		}
 		return nil, false
 	}
 	v, err := s.availableVideo(r.Context(), videoID)
 	if err != nil {
-		http.NotFound(w, r)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+		} else {
+			writeServiceUnavailable(w, r, "load shared video", err)
+		}
 		return nil, false
 	}
 	return v, true
@@ -250,8 +258,11 @@ func (s *Server) availableVideo(ctx context.Context, id string) (*catalog.Video,
 	if s.Catalog == nil {
 		return nil, sql.ErrNoRows
 	}
-	v, err := s.Catalog.GetVideo(ctx, id)
-	if err != nil || v.Hidden {
+	v, err := s.videoByPublicID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if v.Hidden {
 		return nil, sql.ErrNoRows
 	}
 	if v.DriveID == localUploadDriveID {
@@ -259,21 +270,37 @@ func (s *Server) availableVideo(ctx context.Context, id string) (*catalog.Video,
 	}
 	if _, err := s.Catalog.GetDrive(ctx, v.DriveID); err == nil {
 		return v, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
 	}
 	// Preserve the catalog-only development/test mode used by the existing API:
 	// when no drives have been configured at all, metadata remains readable.
 	drives, err := s.Catalog.ListDrives(ctx)
-	if err != nil || len(drives) > 0 {
+	if err != nil {
+		return nil, err
+	}
+	if len(drives) > 0 {
 		return nil, sql.ErrNoRows
 	}
 	return v, nil
+}
+
+func (s *Server) videoByPublicID(ctx context.Context, id string) (*catalog.Video, error) {
+	if s.Catalog == nil {
+		return nil, sql.ErrNoRows
+	}
+	resolvedID, err := s.Catalog.ResolveVideoID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return s.Catalog.GetVideo(ctx, resolvedID)
 }
 
 func (s *Server) mapSharedVideoDetail(ctx context.Context, v *catalog.Video, shareID string) VideoDetailDTO {
 	dto := mapVideo(v)
 	dto.Href = ""
 	dto.Thumbnail = s.sharedThumbnailURL(v, shareID)
-	dto.PreviewSrc = sharedAssetURL(shareID, "preview", v.UpdatedAt)
+	dto.PreviewSrc = sharedAssetURL(shareID, "preview", v.PreviewUpdatedAt)
 	if d, err := s.Catalog.GetDrive(ctx, v.DriveID); err == nil {
 		dto.SourceLabel = driveKindLabel(d.Kind)
 	}
@@ -287,15 +314,14 @@ func (s *Server) mapSharedVideoDetail(ctx context.Context, v *catalog.Video, sha
 			Name:   v.Author,
 			Badges: []string{},
 		},
-		RelatedVideos: []VideoDTO{},
-		CommentsList:  []Comment{},
+		CommentsList: []Comment{},
 	}
 }
 
 func (s *Server) sharedThumbnailURL(v *catalog.Video, shareID string) string {
 	thumbnail := thumbnailURL(v)
 	if strings.HasPrefix(thumbnail, "/p/thumb/") {
-		return sharedAssetURL(shareID, "thumb", v.UpdatedAt)
+		return sharedAssetURL(shareID, "thumb", v.ThumbnailUpdatedAt)
 	}
 	return thumbnail
 }
@@ -350,9 +376,17 @@ func (s *Server) servePreviewVideo(w http.ResponseWriter, r *http.Request, v *ca
 			http.Error(w, "invalid local path", http.StatusForbidden)
 			return
 		}
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Pragma", "no-cache")
-		w.Header().Set("Expires", "0")
+		expectedVersion := ""
+		if !v.PreviewUpdatedAt.IsZero() {
+			expectedVersion = strconv.FormatInt(v.PreviewUpdatedAt.UnixMilli(), 10)
+		}
+		if expectedVersion != "" && r.URL.Query().Get("v") == expectedVersion {
+			w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Pragma", "no-cache")
+			w.Header().Set("Expires", "0")
+		}
 		s.Proxy.ServeLocal(w, r, localPreview)
 		return
 	}
@@ -390,7 +424,11 @@ func (s *Server) serveVideoThumb(w http.ResponseWriter, r *http.Request, videoID
 			clean = backgroundPath
 		}
 	}
-	w.Header().Set("Cache-Control", "private, max-age=86400")
+	if r.URL.Query().Get("v") != "" {
+		w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
+	} else {
+		w.Header().Set("Cache-Control", "private, max-age=86400")
+	}
 	s.Proxy.ServeLocal(w, r, clean)
 }
 

@@ -40,26 +40,32 @@ function ruleBody(css: string, selector: string): string {
 
 test("home page refresh button shares back-to-top slot until back-to-top is visible", () => {
   assert.match(homePageSource, /import \{ RefreshCw \} from "lucide-react"/);
-  assert.match(homePageSource, /const LATEST_POOL_SIZE = 96;/);
-  assert.match(homePageSource, /const HOME_LATEST_CURSOR_KEY = "home\.latest\.cursor";/);
-  assert.match(homePageSource, /function nextLatestBatch/);
-  assert.match(homePageSource, /let cachedLatestBatch: VideoItem\[\] \| null = null;/);
-  assert.match(homePageSource, /function cacheNextLatestBatch/);
-  assert.match(homePageSource, /loadLatestCursor\(items\.length\)/);
-  assert.match(homePageSource, /saveLatestCursor\(\(start \+ count\) % items\.length\)/);
-  assert.match(homePageSource, /const refreshHome = useCallback\(async \(\) =>/);
-  assert.match(homePageSource, /fetchHomeVideos\(displayCountRef\.current\)/);
-  assert.match(homePageSource, /fetchListing\(1,\s*LATEST_POOL_SIZE,\s*\{ sort: "latest", includeTotal: false \}\)/);
-  assert.match(homePageSource, /const DESKTOP_COUNT = 12;/);
-  assert.match(homePageSource, /const MOBILE_COUNT = 8;/);
-  assert.match(homePageSource, /const HOME_SEARCH_DESKTOP_PAGE_SIZE = 20;/);
-  assert.match(homePageSource, /setLatestVideos\(latestBatch\)/);
-  assert.match(homePageSource, /const displayCount = isMobile \? MOBILE_COUNT : DESKTOP_COUNT;/);
-  assert.match(homePageSource, /const displayCountRef = useRef\(displayCount\);/);
-  assert.match(homePageSource, /cacheNextLatestBatch\(\s*latestResult\.value\.items,\s*displayCountRef\.current\s*\)/);
-  assert.match(homePageSource, /cacheNextLatestBatch\(\s*latestResult\.items,\s*displayCountRef\.current\s*\)/);
-  assert.match(homePageSource, /const batchSize = Math\.min\(DESKTOP_COUNT, items\.length\);/);
-  assert.match(homePageSource, /saveLatestCursor\(\(start \+ count\) % items\.length\)/);
+  // 刷新只对随机推荐有意义：最新视频是时间序，重抽一轮没有区别。
+  assert.match(
+    homePageSource,
+    /const isRandomRecommendationFeed =\s*!hasActiveFilter && feed === "recommend";/
+  );
+  assert.match(homePageSource, /const showRefresh = isRandomRecommendationFeed;/);
+  assert.match(
+    homePageSource,
+    /feedSnapshotScope: activeFeedSource\.snapshotRestoreScope/
+  );
+  assert.match(homePageSource, /const refreshing = showRefresh && homeFeed\.initialLoading;/);
+  assert.match(homePageSource, /\{showRefresh && \(/);
+  assert.match(
+    homePageSource,
+    /const refreshHome = useCallback\(\(\) => \{\s*window\.scrollTo\(\{ top: 0, behavior: "auto" \}\);\s*reloadFeed\(\);/
+  );
+  assert.match(homePageSource, /const HOME_DESKTOP_BATCH_SIZE = 20;/);
+  assert.match(
+    homePageSource,
+    /const batchSize = isMobile\s*\? MOBILE_VIDEO_PAGE_SIZE\s*:\s*HOME_DESKTOP_BATCH_SIZE;/
+  );
+  // 推荐流的取数和缓存都收敛到共享的无限滚动 hook 里。
+  assert.doesNotMatch(homePageSource, /cachedRanking|cachedLatest/);
+  assert.doesNotMatch(homePageSource, /fetchHomeVideos|fetchLatestHomeVideos/);
+  assert.doesNotMatch(homePageSource, /LATEST_POOL_SIZE|HOME_LATEST_CURSOR_KEY/);
+  assert.doesNotMatch(homePageSource, /fetchListing\(1,\s*96/);
   assert.doesNotMatch(homePageSource, /HOME_RECENT_KEY/);
   assert.doesNotMatch(homePageSource, /loadRecentHomeVideoIds/);
   assert.doesNotMatch(homePageSource, /rememberHomeVideos/);
@@ -84,29 +90,41 @@ test("home page refresh button shares back-to-top slot until back-to-top is visi
   assert.match(backToTopSource, /onVisibilityChange\?\.\(nextVisible\)/);
 });
 
-test("home page reuses the cached latest batch when returning from detail", () => {
-  assert.match(homePageSource, /const \[latestVideos,\s*setLatestVideos\] = useState<VideoItem\[\]>\(cachedLatestBatch \?\? \[\]\)/);
-  assert.match(homePageSource, /const \[latestLoading,\s*setLatestLoading\] = useState\(cachedLatestBatch === null\)/);
-  assert.match(homePageSource, /cachedLatestBatch \?\?\s*cacheNextLatestBatch\(cachedLatestPool, displayCountRef\.current\)/);
-  assert.doesNotMatch(homePageSource, /setLatestVideos\(nextLatestBatch\(cachedLatestPool,\s*DESKTOP_COUNT\)\)/);
+test("home page keeps every active result set in the shared feed session", () => {
+  // 返回首页时的续播、去重、中断过期请求都由 useInfiniteListing 负责，
+  // 页面自己不再维护模块级缓存和请求版本号。
+  assert.match(homePageSource, /const activeFeedSource = hasActiveFilter \? filterFeedSource : feedSource;/);
+  assert.match(homePageSource, /const homeFeed = useInfiniteListing\(activeFeedSource, \{/);
+  assert.match(homePageSource, /restoreCount: restoreTarget\.count,/);
+  assert.match(homePageSource, /queryKey: activeFeedSource\.key,[\s\S]*?requestedCount: homeFeed\.requestedCount/);
+  assert.doesNotMatch(homePageSource, /rankingRequestVersion|latestRequestVersion|homeRequestVersion/);
+  assert.doesNotMatch(homePageSource, /loadRanking|loadLatest|refreshLatest/);
+  assert.doesNotMatch(homePageSource, /HOME_CACHE_TTL_MS|cacheIsFresh|cachedRankingAt|cachedLatestAt/);
+  assert.doesNotMatch(homePageSource, /localStorage/);
 });
 
-test("home page reserves tag cloud space while tags load and uses one empty library state", () => {
+test("home and list pages load the shared tag cloud independently from video results", () => {
   assert.match(tagCloudSource, /const visibleTags = useMemo/);
   assert.match(tagCloudSource, /typeof tag\.count !== "number" \|\| tag\.count > 0/);
   assert.match(tagCloudSource, /const initialTagsRef = useRef<TagItem\[\] \| null>\(readCachedTags\(\)\)/);
   assert.match(tagCloudSource, /const \[tags,\s*setTags\] = useState<TagItem\[\]>\(initialTagsRef\.current \?\? \[\]\)/);
-  assert.match(tagCloudSource, /const \[loaded,\s*setLoaded\] = useState\(initialTagsRef\.current !== null\)/);
-  assert.match(tagCloudSource, /if \(initialTagsRef\.current !== null\) return/);
-  assert.match(tagCloudSource, /setLoaded\(true\)/);
-  assert.match(tagCloudSource, /if \(loaded && visibleTags\.length === 0\) return null/);
-  assert.match(tagCloudSource, /const loading = !loaded && visibleTags\.length === 0/);
+  assert.match(tagCloudSource, /type TagCloudStatus = "loading" \| "ready" \| "error"/);
+  assert.match(tagCloudSource, /const \[retryVersion, setRetryVersion\] = useState\(0\)/);
+  assert.match(tagCloudSource, /if \(initialTagsRef\.current !== null && retryVersion === 0\) return/);
+  assert.match(tagCloudSource, /setStatus\("ready"\)/);
+  assert.match(tagCloudSource, /setStatus\("error"\)/);
+  assert.match(tagCloudSource, /if \(status === "ready" && visibleTags\.length === 0\) return null/);
+  assert.match(tagCloudSource, /const loading = status === "loading" && visibleTags\.length === 0/);
+  assert.match(tagCloudSource, /const failed = status === "error" && visibleTags\.length === 0/);
+  assert.match(tagCloudSource, /标签加载失败/);
+  assert.match(tagCloudSource, /重新加载/);
+  assert.match(tagCloudSource, /setRetryVersion\(\(current\) => current \+ 1\)/);
   assert.match(tagCloudSource, /const TAG_PLACEHOLDER_COUNT = 16;/);
   assert.match(tagCloudSource, /type TagCloudProps = \{/);
   assert.match(tagCloudSource, /linkBasePath\?: string;/);
   assert.match(tagCloudSource, /onTagSelect\?: \(\) => void;/);
-  assert.match(tagCloudSource, /export function TagCloud\(\{ linkBasePath = "\/list", onTagSelect \}: TagCloudProps\)/);
-  assert.match(tagCloudSource, /to=\{`\$\{linkBasePath\}\?tag=\$\{encodeURIComponent\(tag\.label\)\}`\}/);
+  assert.match(tagCloudSource, /export const TagCloud = memo\(function TagCloud\(\{[\s\S]*?linkBasePath = "\/list",[\s\S]*?onTagSelect,[\s\S]*?\}: TagCloudProps\)/);
+  assert.match(tagCloudSource, /to=\{buildTagHref\(tag\.label\)\}/);
   assert.match(tagCloudSource, /onClick=\{onTagSelect\}/);
   assert.match(tagCloudSource, /const \[hasMoreRight, setHasMoreRight\] = useState\(false\)/);
   assert.match(tagCloudSource, /const remaining = slider\.scrollWidth - slider\.clientWidth - slider\.scrollLeft/);
@@ -126,7 +144,8 @@ test("home page reserves tag cloud space while tags load and uses one empty libr
   const tagCloudContainer = ruleBody(searchCss, ".tag-cloud-container");
   const overflowingTagCloud = ruleBody(searchCss, ".tag-cloud-container.has-more-right");
   const loadingTagCloud = ruleBody(searchCss, ".tag-cloud-container.is-loading");
-  const reservedTagCloud = ruleBody(searchCss, ".tag-cloud-container.is-reserved");
+  const tagCloudError = ruleBody(searchCss, ".tag-cloud__error");
+  const tagCloudRetry = ruleBody(searchCss, ".tag-cloud__retry");
   const tagCloudRow = ruleBody(searchCss, ".tag-cloud__row");
   const tagChip = ruleBody(searchCss, ".tag-chip");
   const tagPlaceholder = ruleBody(searchCss, ".tag-chip--placeholder");
@@ -134,7 +153,8 @@ test("home page reserves tag cloud space while tags load and uses one empty libr
   assert.match(tagCloudContainer, /mask-image\s*:\s*none/);
   assert.match(overflowingTagCloud, /mask-image\s*:\s*linear-gradient\(to right, black 0%, black 93%, transparent 100%\)/);
   assert.match(loadingTagCloud, /pointer-events\s*:\s*none/);
-  assert.match(reservedTagCloud, /mask-image\s*:\s*none/);
+  assert.match(tagCloudError, /min-height\s*:\s*34px/);
+  assert.match(tagCloudRetry, /color\s*:\s*var\(--accent\)/);
   assert.match(tagCloudRow, /flex-wrap\s*:\s*nowrap/);
   assert.match(tagChip, /flex\s*:\s*0 0 auto/);
   assert.match(tagPlaceholder, /width\s*:\s*68px/);
@@ -206,51 +226,41 @@ test("home page reserves tag cloud space while tags load and uses one empty libr
   assert.doesNotMatch(searchCss, /\.search-panel--uiverse \.search-panel__reset\.is-visible/);
   assert.doesNotMatch(searchCss, /\.search-panel--uiverse \.search-panel__submit\s*\{/);
 
-  assert.match(homePageSource, /const homeLoading = rankingLoading \|\| latestLoading/);
   assert.match(homePageSource, /import \{ AdminEmptyVisual \} from "@\/admin\/AdminEmptyVisual"/);
   assert.doesNotMatch(homePageSource, /const \[searchQuery, setSearchQuery\] = useState\(""\)/);
   assert.match(homePageSource, /const \[searchParams, setSearchParams\] = useSearchParams\(\)/);
   assert.match(homePageSource, /const activeSearchQuery = searchParams\.get\("q"\)\?\.trim\(\) \?\? ""/);
   assert.match(homePageSource, /const activeTag = searchParams\.get\("tag"\)\?\.trim\(\) \?\? ""/);
-  assert.match(homePageSource, /const \[searchSort, setSearchSort\] = useState<SortKey>\("hot"\)/);
-  assert.match(homePageSource, /const \[searchView, setSearchView\] = useState<ViewMode>\("grid"\)/);
-  assert.match(homePageSource, /const resetSearchResults = useCallback\(\(\) => \{\s*setSearchPage\(1\);\s*setSearchSort\("hot"\);/);
-  assert.match(homePageSource, /const handleSearch = useCallback\(\(keyword: string\) => \{[\s\S]*?const q = keyword\.trim\(\);[\s\S]*?setSearchParams\(/);
-  assert.match(homePageSource, /next\.set\("q", q\);[\s\S]*?next\.delete\("tag"\);/);
-  assert.match(homePageSource, /next\.delete\("q"\);/);
-  assert.match(homePageSource, /\{ replace: true \}/);
-  assert.match(homePageSource, /<SearchPanel[\s\S]*?value=\{activeSearchQuery\}[\s\S]*?onSearch=\{handleSearch\}[\s\S]*?variant="uiverse"[\s\S]*?placeholder=""[\s\S]*?\/>/);
+  assert.match(homePageSource, /const searchSort = readListingSort\(searchParams\)/);
+  assert.match(homePageSource, /const searchView = readListingView\(searchParams\)/);
+  assert.doesNotMatch(homePageSource, /const handleSearch = useCallback/);
+  assert.doesNotMatch(homePageSource, /next\.delete\("tag"\)/);
+  assert.match(homePageSource, /<SearchPanel[\s\S]*?navigationPath="\/"[\s\S]*?variant="uiverse"[\s\S]*?placeholder=""[\s\S]*?\/>/);
   assert.match(homePageSource, /className="search-panel--public search-panel--transparent"/);
-  assert.match(homePageSource, /const searchPageSize = isMobile\s*\? MOBILE_VIDEO_PAGE_SIZE\s*:\s*HOME_SEARCH_DESKTOP_PAGE_SIZE/);
-  assert.match(homePageSource, /fetchListing\(searchPage,\s*searchPageSize,\s*\{[\s\S]*?q: activeSearchQuery,[\s\S]*?tag: activeTag,[\s\S]*?sort: searchSort/);
-  assert.match(homePageSource, /setSearchPage\(1\);\s*\}, \[searchPageSize\]\)/);
-  assert.match(homePageSource, /setSearchPage\(1\);\s*setSearchSort\("hot"\);\s*\}, \[activeSearchQuery, activeTag\]\)/);
+  assert.match(homePageSource, /const batchSize = isMobile\s*\? MOBILE_VIDEO_PAGE_SIZE\s*:\s*HOME_DESKTOP_BATCH_SIZE/);
+  assert.match(homePageSource, /listingFeedSource\(\{[\s\S]*?q: activeSearchQuery,[\s\S]*?tag: activeTag,[\s\S]*?sort: searchSort,[\s\S]*?pageSize: batchSize/);
+  assert.doesNotMatch(homePageSource, /useListingQuery|<Pagination/);
+  assert.match(homePageSource, /withListingPage\(current, 1\)/);
   assert.match(homePageSource, /const hasActiveTag = activeTag\.length > 0/);
   assert.match(homePageSource, /const hasActiveFilter = hasActiveSearch \|\| hasActiveTag/);
   assert.doesNotMatch(homePageSource, /搜索结果：/);
   assert.match(homePageSource, /<SortToolbar[\s\S]*?sort=\{searchSort\}[\s\S]*?view=\{searchView\}/);
-  assert.match(homePageSource, /setSearchSort\(nextSort\);[\s\S]*?setSearchPage\(1\);/);
-  assert.match(homePageSource, /onViewChange=\{setSearchView\}/);
-  assert.match(homePageSource, /compact=\{searchView === "compact"\}/);
-  assert.match(homePageSource, /variant="no-results"[\s\S]*?text="未查询到"[\s\S]*?className="admin-empty-state admin-empty-state--plain home-empty-state"/);
-  assert.match(homePageSource, /const searchTotalPages = Math\.max\(1, Math\.ceil\(searchTotal \/ searchPageSize\)\)/);
-  assert.match(homePageSource, /<Pagination[\s\S]*?page=\{searchPage\}[\s\S]*?pageSize=\{searchPageSize\}/);
-  assert.match(homePageSource, /const hasAnyVideos = ranking\.length > 0 \|\| latest\.length > 0/);
-  assert.match(homePageSource, /const \[latestError, setLatestError\] = useState\(false\)/);
-  assert.match(homePageSource, /const hasHomeError = rankingError \|\| latestError/);
-  assert.match(homePageSource, /const showEmptyHome = !homeLoading && !hasHomeError && !hasAnyVideos/);
-  assert.match(homePageSource, /const homeRequestVersion = useRef\(1\)/);
-  assert.match(homePageSource, /if \(requestVersion !== homeRequestVersion\.current\) return/);
-  assert.match(homePageSource, /emptyText=\{latestError \? "最新视频加载失败，请刷新重试" : undefined\}/);
-  assert.doesNotMatch(homePageSource, /cachedRanking = null;\s*setRankingVideos\(\[\]\);\s*setRankingError\(true\)/);
-  assert.match(homePageSource, /\{!hasActiveSearch && \(\s*hasAnyVideos \|\| hasActiveTag \? \(\s*<TagCloud linkBasePath="\/" onTagSelect=\{resetSearchResults\} \/>\s*\) : \(\s*<div className="tag-cloud-container is-reserved" aria-hidden="true" \/>\s*\)\s*\)\}/);
-  assert.match(homePageSource, /<SectionHeader title="随机推荐" \/>/);
-  assert.match(homePageSource, /<SectionHeader title="最新视频" \/>/);
+  assert.match(homePageSource, /withListingNavigation\(current, \{ sort: nextSort, page: 1 \}\)/);
+  assert.match(homePageSource, /withListingView\(current, nextView\)/);
+  assert.match(homePageSource, /compact=\{hasActiveFilter && searchView === "compact"\}/);
+  assert.match(homePageSource, /variant=\{hasActiveFilter \? "no-results" : "empty"\}[\s\S]*?text=\{hasActiveFilter \? "未查询到" : "当前库中没有视频"\}/);
+  assert.match(homePageSource, /<VirtualVideoGrid[\s\S]*?onLoadMore=\{homeFeed\.loadMore\}/);
+  assert.match(homePageSource, /const feedHasContent = feedItems\.length > 0/);
+  assert.match(homePageSource, /<TagCloud linkBasePath="\/" \/>/);
+  assert.doesNotMatch(homePageSource, /is-reserved/);
+  // 两个推荐列表改成一个 tab 栏，不再各占一个 section。
+  assert.match(homePageSource, /<HomeFeedTabs\s+feed=\{feed\}/);
+  assert.doesNotMatch(homePageSource, /<SectionHeader/);
   assert.doesNotMatch(homePageSource, /随机展示/);
   assert.doesNotMatch(homePageSource, /共 \$\{latest\.length\} 个/);
   assert.match(homePageSource, /className="container page-section home-discovery-section"/);
   assert.match(homePageSource, /className="container page-section home-primary-section"/);
-  assert.match(homePageSource, /variant="empty"[\s\S]*?text="当前库中没有视频"[\s\S]*?className="admin-empty-state admin-empty-state--plain home-empty-state"/);
+  assert.match(homePageSource, /className="admin-empty-state admin-empty-state--plain home-empty-state"/);
   assert.doesNotMatch(homePageSource, /className="home-empty"/);
   assert.doesNotMatch(homePageSource, /当前没有可播放视频/);
 

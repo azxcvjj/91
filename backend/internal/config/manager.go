@@ -24,14 +24,21 @@ var ErrVersionConflict = errors.New("config.yaml changed since it was loaded")
 // LiveSettings is the subset of config.yaml that the running process can
 // safely apply without rebuilding its long-lived dependencies.
 type LiveSettings struct {
-	NightlyStartTime string `json:"nightlyStartTime"`
+	ThumbnailConcurrency   int    `json:"thumbnailConcurrency"`
+	FingerprintConcurrency int    `json:"fingerprintConcurrency"`
+	NightlyDisabled        bool   `json:"nightlyDisabled"`
+	NightlyStartTime       string `json:"nightlyStartTime"`
+	NightlyTimezone        string `json:"nightlyTimezone"`
+	BuiltinTagsEnabled     bool   `json:"builtinTagsEnabled"`
+	PreviewConcurrency     int    `json:"previewConcurrency"`
 }
 
 // LegacyRuntimeSettings carries values written by the short-lived SQLite
 // settings implementation. They are consulted only when config.yaml does not
 // yet contain the corresponding field.
 type LegacyRuntimeSettings struct {
-	NightlyStartTime *string
+	NightlyStartTime   *string
+	BuiltinTagsEnabled *bool
 }
 
 type SaveResult struct {
@@ -52,7 +59,7 @@ type Manager struct {
 	// observedVersion also records an invalid external revision so the watcher
 	// reports it once instead of logging the same rejected bytes every second.
 	observedVersion string
-	apply           func(LiveSettings)
+	apply           func(LiveSettings) error
 }
 
 func NewManager(path string) (*Manager, error) {
@@ -74,7 +81,13 @@ func NewManager(path string) (*Manager, error) {
 
 func DefaultLiveSettings() LiveSettings {
 	return LiveSettings{
-		NightlyStartTime: DefaultNightlyStartTime,
+		NightlyDisabled:        DefaultNightlyDisabled,
+		NightlyStartTime:       DefaultNightlyStartTime,
+		NightlyTimezone:        DefaultNightlyTimezone,
+		BuiltinTagsEnabled:     DefaultBuiltinTagsEnabled,
+		PreviewConcurrency:     DefaultGenerationConcurrency,
+		ThumbnailConcurrency:   DefaultGenerationConcurrency,
+		FingerprintConcurrency: DefaultGenerationConcurrency,
 	}
 }
 
@@ -83,7 +96,13 @@ func liveSettingsFromConfig(cfg *Config) LiveSettings {
 		return DefaultLiveSettings()
 	}
 	return LiveSettings{
-		NightlyStartTime: cfg.Nightly.StartTime,
+		NightlyDisabled:        cfg.Nightly.Disabled,
+		NightlyStartTime:       cfg.Nightly.StartTime,
+		NightlyTimezone:        cfg.Nightly.Timezone,
+		BuiltinTagsEnabled:     cfg.Tags.IsBuiltinPackEnabled(),
+		PreviewConcurrency:     cfg.Generation.PreviewConcurrency,
+		ThumbnailConcurrency:   cfg.Generation.ThumbnailConcurrency,
+		FingerprintConcurrency: cfg.Generation.FingerprintConcurrency,
 	}
 }
 
@@ -99,19 +118,24 @@ func (m *Manager) LiveSettings() LiveSettings {
 // SetApply installs the callback used to propagate hot-reloadable fields. It
 // immediately supplies the current snapshot, which prevents consumers from
 // starting with a stale default when wiring order changes.
-func (m *Manager) SetApply(apply func(LiveSettings)) {
+func (m *Manager) SetApply(apply func(LiveSettings) error) error {
 	if m == nil {
-		return
+		return errors.New("configuration manager is unavailable")
 	}
 	m.updateMu.Lock()
 	defer m.updateMu.Unlock()
+	m.mu.RLock()
+	settings := liveSettingsFromConfig(m.current)
+	m.mu.RUnlock()
+	if apply != nil {
+		if err := apply(settings); err != nil {
+			return err
+		}
+	}
 	m.mu.Lock()
 	m.apply = apply
-	settings := liveSettingsFromConfig(m.current)
 	m.mu.Unlock()
-	if apply != nil {
-		apply(settings)
-	}
+	return nil
 }
 
 // ReadYAML returns the bytes currently on disk and their content version.
@@ -149,13 +173,23 @@ func (m *Manager) ReplaceYAML(data []byte, expectedVersion string) (SaveResult, 
 		return SaveResult{}, ErrVersionConflict
 	}
 	restartRequired := hasRestartRequiredChange(currentData, data)
-	if !bytes.Equal(currentData, data) {
-		if err := writeFileAtomically(m.path, data, configFileMode(m.path)); err != nil {
+	fileChanged := !bytes.Equal(currentData, data)
+	fileMode := configFileMode(m.path)
+	if fileChanged {
+		if err := writeFileAtomically(m.path, data, fileMode); err != nil {
 			return SaveResult{}, err
 		}
 	}
 	version := configVersion(data)
-	settings := m.publishLocked(candidate, version)
+	settings, err := m.publishLocked(candidate, version)
+	if err != nil {
+		if fileChanged {
+			if restoreErr := writeFileAtomically(m.path, currentData, fileMode); restoreErr != nil {
+				err = errors.Join(err, fmt.Errorf("restore config after live apply failure: %w", restoreErr))
+			}
+		}
+		return SaveResult{}, fmt.Errorf("apply live configuration: %w", err)
+	}
 	return SaveResult{
 		Version:         version,
 		RestartRequired: restartRequired,
@@ -190,18 +224,27 @@ func (m *Manager) UpdateAdminCredentials(username, password string) error {
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomically(m.path, updated, configFileMode(m.path)); err != nil {
+	fileMode := configFileMode(m.path)
+	if err := writeFileAtomically(m.path, updated, fileMode); err != nil {
 		return err
 	}
-	m.publishLocked(parsed, configVersion(updated))
+	if _, err := m.publishLocked(parsed, configVersion(updated)); err != nil {
+		if restoreErr := writeFileAtomically(m.path, data, fileMode); restoreErr != nil {
+			err = errors.Join(err, fmt.Errorf("restore config after live apply failure: %w", restoreErr))
+		}
+		return fmt.Errorf("apply live configuration: %w", err)
+	}
 	return nil
 }
 
 // MigrateLegacyRuntimeSettings performs a one-time schema migration into the
 // real YAML document. Existing YAML values always win over SQLite values;
 // cron_hour is converted to start_time and then removed to avoid two competing
-// fields. The retired duplicate-review switch is removed at the same boundary;
-// comments and unrelated unknown nodes are retained by yaml.Node encoding.
+// fields. Missing timezone values are made explicit so future scheduling no
+// longer depends on the host. The built-in tag switch is migrated from SQLite
+// when the YAML field is absent. Retired settings and the unused drives field
+// are removed at the same boundary; comments and unrelated unknown nodes are
+// retained by yaml.Node encoding.
 func (m *Manager) MigrateLegacyRuntimeSettings(legacy LegacyRuntimeSettings) (bool, error) {
 	if m == nil {
 		return false, errors.New("configuration manager is unavailable")
@@ -239,18 +282,44 @@ func (m *Manager) MigrateLegacyRuntimeSettings(legacy LegacyRuntimeSettings) (bo
 	if deleteMappingValue(nightly, "cron_hour") {
 		changed = true
 	}
+	if _, exists := mappingValue(nightly, "timezone"); !exists {
+		setScalarValue(nightly, "timezone", parsed.Nightly.Timezone)
+		changed = true
+	}
+	tags, tagsExist := mappingValue(document, "tags")
+	_, builtinTagsExist := mappingValue(tags, "builtin_pack_enabled")
+	if !tagsExist || !builtinTagsExist {
+		enabled := parsed.Tags.IsBuiltinPackEnabled()
+		if legacy.BuiltinTagsEnabled != nil {
+			enabled = *legacy.BuiltinTagsEnabled
+		}
+		tags = ensureMappingValue(document, "tags")
+		setBooleanValue(tags, "builtin_pack_enabled", enabled)
+		changed = true
+	}
 
-	if dedupe, exists := mappingValue(document, "dedupe"); exists {
-		if deleteMappingValue(dedupe, "duplicate_review_enabled") {
-			changed = true
-		}
-		if len(dedupe.Content) == 0 && deleteMappingValue(document, "dedupe") {
-			changed = true
-		}
+	// Drive definitions have always been persisted and loaded from SQLite. Any
+	// YAML drives node is therefore dead configuration and can contain stale
+	// credentials. Remove the complete node regardless of whether it is empty.
+	if deleteMappingValue(document, "drives") {
+		changed = true
+	}
+	// The former per-drive preview limit and shared media budget no longer
+	// control generation. Remove them so the source editor cannot present
+	// ineffective controls alongside the three independent global limits.
+	preview, _ := mappingValue(document, "preview")
+	if deleteMappingValue(preview, "concurrency") {
+		changed = true
+	}
+	generation, _ := mappingValue(document, "generation")
+	if deleteMappingValue(generation, "media_concurrency") {
+		changed = true
 	}
 
 	if !changed {
-		m.publishLocked(parsed, configVersion(data))
+		if _, err := m.publishLocked(parsed, configVersion(data)); err != nil {
+			return false, err
+		}
 		return false, nil
 	}
 	var out bytes.Buffer
@@ -268,10 +337,16 @@ func (m *Manager) MigrateLegacyRuntimeSettings(legacy LegacyRuntimeSettings) (bo
 	if err != nil {
 		return false, fmt.Errorf("validate migrated config: %w", err)
 	}
-	if err := writeFileAtomically(m.path, migratedData, configFileMode(m.path)); err != nil {
+	fileMode := configFileMode(m.path)
+	if err := writeFileAtomically(m.path, migratedData, fileMode); err != nil {
 		return false, err
 	}
-	m.publishLocked(migrated, configVersion(migratedData))
+	if _, err := m.publishLocked(migrated, configVersion(migratedData)); err != nil {
+		if restoreErr := writeFileAtomically(m.path, data, fileMode); restoreErr != nil {
+			err = errors.Join(err, fmt.Errorf("restore config after migration apply failure: %w", restoreErr))
+		}
+		return false, fmt.Errorf("apply migrated live configuration: %w", err)
+	}
 	return true, nil
 }
 
@@ -294,14 +369,16 @@ func (m *Manager) Reload() (bool, error) {
 	if version == observedVersion {
 		return false, nil
 	}
-	m.mu.Lock()
-	m.observedVersion = version
-	m.mu.Unlock()
 	parsed, err := Parse(data)
 	if err != nil {
+		m.mu.Lock()
+		m.observedVersion = version
+		m.mu.Unlock()
 		return false, err
 	}
-	m.publishLocked(parsed, version)
+	if _, err := m.publishLocked(parsed, version); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 
@@ -326,19 +403,30 @@ func (m *Manager) Watch(ctx context.Context) {
 	}
 }
 
-// publishLocked requires updateMu. The callback runs after the snapshot lock is
-// released but before another publication can overtake it.
-func (m *Manager) publishLocked(cfg *Config, version string) LiveSettings {
+// publishLocked requires updateMu. Changed live settings are applied before the
+// validated snapshot becomes visible. A failed callback is asked to restore the
+// previous projection, while callers retain or restore the previous YAML bytes.
+func (m *Manager) publishLocked(cfg *Config, version string) (LiveSettings, error) {
+	settings := liveSettingsFromConfig(cfg)
+	m.mu.RLock()
+	previous := liveSettingsFromConfig(m.current)
+	apply := m.apply
+	m.mu.RUnlock()
+
+	if apply != nil && settings != previous {
+		if err := apply(settings); err != nil {
+			if rollbackErr := apply(previous); rollbackErr != nil {
+				return settings, errors.Join(err, fmt.Errorf("restore previous live settings: %w", rollbackErr))
+			}
+			return settings, err
+		}
+	}
+
 	m.mu.Lock()
 	m.current = cfg
 	m.observedVersion = version
-	apply := m.apply
-	settings := liveSettingsFromConfig(cfg)
 	m.mu.Unlock()
-	if apply != nil {
-		apply(settings)
-	}
-	return settings
+	return settings, nil
 }
 
 func configVersion(data []byte) string {
@@ -395,6 +483,12 @@ func removeLiveDocumentValues(document any) {
 	}
 	removeNestedValue(root, "nightly", "start_time")
 	removeNestedValue(root, "nightly", "cron_hour")
+	removeNestedValue(root, "nightly", "timezone")
+	removeNestedValue(root, "nightly", "disabled")
+	removeNestedValue(root, "tags", "builtin_pack_enabled")
+	removeNestedValue(root, "generation", "preview_concurrency")
+	removeNestedValue(root, "generation", "thumbnail_concurrency")
+	removeNestedValue(root, "generation", "fingerprint_concurrency")
 }
 
 func removeNestedValue(root map[string]any, section, key string) {

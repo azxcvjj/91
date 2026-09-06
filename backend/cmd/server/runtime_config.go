@@ -2,15 +2,17 @@ package main
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
+	"github.com/video-site/backend/internal/tasklimit"
 )
 
 const (
-	legacyNightlyStartTimeSetting         = "automation.nightly_start_time"
-	obsoleteDuplicateReviewEnabledSetting = "dedupe.duplicate_review_enabled"
-	legacySettingMissing                  = "\x00video-site-config-setting-missing\x00"
+	legacyNightlyStartTimeSetting   = "automation.nightly_start_time"
+	legacyBuiltinTagsEnabledSetting = "tags.builtin_pack_enabled"
+	legacySettingMissing            = "\x00video-site-config-setting-missing\x00"
 )
 
 func (a *App) liveConfigSettings() config.LiveSettings {
@@ -20,15 +22,42 @@ func (a *App) liveConfigSettings() config.LiveSettings {
 	return a.configManager.LiveSettings()
 }
 
-func (a *App) applyLiveConfig(settings config.LiveSettings) {
-	if a == nil || a.nightlyRunner == nil {
-		return
+func (a *App) applyLiveConfig(ctx context.Context, settings config.LiveSettings) error {
+	if a == nil {
+		return nil
 	}
-	// The configuration parser already validated and normalized this value.
-	// Runner validates again at its own boundary as a defensive invariant.
-	if err := a.nightlyRunner.UpdateStartTime(settings.NightlyStartTime); err != nil {
-		return
+	if a.nightlyRunner != nil {
+		// The configuration parser already validated and normalized these values.
+		// Runner validates again and swaps the schedule state atomically at its boundary.
+		if err := a.nightlyRunner.UpdateSchedule(
+			settings.NightlyStartTime,
+			settings.NightlyTimezone,
+			settings.NightlyDisabled,
+		); err != nil {
+			return fmt.Errorf("update nightly schedule: %w", err)
+		}
 	}
+	thumbnails, previews, fingerprints := a.generationLimits()
+	thumbnails.SetLimit(settings.ThumbnailConcurrency)
+	previews.SetLimit(settings.PreviewConcurrency)
+	fingerprints.SetLimit(settings.FingerprintConcurrency)
+	if a.cat == nil {
+		return nil
+	}
+	changed, err := a.cat.SetBuiltinTagsEnabled(ctx, settings.BuiltinTagsEnabled)
+	if err != nil {
+		return fmt.Errorf("apply built-in tag configuration: %w", err)
+	}
+	if !changed {
+		return nil
+	}
+	if a.onTagsChanged != nil {
+		a.onTagsChanged()
+	}
+	if settings.BuiltinTagsEnabled {
+		a.startTagRetag(ctx)
+	}
+	return nil
 }
 
 func loadLegacyRuntimeSettings(ctx context.Context, cat *catalog.Catalog) (config.LegacyRuntimeSettings, error) {
@@ -42,5 +71,29 @@ func loadLegacyRuntimeSettings(ctx context.Context, cat *catalog.Catalog) (confi
 			legacy.NightlyStartTime = &normalized
 		}
 	}
+	builtinTagsEnabled, err := cat.BuiltinTagsEnabled(ctx)
+	if err != nil {
+		return legacy, err
+	}
+	legacy.BuiltinTagsEnabled = &builtinTagsEnabled
 	return legacy, nil
+}
+
+// generationLimits initializes shared budgets once. Live updates resize these
+// objects so active, newly attached and replaced workers all observe the limit.
+func (a *App) generationLimits() (*tasklimit.Limiter, *tasklimit.Limiter, *tasklimit.Limiter) {
+	a.generationLimitsOnce.Do(func() {
+		limits := config.Generation{
+			ThumbnailConcurrency:   config.DefaultGenerationConcurrency,
+			PreviewConcurrency:     config.DefaultGenerationConcurrency,
+			FingerprintConcurrency: config.DefaultGenerationConcurrency,
+		}
+		if a.cfg != nil {
+			limits = a.cfg.Generation
+		}
+		a.thumbnailLimiter = tasklimit.New(limits.ThumbnailConcurrency)
+		a.previewLimiter = tasklimit.New(limits.PreviewConcurrency)
+		a.fingerprintLimiter = tasklimit.New(limits.FingerprintConcurrency)
+	})
+	return a.thumbnailLimiter, a.previewLimiter, a.fingerprintLimiter
 }

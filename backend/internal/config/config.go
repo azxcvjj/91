@@ -9,17 +9,25 @@ import (
 	"strings"
 	"time"
 
+	"github.com/video-site/backend/internal/atomicfile"
 	"github.com/video-site/backend/internal/localpath"
+	"github.com/video-site/backend/internal/schedule"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	DefaultAdminUsername    = "admin"
-	DefaultAdminPassword    = "admin123"
-	DefaultNightlyStartTime = "01:00"
+	DefaultAdminUsername         = "admin"
+	DefaultAdminPassword         = "admin123"
+	DefaultNightlyDisabled       = false
+	DefaultNightlyStartTime      = "01:00"
+	DefaultNightlyTimezone       = schedule.DefaultTimezone
+	DefaultBuiltinTagsEnabled    = true
+	DefaultGenerationConcurrency = 1
+	MaxGenerationConcurrency     = 5
 )
 
 var ErrInvalidNightlyStartTime = errors.New("nightly start time must use HH:mm")
+var ErrInvalidNightlyTimezone = schedule.ErrInvalidTimezone
 
 var (
 	legacyDefaultVideoExtensions = []string{".mp4", ".mkv", ".mov", ".webm", ".avi"}
@@ -32,10 +40,11 @@ type Config struct {
 	Logging      Logging      `yaml:"logging"`
 	Scanner      Scanner      `yaml:"scanner"`
 	Preview      Preview      `yaml:"preview"`
+	Generation   Generation   `yaml:"generation"`
 	Proxy        Proxy        `yaml:"proxy"`
 	Nightly      Nightly      `yaml:"nightly"`
+	Tags         Tags         `yaml:"tags"`
 	RemoteUpload RemoteUpload `yaml:"remote_upload"`
-	Drives       []Drive      `yaml:"drives"`
 }
 
 type Server struct {
@@ -179,6 +188,30 @@ func setScalarValue(parent *yaml.Node, key, value string) {
 	)
 }
 
+func setBooleanValue(parent *yaml.Node, key string, value bool) {
+	rendered := "false"
+	if value {
+		rendered = "true"
+	}
+	if parent.Kind != yaml.MappingNode {
+		parent.Kind = yaml.MappingNode
+		parent.Content = nil
+	}
+	for i := 0; i+1 < len(parent.Content); i += 2 {
+		if parent.Content[i].Value == key {
+			parent.Content[i+1].Kind = yaml.ScalarNode
+			parent.Content[i+1].Tag = "!!bool"
+			parent.Content[i+1].Value = rendered
+			parent.Content[i+1].Content = nil
+			return
+		}
+	}
+	parent.Content = append(parent.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: rendered},
+	)
+}
+
 type Storage struct {
 	DBPath          string `yaml:"db_path"`
 	LocalPreviewDir string `yaml:"local_preview_dir"`
@@ -227,15 +260,24 @@ func ResolveLoggingPaths(logging Logging, baseDir string) (Logging, error) {
 type Scanner struct {
 	// IntervalSeconds 已废弃。旧版每天 02:00–07:00 窗口内按这个间隔重复扫盘；
 	// 新版统一由 nightly 调度器调度，此字段被忽略，保留仅为兼容旧 yaml。
-	IntervalSeconds int      `yaml:"interval_seconds"`
+	IntervalSeconds int `yaml:"interval_seconds"`
+	// MaxDepth 已废弃。扫描会递归到叶子目录；字段仅用于兼容旧 yaml。
 	MaxDepth        int      `yaml:"max_depth"`
 	VideoExtensions []string `yaml:"video_extensions"`
+}
+
+// Generation bounds work across every drive, independently of scan concurrency.
+type Generation struct {
+	ThumbnailConcurrency   int `yaml:"thumbnail_concurrency"`
+	PreviewConcurrency     int `yaml:"preview_concurrency"`
+	FingerprintConcurrency int `yaml:"fingerprint_concurrency"`
 }
 
 type Preview struct {
 	Enabled         bool   `yaml:"enabled"`
 	FFmpegPath      string `yaml:"ffmpeg_path"`
 	FFprobePath     string `yaml:"ffprobe_path"`
+	FFmpegThreads   int    `yaml:"ffmpeg_threads"`
 	DurationSeconds int    `yaml:"duration_seconds"`
 	Width           int    `yaml:"width"`
 	Segments        int    `yaml:"segments"`
@@ -257,11 +299,27 @@ func (p Proxy) AllowsForcedRelay() bool {
 // 一个进程只跑一条 nightly 流水线；该 cron 时间到达且当天还没跑过时触发。
 // 管理后台「扫描所有网盘」与它共享任务协调器，但只运行扫盘和去重阶段。
 type Nightly struct {
+	// Disabled 阻止每日自然调度触发新的流水线。它不影响管理员手动触发的
+	// 扫描任务，也不会取消已经开始执行的流水线。
+	Disabled bool `yaml:"disabled,omitempty"`
 	// StartTime 是每日触发时间，采用严格的 24 小时 HH:mm 格式。该字段可在
 	// 管理后台热更新；配置面板与源码编辑器都直接读写 config.yaml。
 	StartTime string `yaml:"start_time,omitempty"`
+	// Timezone 是独立于宿主机系统时区的 IANA 时区名。调度时间和每日去重
+	// 日期均按该时区计算；修改它不会修改操作系统时区。
+	Timezone string `yaml:"timezone,omitempty"`
 	// CronHour 仅用于读取旧版配置。启动迁移会把它转换为 start_time。
 	CronHour int `yaml:"cron_hour,omitempty"`
+}
+
+// Tags controls the built-in tag catalog. A pointer preserves the distinction
+// between an omitted legacy field and an explicit false value during migration.
+type Tags struct {
+	BuiltinPackEnabled *bool `yaml:"builtin_pack_enabled,omitempty"`
+}
+
+func (t Tags) IsBuiltinPackEnabled() bool {
+	return t.BuiltinPackEnabled == nil || *t.BuiltinPackEnabled
 }
 
 func NormalizeNightlyStartTime(value string) (string, error) {
@@ -273,21 +331,19 @@ func NormalizeNightlyStartTime(value string) (string, error) {
 	return parsed.Format("15:04"), nil
 }
 
+func NormalizeNightlyTimezone(value string) (string, error) {
+	normalized, _, err := schedule.LoadTimezone(value)
+	if err != nil {
+		return "", ErrInvalidNightlyTimezone
+	}
+	return normalized, nil
+}
+
 type RemoteUpload struct {
 	// DiskReserveBytes 是直链下载期间必须留给数据盘的最小可用空间。
 	DiskReserveBytes int64 `yaml:"disk_reserve_bytes"`
 	// IdleTimeoutSeconds 是响应正文连续无数据时中止任务的秒数。
 	IdleTimeoutSeconds int `yaml:"idle_timeout_seconds"`
-}
-
-// Drive 配置项中的敏感字段（Cookie / RefreshToken 等）最终由管理后台写入 DB
-// 这里保留 yaml 中的静态定义，用于启动时预置盘。生产建议只在 DB 里维护。
-type Drive struct {
-	ID     string            `yaml:"id"`
-	Kind   string            `yaml:"kind"` // quark / p115 / p123 / pikpak / wopan / guangyapan / onedrive / googledrive / webdav / localstorage
-	Name   string            `yaml:"name"`
-	RootID string            `yaml:"root_id"`
-	Params map[string]string `yaml:"params,omitempty"`
 }
 
 // Load 读取配置；若不存在则从 config.example.yaml 复制一份并返回
@@ -361,6 +417,27 @@ func (c *Config) applyDefaults() error {
 	} else if isLegacyDefaultVideoExtensions(c.Scanner.VideoExtensions) {
 		c.Scanner.VideoExtensions = append(c.Scanner.VideoExtensions, ".strm")
 	}
+	for _, field := range []struct {
+		name  string
+		value *int
+	}{
+		{"thumbnail_concurrency", &c.Generation.ThumbnailConcurrency},
+		{"preview_concurrency", &c.Generation.PreviewConcurrency},
+		{"fingerprint_concurrency", &c.Generation.FingerprintConcurrency},
+	} {
+		if *field.value == 0 {
+			*field.value = DefaultGenerationConcurrency
+		}
+		if *field.value < 1 || *field.value > MaxGenerationConcurrency {
+			return fmt.Errorf("generation.%s must be between 1 and %d", field.name, MaxGenerationConcurrency)
+		}
+	}
+	if c.Preview.FFmpegThreads == 0 {
+		c.Preview.FFmpegThreads = 1
+	}
+	if c.Preview.FFmpegThreads < 1 || c.Preview.FFmpegThreads > 16 {
+		return fmt.Errorf("preview.ffmpeg_threads must be between 1 and 16")
+	}
 	if c.Preview.FFmpegPath == "" {
 		c.Preview.FFmpegPath = "ffmpeg"
 	}
@@ -387,6 +464,19 @@ func (c *Config) applyDefaults() error {
 			return fmt.Errorf("nightly.start_time: %w", err)
 		}
 		c.Nightly.StartTime = startTime
+	}
+	if strings.TrimSpace(c.Nightly.Timezone) == "" {
+		c.Nightly.Timezone = DefaultNightlyTimezone
+	} else {
+		timezone, err := NormalizeNightlyTimezone(c.Nightly.Timezone)
+		if err != nil {
+			return fmt.Errorf("nightly.timezone: %w", err)
+		}
+		c.Nightly.Timezone = timezone
+	}
+	if c.Tags.BuiltinPackEnabled == nil {
+		enabled := DefaultBuiltinTagsEnabled
+		c.Tags.BuiltinPackEnabled = &enabled
 	}
 	if c.RemoteUpload.DiskReserveBytes <= 0 {
 		c.RemoteUpload.DiskReserveBytes = 1 << 30
@@ -441,10 +531,7 @@ func writeFileAtomically(path string, data []byte, mode os.FileMode) error {
 	// Windows) reject syncing directory handles. The rename has already committed
 	// at this point, so returning an error would falsely tell callers that the
 	// save failed even though config.yaml was replaced.
-	if dirHandle, err := os.Open(dir); err == nil {
-		_ = dirHandle.Sync()
-		_ = dirHandle.Close()
-	}
+	_ = atomicfile.SyncDirectory(dir)
 	return nil
 }
 

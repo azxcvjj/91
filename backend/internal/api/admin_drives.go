@@ -1,36 +1,20 @@
 package api
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 
 	"github.com/video-site/backend/internal/catalog"
+	drivepkg "github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
 )
 
 func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	drives, err := a.Catalog.ListDrives(r.Context())
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	teaserCounts, err := a.Catalog.CountTeasersByDrive(r.Context())
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	thumbnailCounts, err := a.Catalog.CountThumbnailsByDrive(r.Context())
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	fingerprintCounts, err := a.Catalog.CountFingerprintsByDrive(r.Context())
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	transcodeCounts, err := a.Catalog.CountTranscodesByDrive(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -38,6 +22,16 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 	generationStatuses := map[string]DriveGenerationStatuses{}
 	if a.GetDriveGenerationStatuses != nil {
 		generationStatuses = a.GetDriveGenerationStatuses()
+	}
+	assetStats, err := a.Catalog.CountDriveAssetStats(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	scanResults, err := a.Catalog.LatestScanResults(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
 	}
 	// 出参不返回凭证明文，只告诉前端是否已配置
 	type out struct {
@@ -49,6 +43,7 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		Status        string `json:"status"`
 		LastError     string `json:"lastError,omitempty"`
 		HasCredential bool   `json:"hasCredential"`
+		CanUpload     bool   `json:"canUpload"`
 		// TeaserEnabled 控制是否给本盘生成预览视频；封面生成不受影响。
 		// 前端用它在网盘列表/编辑表单展示开关状态。
 		TeaserEnabled bool `json:"teaserEnabled"`
@@ -73,22 +68,22 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		FingerprintReadyCount         int              `json:"fingerprintReadyCount"`
 		FingerprintPendingCount       int              `json:"fingerprintPendingCount"`
 		FingerprintFailedCount        int              `json:"fingerprintFailedCount"`
-		TranscodeGenerationStatus     GenerationStatus `json:"transcodeGenerationStatus"`
-		TranscodePendingCount         int              `json:"transcodePendingCount"`
-		TranscodeReadyCount           int              `json:"transcodeReadyCount"`
-		TranscodeFailedCount          int              `json:"transcodeFailedCount"`
-		TranscodeSkippedCount         int              `json:"transcodeSkippedCount"`
 	}
 	list := make([]out, 0, len(drives))
 	for _, d := range drives {
 		if isCrawlerDriveKind(d.Kind) {
 			continue
 		}
-		counts := teaserCounts[d.ID]
-		thumbCounts := thumbnailCounts[d.ID]
-		fingerprintCount := fingerprintCounts[d.ID]
-		transcodeCount := transcodeCounts[d.ID]
+		counts := assetStats.Teasers[d.ID]
+		thumbCounts := assetStats.Thumbnails[d.ID]
+		fingerprintCount := assetStats.Fingerprints[d.ID]
 		generation := generationStatuses[d.ID]
+		if result, ok := scanResults[d.ID]; ok && (generation.Scan.State == "" || generation.Scan.State == "idle") {
+			generation.Scan.State = string(result.State)
+			generation.Scan.ScannedCount = result.ScannedCount
+			generation.Scan.AddedCount = result.AddedCount
+			generation.Scan.Result = &result
+		}
 		if generation.Scan.State == "" {
 			generation.Scan.State = "idle"
 		}
@@ -100,9 +95,6 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		}
 		if generation.Fingerprint.State == "" {
 			generation.Fingerprint.State = "idle"
-		}
-		if generation.Transcode.State == "" {
-			generation.Transcode.State = "idle"
 		}
 		// last_crawl_at 是后端自动写入的运行状态字段，不计入 hasCredential 判定。
 		hasCred := false
@@ -129,6 +121,7 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 			RootID: d.RootID, ScanRootID: d.ScanRootID,
 			Status: d.Status, LastError: d.LastError,
 			HasCredential:                 hasCred,
+			CanUpload:                     drivepkg.CapabilitiesForKind(d.Kind).Upload,
 			TeaserEnabled:                 d.TeaserEnabled,
 			SkipDirIDs:                    append([]string{}, d.SkipDirIDs...),
 			LastCrawlAt:                   lastCrawlAt,
@@ -147,11 +140,6 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 			FingerprintReadyCount:         fingerprintCount.Ready,
 			FingerprintPendingCount:       fingerprintCount.Pending,
 			FingerprintFailedCount:        fingerprintCount.Failed,
-			TranscodeGenerationStatus:     generation.Transcode,
-			TranscodePendingCount:         transcodeCount.Pending,
-			TranscodeReadyCount:           transcodeCount.Ready,
-			TranscodeFailedCount:          transcodeCount.Failed,
-			TranscodeSkippedCount:         transcodeCount.Skipped,
 		})
 	}
 	writeJSON(w, http.StatusOK, list)
@@ -185,15 +173,37 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "id and kind are required", http.StatusBadRequest)
 		return
 	}
-	// 凭证 / TeaserEnabled 都支持 "未传 = 沿用旧值"：先把现存 drive 拉出来一次。
-	var existing *catalog.Drive
-	if existingDrive, err := a.Catalog.GetDrive(r.Context(), body.ID); err == nil {
-		existing = existingDrive
-	}
 	if !isSupportedDriveKind(body.Kind) {
 		http.Error(w, "unsupported drive kind", http.StatusBadRequest)
 		return
 	}
+	configLease, ok := a.beginDriveConfigUpdate(w, body.ID)
+	if !ok {
+		return
+	}
+	if configLease != nil {
+		defer configLease.Release()
+	}
+
+	// 凭证 / TeaserEnabled 都支持 "未传 = 沿用旧值"：先把现存 drive 拉出来一次。
+	// 只有确实不存在才进入新建路径；读取失败时继续保存会误判变更类型，甚至把
+	// 同 ID 的现有凭证当成新网盘整组替换。
+	var existing *catalog.Drive
+	existingDrive, err := a.Catalog.GetDrive(r.Context(), body.ID)
+	switch {
+	case err == nil:
+		existing = existingDrive
+	case errors.Is(err, sql.ErrNoRows):
+		// New drive.
+	default:
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Existing drives use credential-patch semantics. Access/refresh tokens and
+	// cookies may rotate after an edit form was opened; replacing the form's
+	// complete snapshot would roll those runtime updates back. A kind change is
+	// intentionally a replacement so credentials never leak across providers.
+	patchCredentials := existing != nil && existing.Kind == body.Kind && body.Kind != scriptcrawler.Kind
 	if body.Kind == scriptcrawler.Kind {
 		credentials, err := mergeScriptCrawlerCredentials(existing, body.Credentials)
 		if err != nil {
@@ -202,13 +212,15 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 		}
 		body.Credentials = credentials
 	} else if body.Kind == "googledrive" {
-		body.Credentials = mergeGoogleDriveCredentials(existing, body.Credentials)
-	} else if body.Kind == "localstorage" || body.Kind == "guangyapan" || body.Kind == "webdav" {
-		// 按键合并、空值沿用旧值：这些网盘的编辑表单允许只改某几个字段，
-		// 其它 token / 路径 / 开关字段应保留旧值。
-		body.Credentials = mergeNonEmptyCredentials(existing, body.Credentials)
-	} else if len(body.Credentials) == 0 && existing != nil && len(existing.Credentials) > 0 {
-		body.Credentials = existing.Credentials
+		if patchCredentials {
+			body.Credentials = googleDriveCredentialPatch(body.Credentials)
+		} else {
+			body.Credentials = mergeGoogleDriveCredentials(nil, body.Credentials)
+		}
+	} else if body.Kind == "onedrive" && patchCredentials {
+		body.Credentials = oneDriveCredentialPatch(body.Credentials)
+	} else {
+		body.Credentials = nonEmptyCredentials(body.Credentials)
 	}
 
 	// teaserEnabled 解析顺序：
@@ -225,33 +237,144 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 
 	// skipDirIds 解析顺序：
 	//   1. 请求显式带了（包括空数组）→ 用请求值（空数组 = 清空）
-	//   2. 请求没带 + 编辑现有 drive → 沿用旧值
-	//   3. 请求没带 + 新建 drive → nil（不跳过任何目录）
+	//   2. 请求没带 → 在 catalog 的冲突更新 SQL 中保留当前值，避免这里先读到
+	//      旧值后与跳过目录自动保存发生丢失更新；新建 drive 仍写入空数组。
 	var skipDirIDs []string
-	switch {
-	case body.SkipDirIDs != nil:
+	if body.SkipDirIDs != nil {
 		skipDirIDs = *body.SkipDirIDs
-	case existing != nil:
-		skipDirIDs = existing.SkipDirIDs
 	}
 
+	// Status is only the initial value for a new row. Catalog configuration
+	// upserts preserve status/last_error on conflicts; the mounted runtime owns
+	// subsequent connection-state updates.
 	d := &catalog.Drive{
 		ID: body.ID, Kind: body.Kind, Name: body.Name,
-		RootID:        body.RootID,
+		RootID:        catalog.NormalizeDriveRootID(body.Kind, body.RootID),
 		Credentials:   body.Credentials,
 		Status:        "disconnected",
 		TeaserEnabled: teaserEnabled,
 		SkipDirIDs:    skipDirIDs,
 	}
-	if err := a.Catalog.UpsertDrive(r.Context(), d); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+	runtimeReload := driveRuntimeReloadRequired(existing, d)
+	teaserChanged := existing != nil && existing.TeaserEnabled != teaserEnabled
+	updateScope := DriveConfigUpdateScope(0)
+	if runtimeReload {
+		updateScope |= DriveConfigUpdateRuntime
+	}
+	if teaserChanged {
+		updateScope |= DriveConfigUpdatePreview
+	}
+	if body.SkipDirIDs != nil {
+		updateScope |= DriveConfigUpdateScan
+	}
+	if !authorizeDriveConfigUpdate(w, configLease, updateScope) {
 		return
 	}
-	if a.OnDriveSaved != nil {
-		if err := a.OnDriveSaved(body.ID); err != nil {
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "warning": err.Error()})
-			return
+
+	saveErr := a.Catalog.UpsertDriveWithOptions(r.Context(), d, catalog.DriveUpsertOptions{
+		ReplaceSkipDirIDs:    body.SkipDirIDs != nil,
+		ReplaceTeaserEnabled: body.TeaserEnabled != nil,
+		PatchCredentials:     patchCredentials,
+	})
+	if saveErr != nil {
+		writeErr(w, http.StatusInternalServerError, saveErr)
+		return
+	}
+	deferred := false
+	var runtimeErr error
+	if runtimeReload {
+		wasDeferred, applyErr := commitDriveConfigUpdate(configLease, DriveConfigUpdateRuntime, func() error {
+			if a.OnDriveRuntimeConfigChanged == nil {
+				return nil
+			}
+			return a.OnDriveRuntimeConfigChanged(body.ID)
+		})
+		deferred = deferred || wasDeferred
+		runtimeErr = applyErr
+	}
+	if teaserChanged {
+		wasDeferred, applyErr := commitDriveConfigUpdate(configLease, DriveConfigUpdatePreview, func() error {
+			if a.OnTeaserEnabledChanged != nil {
+				a.OnTeaserEnabledChanged(body.ID, teaserEnabled)
+			}
+			return nil
+		})
+		deferred = deferred || wasDeferred
+		if runtimeErr == nil {
+			runtimeErr = applyErr
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	if body.SkipDirIDs != nil {
+		wasDeferred, applyErr := commitDriveConfigUpdate(configLease, DriveConfigUpdateScan, nil)
+		deferred = deferred || wasDeferred
+		if runtimeErr == nil {
+			runtimeErr = applyErr
+		}
+	}
+	resp := map[string]any{"ok": true}
+	if deferred {
+		resp["deferred"] = true
+		resp["message"] = driveConfigDeferredMessage
+	}
+	if runtimeErr != nil {
+		resp["warning"] = runtimeErr.Error()
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// driveRuntimeReloadRequired separates persisted metadata from the fields
+// captured by a mounted Driver. For an existing non-crawler drive Credentials
+// contains only the explicit JSON patch, so an empty map means the current
+// runtime credentials must be left untouched. Script files can be overwritten
+// in place without changing their path; crawler saves therefore remain
+// conservatively reload-on-save.
+func driveRuntimeReloadRequired(existing, next *catalog.Drive) bool {
+	if existing == nil || next == nil {
+		return true
+	}
+	if existing.Kind != next.Kind || existing.RootID != next.RootID {
+		return true
+	}
+	if next.Kind == scriptcrawler.Kind {
+		return true
+	}
+	return len(next.Credentials) > 0
+}
+
+func (a *AdminServer) beginDriveConfigUpdate(w http.ResponseWriter, driveID string) (DriveConfigUpdateLease, bool) {
+	if a.BeginDriveConfigUpdate == nil {
+		return nil, true
+	}
+	lease, reason := a.BeginDriveConfigUpdate(driveID)
+	if lease != nil {
+		return lease, true
+	}
+	if reason == "" {
+		reason = "当前网盘配置正在更新，请稍后重试"
+	}
+	http.Error(w, reason, http.StatusConflict)
+	return nil, false
+}
+
+func authorizeDriveConfigUpdate(w http.ResponseWriter, lease DriveConfigUpdateLease, scope DriveConfigUpdateScope) bool {
+	if lease == nil {
+		return true
+	}
+	if reason := lease.Authorize(scope); reason != "" {
+		http.Error(w, reason, http.StatusConflict)
+		return false
+	}
+	return true
+}
+
+const driveConfigDeferredMessage = "配置已保存，将在当前网盘任务结束后生效"
+
+func commitDriveConfigUpdate(lease DriveConfigUpdateLease, scope DriveConfigUpdateScope, apply func() error) (bool, error) {
+	if lease != nil {
+		return lease.Commit(scope, apply)
+	}
+	if apply == nil {
+		return false, nil
+	}
+	return false, apply()
 }

@@ -20,8 +20,10 @@ import (
 	"io"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,11 +36,13 @@ import (
 	"github.com/video-site/backend/internal/drives/p115"
 	"github.com/video-site/backend/internal/drives/p123"
 	"github.com/video-site/backend/internal/drives/pikpak"
+	"github.com/video-site/backend/internal/drives/quark"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
 	"github.com/video-site/backend/internal/drives/webdav"
 	"github.com/video-site/backend/internal/drives/wopan"
 	"github.com/video-site/backend/internal/mediaasset"
 	"github.com/video-site/backend/internal/persistence"
+	"github.com/video-site/backend/internal/scopedproxy"
 	"github.com/video-site/backend/internal/videoname"
 )
 
@@ -63,6 +67,14 @@ type uploadTarget interface {
 	EnsureDir(ctx context.Context, pathFromRoot string) (string, error)
 	UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error)
 	Rename(ctx context.Context, fileID, newName string) error
+}
+
+// existingUploadFinder reconciles the deterministic destination name before a
+// new upload. It closes the unavoidable remote-write/catalog-write crash
+// window: after a restart the worker binds the local row to the already-created
+// remote object instead of uploading another copy.
+type existingUploadFinder interface {
+	FindExisting(ctx context.Context, parentID, name string, size int64) (*UploadResult, error)
 }
 
 // LocalSource is the local source interface used by the migration
@@ -104,6 +116,7 @@ type migrationPlan struct {
 	targetDriveID       string
 	target              uploadTarget
 	uploadDir           string
+	uploadProxyURL      string
 	keepLatestN         int
 	requireAssetsReady  bool
 	requirePreviewReady bool
@@ -117,7 +130,8 @@ type migrationPlan struct {
 //     直接共用同名同签名方法会引入循环依赖；
 //  2. driver 包不应该感知 crawlerupload 这一层业务定义。
 type pikpakAdapter struct {
-	d *pikpak.Driver
+	d        *pikpak.Driver
+	existing existingUploadCache
 }
 
 func (a *pikpakAdapter) ID() string     { return a.d.ID() }
@@ -138,7 +152,8 @@ func (a *pikpakAdapter) Rename(ctx context.Context, fileID, newName string) erro
 }
 
 type p115Adapter struct {
-	d *p115.Driver
+	d        *p115.Driver
+	existing existingUploadCache
 }
 
 func (a *p115Adapter) ID() string     { return a.d.ID() }
@@ -159,7 +174,8 @@ func (a *p115Adapter) Rename(ctx context.Context, fileID, newName string) error 
 }
 
 type p123Adapter struct {
-	d *p123.Driver
+	d        *p123.Driver
+	existing existingUploadCache
 }
 
 func (a *p123Adapter) ID() string     { return a.d.ID() }
@@ -180,7 +196,8 @@ func (a *p123Adapter) Rename(ctx context.Context, fileID, newName string) error 
 }
 
 type onedriveAdapter struct {
-	d *onedrive.Driver
+	d        *onedrive.Driver
+	existing existingUploadCache
 }
 
 func (a *onedriveAdapter) ID() string     { return a.d.ID() }
@@ -201,7 +218,8 @@ func (a *onedriveAdapter) Rename(ctx context.Context, fileID, newName string) er
 }
 
 type googledriveAdapter struct {
-	d *googledrive.Driver
+	d        *googledrive.Driver
+	existing existingUploadCache
 }
 
 func (a *googledriveAdapter) ID() string     { return a.d.ID() }
@@ -222,7 +240,8 @@ func (a *googledriveAdapter) Rename(ctx context.Context, fileID, newName string)
 }
 
 type wopanAdapter struct {
-	d *wopan.Driver
+	d        *wopan.Driver
+	existing existingUploadCache
 }
 
 func (a *wopanAdapter) ID() string     { return a.d.ID() }
@@ -243,7 +262,8 @@ func (a *wopanAdapter) Rename(ctx context.Context, fileID, newName string) error
 }
 
 type guangyapanAdapter struct {
-	d *guangyapan.Driver
+	d        *guangyapan.Driver
+	existing existingUploadCache
 }
 
 func (a *guangyapanAdapter) ID() string     { return a.d.ID() }
@@ -264,7 +284,8 @@ func (a *guangyapanAdapter) Rename(ctx context.Context, fileID, newName string) 
 }
 
 type webdavAdapter struct {
-	d *webdav.Driver
+	d        *webdav.Driver
+	existing existingUploadCache
 }
 
 func (a *webdavAdapter) ID() string     { return a.d.ID() }
@@ -282,6 +303,95 @@ func (a *webdavAdapter) UploadAndReportHash(ctx context.Context, parentID, name 
 }
 func (a *webdavAdapter) Rename(ctx context.Context, fileID, newName string) error {
 	return a.d.Rename(ctx, fileID, newName)
+}
+
+type quarkAdapter struct {
+	d        *quark.Driver
+	existing existingUploadCache
+}
+
+func (a *quarkAdapter) ID() string     { return a.d.ID() }
+func (a *quarkAdapter) Kind() string   { return a.d.Kind() }
+func (a *quarkAdapter) RootID() string { return a.d.RootID() }
+func (a *quarkAdapter) EnsureDir(ctx context.Context, pathFromRoot string) (string, error) {
+	return a.d.EnsureDir(ctx, pathFromRoot)
+}
+func (a *quarkAdapter) UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
+	res, err := a.d.UploadAndReportHash(ctx, parentID, name, r, size)
+	if err != nil {
+		return UploadResult{}, err
+	}
+	return UploadResult{FileID: res.FileID, Hash: res.Hash, Size: res.Size}, nil
+}
+func (a *quarkAdapter) Rename(ctx context.Context, fileID, newName string) error {
+	return a.d.Rename(ctx, fileID, newName)
+}
+
+type existingUploadCache struct {
+	byParent map[string]map[string]UploadResult
+}
+
+func findExistingDriveUpload(ctx context.Context, d drives.Drive, cache *existingUploadCache, parentID, name string, size int64) (*UploadResult, error) {
+	if cache == nil {
+		cache = &existingUploadCache{}
+	}
+	if cache.byParent == nil {
+		cache.byParent = make(map[string]map[string]UploadResult)
+	}
+	files, loaded := cache.byParent[parentID]
+	if !loaded {
+		entries, err := d.List(ctx, parentID)
+		if err != nil {
+			return nil, err
+		}
+		files = make(map[string]UploadResult)
+		for _, entry := range entries {
+			if entry.IsDir || strings.TrimSpace(entry.ID) == "" {
+				continue
+			}
+			files[uploadDestinationSignature(entry.Name, entry.Size)] = UploadResult{
+				FileID: entry.ID, Hash: entry.Hash, Size: entry.Size,
+			}
+		}
+		cache.byParent[parentID] = files
+	}
+	result, ok := files[uploadDestinationSignature(name, size)]
+	if !ok {
+		return nil, nil
+	}
+	return &result, nil
+}
+
+func uploadDestinationSignature(name string, size int64) string {
+	return name + "\x00" + strconv.FormatInt(size, 10)
+}
+
+func (a *pikpakAdapter) FindExisting(ctx context.Context, parentID, name string, size int64) (*UploadResult, error) {
+	return findExistingDriveUpload(ctx, a.d, &a.existing, parentID, name, size)
+}
+func (a *p115Adapter) FindExisting(ctx context.Context, parentID, name string, size int64) (*UploadResult, error) {
+	return findExistingDriveUpload(ctx, a.d, &a.existing, parentID, name, size)
+}
+func (a *p123Adapter) FindExisting(ctx context.Context, parentID, name string, size int64) (*UploadResult, error) {
+	return findExistingDriveUpload(ctx, a.d, &a.existing, parentID, name, size)
+}
+func (a *onedriveAdapter) FindExisting(ctx context.Context, parentID, name string, size int64) (*UploadResult, error) {
+	return findExistingDriveUpload(ctx, a.d, &a.existing, parentID, name, size)
+}
+func (a *googledriveAdapter) FindExisting(ctx context.Context, parentID, name string, size int64) (*UploadResult, error) {
+	return findExistingDriveUpload(ctx, a.d, &a.existing, parentID, name, size)
+}
+func (a *wopanAdapter) FindExisting(ctx context.Context, parentID, name string, size int64) (*UploadResult, error) {
+	return findExistingDriveUpload(ctx, a.d, &a.existing, parentID, name, size)
+}
+func (a *guangyapanAdapter) FindExisting(ctx context.Context, parentID, name string, size int64) (*UploadResult, error) {
+	return findExistingDriveUpload(ctx, a.d, &a.existing, parentID, name, size)
+}
+func (a *webdavAdapter) FindExisting(ctx context.Context, parentID, name string, size int64) (*UploadResult, error) {
+	return findExistingDriveUpload(ctx, a.d, &a.existing, parentID, name, size)
+}
+func (a *quarkAdapter) FindExisting(ctx context.Context, parentID, name string, size int64) (*UploadResult, error) {
+	return findExistingDriveUpload(ctx, a.d, &a.existing, parentID, name, size)
 }
 
 // adaptUploadTarget 把通用 drive 包装成 uploadTarget。
@@ -304,6 +414,8 @@ func adaptUploadTarget(d drives.Drive) (uploadTarget, error) {
 		return &guangyapanAdapter{d: v}, nil
 	case *webdav.Driver:
 		return &webdavAdapter{d: v}, nil
+	case *quark.Driver:
+		return &quarkAdapter{d: v}, nil
 	case uploadTarget:
 		// 测试或自定义实现可以直接传入；优先使用具体类型分支以拿到适配器。
 		return v, nil
@@ -321,6 +433,10 @@ type Registry interface {
 type Config struct {
 	Catalog  *catalog.Catalog
 	Registry Registry
+	// GetDrive returns the task-generation configuration snapshot. Production
+	// supplies this while deferred admin edits are pending; tests and standalone
+	// users may omit it to read Catalog directly.
+	GetDrive func(context.Context, string) (*catalog.Drive, error)
 	// Interval 已废弃 —— 旧版迁移 worker 是周期 ticker，新版只通过 nightly
 	// pipeline 调用 RunOnce，不再有内置定时器。保留字段不删是为了兼容外
 	// 部 yaml / 测试代码里仍传值的场景。
@@ -430,26 +546,85 @@ func (m *Migrator) markCooldownLogged() bool {
 // 整轮被 cooldown / context 取消时也通过日志可观测。保留 error 返回签名是为
 // 给未来需要把 nightly 失败状态展示给 admin 用。
 func (m *Migrator) RunOnce(ctx context.Context) error {
-	m.runOnce(ctx)
+	if !m.tryBeginRun() {
+		return nil
+	}
+	defer m.finishRun()
+	m.run(ctx, nil)
 	return nil
 }
 
-// runOnce 单轮：扫所有 scriptcrawler drive，对每条还有本地文件的视频做迁移。
-//
-// 互斥保证：同一 Migrator 内不会并发跑两轮（避免重复上传）。
-func (m *Migrator) runOnce(ctx context.Context) {
+// RunDrives migrates exactly the supplied crawler IDs. The application uses
+// this after admitting the same source set, so a crawler attached concurrently
+// cannot escape task/configuration coordination.
+func (m *Migrator) RunDrives(ctx context.Context, driveIDs []string) error {
+	seen := make(map[string]struct{}, len(driveIDs))
+	cleaned := make([]string, 0, len(driveIDs))
+	for _, driveID := range driveIDs {
+		driveID = strings.TrimSpace(driveID)
+		if driveID == "" {
+			continue
+		}
+		if _, exists := seen[driveID]; exists {
+			continue
+		}
+		seen[driveID] = struct{}{}
+		cleaned = append(cleaned, driveID)
+	}
+	if len(cleaned) == 0 || !m.tryBeginRun() {
+		return nil
+	}
+	defer m.finishRun()
+	m.run(ctx, cleaned)
+	return nil
+}
+
+// StartDrive 原子地占用迁移器并异步迁移指定的单个爬虫。返回 false 表示
+// 此时已有全量或单爬虫迁移在运行；调用方必须把它作为“任务忙”反馈给用户，
+// 不能把这次请求报告成已接受。完成通道只会返回一个结果并随后关闭。
+func (m *Migrator) StartDrive(ctx context.Context, driveID string) (<-chan error, bool) {
+	driveID = strings.TrimSpace(driveID)
+	if driveID == "" || !m.tryBeginRun() {
+		return nil, false
+	}
+	done := make(chan error, 1)
+	go func() {
+		func() {
+			defer m.finishRun()
+			m.run(ctx, []string{driveID})
+		}()
+		done <- nil
+		close(done)
+	}()
+	return done, true
+}
+
+// tryBeginRun synchronously reserves the one global migration slot. The
+// reservation happens before StartDrive reports success, eliminating the old
+// race where the HTTP API returned accepted and the background RunOnce then
+// silently discovered that another migration was already running.
+func (m *Migrator) tryBeginRun() bool {
+	if m == nil {
+		return false
+	}
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.running {
-		m.mu.Unlock()
-		return
+		return false
 	}
 	m.running = true
+	return true
+}
+
+func (m *Migrator) finishRun() {
+	m.mu.Lock()
+	m.running = false
 	m.mu.Unlock()
-	defer func() {
-		m.mu.Lock()
-		m.running = false
-		m.mu.Unlock()
-	}()
+}
+
+// run executes either the global nightly migration (driveIDs nil) or exactly
+// the explicitly selected crawler set.
+func (m *Migrator) run(ctx context.Context, driveIDs []string) {
 
 	// captcha 冷却期间整轮跳过 —— 不做任何 PikPak API 调用、不做本地清理，
 	// 等冷却结束。这样从用户视角看：进入冷却 → 一行日志 → 完全静默 → 冷却
@@ -463,7 +638,15 @@ func (m *Migrator) runOnce(ctx context.Context) {
 		log.Printf("[crawlerupload] captcha cooldown ended at %s, resuming migration", until.Format(time.RFC3339))
 	}
 
-	plans := m.migrationPlans(ctx)
+	var plans []migrationPlan
+	if driveIDs == nil {
+		plans = m.migrationPlans(ctx)
+	} else {
+		plans = make([]migrationPlan, 0, len(driveIDs))
+		for _, driveID := range driveIDs {
+			plans = append(plans, m.migrationPlansForDrive(ctx, driveID)...)
+		}
+	}
 	if len(plans) == 0 {
 		// 没目标就静默 —— 用户选择了本地保存，或目标盘还没挂载。
 		return
@@ -477,6 +660,13 @@ func (m *Migrator) runOnce(ctx context.Context) {
 		n, err := m.migrateDrive(ctx, plan)
 		if err != nil {
 			log.Printf("[crawlerupload] drive=%s migrate batch error: %v", plan.source.ID(), err)
+			if _, rateLimited := drives.RateLimitRetryAfter(err); rateLimited {
+				migrated += n
+				if migrated > 0 {
+					log.Printf("[crawlerupload] migrated %d video(s)", migrated)
+				}
+				return
+			}
 		}
 		migrated += n
 		if active, _ := m.inCooldown(); active {
@@ -547,38 +737,70 @@ func (m *Migrator) migrationPlans(ctx context.Context) []migrationPlan {
 	all := m.cfg.Registry.All()
 	out := make([]migrationPlan, 0, len(all))
 	for _, d := range all {
-		if d == nil {
-			continue
+		if plan, ok := m.migrationPlan(ctx, d); ok {
+			out = append(out, plan)
 		}
-		src, ok := d.(LocalSource)
-		if !ok {
-			continue
-		}
-		row, err := m.cfg.Catalog.GetDrive(ctx, d.ID())
-		if err != nil || row == nil || row.Kind != scriptcrawler.Kind {
-			continue
-		}
-		targetID := strings.TrimSpace(row.Credentials["upload_drive_id"])
-		if targetID == "" {
-			continue
-		}
-		resolvedID, target, err := m.resolveTargetID(targetID)
-		if err != nil {
-			log.Printf("[crawlerupload] crawler=%s upload target=%q unavailable: %v", row.ID, targetID, err)
-			continue
-		}
-		out = append(out, migrationPlan{
-			source:              src,
-			row:                 row,
-			targetDriveID:       resolvedID,
-			target:              target,
-			uploadDir:           scriptCrawlerUploadDir(row.ID),
-			keepLatestN:         0,
-			requireAssetsReady:  true,
-			requirePreviewReady: row.TeaserEnabled,
-		})
 	}
 	return out
+}
+
+func (m *Migrator) migrationPlansForDrive(ctx context.Context, driveID string) []migrationPlan {
+	if m == nil || m.cfg.Catalog == nil || m.cfg.Registry == nil {
+		return nil
+	}
+	d, ok := m.cfg.Registry.Get(strings.TrimSpace(driveID))
+	if !ok {
+		return nil
+	}
+	plan, ok := m.migrationPlan(ctx, d)
+	if !ok {
+		return nil
+	}
+	return []migrationPlan{plan}
+}
+
+func (m *Migrator) getDrive(ctx context.Context, driveID string) (*catalog.Drive, error) {
+	if m != nil && m.cfg.GetDrive != nil {
+		return m.cfg.GetDrive(ctx, driveID)
+	}
+	if m == nil || m.cfg.Catalog == nil {
+		return nil, errors.New("catalog not configured")
+	}
+	return m.cfg.Catalog.GetDrive(ctx, driveID)
+}
+
+func (m *Migrator) migrationPlan(ctx context.Context, d drives.Drive) (migrationPlan, bool) {
+	if d == nil {
+		return migrationPlan{}, false
+	}
+	src, ok := d.(LocalSource)
+	if !ok {
+		return migrationPlan{}, false
+	}
+	row, err := m.getDrive(ctx, d.ID())
+	if err != nil || row == nil || row.Kind != scriptcrawler.Kind || !scriptcrawler.IsConfigured(row.Credentials) {
+		return migrationPlan{}, false
+	}
+	targetID := strings.TrimSpace(row.Credentials["upload_drive_id"])
+	if targetID == "" {
+		return migrationPlan{}, false
+	}
+	resolvedID, target, err := m.resolveTargetID(targetID)
+	if err != nil {
+		log.Printf("[crawlerupload] crawler=%s upload target=%q unavailable: %v", row.ID, targetID, err)
+		return migrationPlan{}, false
+	}
+	return migrationPlan{
+		source:              src,
+		row:                 row,
+		targetDriveID:       resolvedID,
+		target:              target,
+		uploadDir:           scriptCrawlerUploadDir(row.ID),
+		uploadProxyURL:      strings.TrimSpace(row.Credentials["upload_proxy"]),
+		keepLatestN:         0,
+		requireAssetsReady:  true,
+		requirePreviewReady: row.TeaserEnabled,
+	}, true
 }
 
 func scriptCrawlerUploadDir(driveID string) string {
@@ -603,6 +825,10 @@ func (m *Migrator) migrateDrive(ctx context.Context, plan migrationPlan) (int, e
 	src := plan.source
 	if src == nil || plan.target == nil || plan.targetDriveID == "" {
 		return 0, nil
+	}
+	uploadCtx, err := scopedproxy.WithURL(ctx, plan.uploadProxyURL)
+	if err != nil {
+		return 0, fmt.Errorf("invalid crawler upload proxy: %w", err)
 	}
 	keepN := plan.keepLatestN
 	if keepN < 0 {
@@ -673,6 +899,7 @@ func (m *Migrator) migrateDrive(ctx context.Context, plan migrationPlan) (int, e
 
 	migrated := 0
 	processed := 0
+	uploadParentID := ""
 	for index, f := range candidates {
 		if err := ctx.Err(); err != nil {
 			return migrated, err
@@ -761,9 +988,23 @@ func (m *Migrator) migrateDrive(ctx context.Context, plan migrationPlan) (int, e
 			}
 		}
 
-		ok, err := m.migrateOne(ctx, v, plan)
+		if uploadParentID == "" {
+			uploadParentID, err = plan.target.EnsureDir(uploadCtx, plan.uploadDir)
+			if err != nil {
+				return migrated, fmt.Errorf("%s ensure %q dir: %w", plan.target.Kind(), plan.uploadDir, err)
+			}
+			if strings.TrimSpace(uploadParentID) == "" {
+				return migrated, fmt.Errorf("%s ensure %q dir returned empty id", plan.target.Kind(), plan.uploadDir)
+			}
+		}
+		ok, err := m.migrateOne(uploadCtx, v, plan, uploadParentID)
 		if err != nil {
 			log.Printf("[crawlerupload] %s: %v", v.ID, err)
+			if _, rateLimited := drives.RateLimitRetryAfter(err); rateLimited {
+				// Provider throttling applies to the batch. Retrying the same
+				// operation for every remaining video only deepens the throttle.
+				return migrated, err
+			}
 			// captcha 错误（4002 / 9）说明 PikPak 当前正拒绝我们；继续在
 			// 同一轮里尝试其它文件大概率会拿到同样的 4002，并且每多一次
 			// 失败就多一份"被风控加深"的风险。立即中止当前 batch 并
@@ -837,7 +1078,7 @@ func (m *Migrator) crawlerVideoAssetsReady(ctx context.Context, v *catalog.Video
 // migrateOne 把单条本地爬虫视频上传到目标盘并改写 catalog。
 // 返回 (true, nil) 表示真的迁了一条；(false, nil) 表示跳过（本地文件已不在等）；
 // (false, err) 表示真出错。
-func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, plan migrationPlan) (bool, error) {
+func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, plan migrationPlan, parent string) (bool, error) {
 	src := plan.source
 	pp := plan.target
 	path, err := src.VideoPath(v.FileID)
@@ -863,11 +1104,23 @@ func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, plan migrat
 	}
 	defer f.Close()
 
-	parent, err := pp.EnsureDir(ctx, plan.uploadDir)
-	if err != nil {
-		return false, fmt.Errorf("%s ensure %q dir: %w", pp.Kind(), plan.uploadDir, err)
-	}
 	uploadName := desiredUploadName(v.Title, sourceIDForUploadName(v, plan), v.Ext)
+	if finder, ok := pp.(existingUploadFinder); ok {
+		existing, err := finder.FindExisting(ctx, parent, uploadName, info.Size())
+		if err != nil {
+			return false, fmt.Errorf("%s reconcile destination: %w", pp.Kind(), err)
+		}
+		if existing != nil {
+			if strings.TrimSpace(existing.FileID) == "" {
+				return false, fmt.Errorf("%s reconcile destination returned empty file id", pp.Kind())
+			}
+			if err := m.completeMigration(ctx, v, plan, *existing, uploadName, parent); err != nil {
+				return false, err
+			}
+			log.Printf("[crawlerupload] %s reconciled existing drive=%s(kind=%s) file=%s name=%q", v.ID, plan.targetDriveID, pp.Kind(), existing.FileID, uploadName)
+			return true, nil
+		}
+	}
 	res, err := pp.UploadAndReportHash(ctx, parent, uploadName, f, info.Size())
 	if err != nil {
 		return false, fmt.Errorf("%s upload: %w", pp.Kind(), err)
@@ -876,27 +1129,50 @@ func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, plan migrat
 		return false, fmt.Errorf("%s returned empty file id", pp.Kind())
 	}
 
-	// 事务性改写 catalog 行：drive_id / file_id / content_hash
-	persistence.RLock()
-	defer persistence.RUnlock()
-	if err := m.cfg.Catalog.MigrateVideoToDrive(ctx, v.ID, plan.targetDriveID, res.FileID, res.Hash); err != nil {
-		return false, fmt.Errorf("catalog migrate: %w", err)
+	if err := m.completeMigration(ctx, v, plan, res, uploadName, parent); err != nil {
+		return false, err
 	}
-	m.preserveCrawledThumbnail(ctx, src, v)
-	// 同步 catalog 里的 file_name，让下次目标盘扫盘时 (file_name, size) 也能匹配上
-	if err := m.cfg.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
-		FileName: uploadName,
-		Title:    videoname.TitleFromFileName(uploadName),
-		TitleSet: true,
-	}); err != nil {
-		log.Printf("[crawlerupload] %s update file_name/title after migrate: %v", v.ID, err)
-	}
-
-	// 删除本地 mp4 和源 thumb（公共 /p/thumb 副本已在 preserveCrawledThumbnail 中保留）。
-	CleanupLocal(src, v.FileID)
 
 	log.Printf("[crawlerupload] %s migrated to drive=%s(kind=%s) file=%s name=%q", v.ID, plan.targetDriveID, pp.Kind(), res.FileID, uploadName)
 	return true, nil
+}
+
+func (m *Migrator) completeMigration(ctx context.Context, v *catalog.Video, plan migrationPlan, res UploadResult, uploadName, parentID string) error {
+	// The catalog rewrite is one atomic UPDATE. If the process stops after the
+	// remote write but before this point, FindExisting reconciles it next run.
+	// Persist the known upload directory now instead of waiting for a later
+	// destination-drive scan to repair an incomplete storage identity.
+	persistence.RLock()
+	defer persistence.RUnlock()
+	title := firstNonEmpty(videoname.TitleFromFileName(uploadName), v.Title)
+	if err := m.cfg.Catalog.MigrateVideoToDrive(ctx, v.ID, catalog.VideoDriveMigration{
+		DriveID:     plan.targetDriveID,
+		FileID:      res.FileID,
+		ContentHash: res.Hash,
+		ParentID:    strings.TrimSpace(parentID),
+		DirName:     uploadDirectoryLabel(plan),
+		FileName:    uploadName,
+		Title:       title,
+	}); err != nil {
+		return fmt.Errorf("catalog migrate: %w", err)
+	}
+	m.preserveCrawledThumbnail(ctx, plan.source, v)
+
+	// 删除本地 mp4 和源 thumb（公共 /p/thumb 副本已在 preserveCrawledThumbnail 中保留）。
+	CleanupLocal(plan.source, v.FileID)
+	return nil
+}
+
+func uploadDirectoryLabel(plan migrationPlan) string {
+	clean := strings.Trim(strings.TrimSpace(plan.uploadDir), "/")
+	label := strings.TrimSpace(path.Base(clean))
+	if label != "" && label != "." {
+		return label
+	}
+	if plan.row != nil {
+		return strings.TrimSpace(plan.row.ID)
+	}
+	return ""
 }
 
 func (m *Migrator) bindToExistingTarget(ctx context.Context, v, target *catalog.Video, plan migrationPlan) (bool, error) {
@@ -908,17 +1184,21 @@ func (m *Migrator) bindToExistingTarget(ctx context.Context, v, target *catalog.
 	}
 	persistence.RLock()
 	defer persistence.RUnlock()
-	if err := m.cfg.Catalog.MigrateVideoToDrive(ctx, v.ID, plan.targetDriveID, target.FileID, firstNonEmpty(target.ContentHash, v.ContentHash)); err != nil {
-		return false, fmt.Errorf("catalog bind existing target: %w", err)
-	}
+	fileName := firstNonEmpty(target.FileName, v.FileName)
+	title := v.Title
 	if target.FileName != "" {
-		if err := m.cfg.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
-			FileName: target.FileName,
-			Title:    videoname.TitleFromFileName(target.FileName),
-			TitleSet: true,
-		}); err != nil {
-			log.Printf("[crawlerupload] %s update file_name/title after duplicate bind: %v", v.ID, err)
-		}
+		title = firstNonEmpty(videoname.TitleFromFileName(target.FileName), title)
+	}
+	if err := m.cfg.Catalog.MigrateVideoToDrive(ctx, v.ID, catalog.VideoDriveMigration{
+		DriveID:     plan.targetDriveID,
+		FileID:      target.FileID,
+		ContentHash: firstNonEmpty(target.ContentHash, v.ContentHash),
+		ParentID:    target.ParentID,
+		DirName:     firstNonEmpty(target.DirName, v.DirName),
+		FileName:    fileName,
+		Title:       title,
+	}); err != nil {
+		return false, fmt.Errorf("catalog bind existing target: %w", err)
 	}
 	m.preserveCrawledThumbnail(ctx, plan.source, v)
 	CleanupLocal(plan.source, v.FileID)

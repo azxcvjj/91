@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -774,11 +775,11 @@ func TestRunReportsSeenVideoFileIDsAndVisitedDirectories(t *testing.T) {
 	if _, ok := stats.SeenFileIDs["empty-video"]; ok {
 		t.Fatalf("seen file ids = %#v, want zero-size entries excluded", stats.SeenFileIDs)
 	}
-	if _, ok := stats.VisitedDirIDs["root"]; !ok {
-		t.Fatalf("visited dir ids = %#v, want root", stats.VisitedDirIDs)
+	if _, ok := stats.EnumeratedDirIDs["root"]; !ok {
+		t.Fatalf("enumerated dir ids = %#v, want root", stats.EnumeratedDirIDs)
 	}
-	if _, ok := stats.VisitedDirIDs["dir-1"]; !ok {
-		t.Fatalf("visited dir ids = %#v, want nested dir", stats.VisitedDirIDs)
+	if _, ok := stats.EnumeratedDirIDs["dir-1"]; !ok {
+		t.Fatalf("enumerated dir ids = %#v, want nested dir", stats.EnumeratedDirIDs)
 	}
 	if stats.Errors != 0 {
 		t.Fatalf("errors = %d, want 0", stats.Errors)
@@ -830,10 +831,10 @@ func TestRunSkipsConfiguredDirIDsAndDoesNotRecurse(t *testing.T) {
 		t.Fatalf("added = %d, want only non-skipped file added", stats.Added)
 	}
 	// skip-dir 自身和它下面的目录 / 文件都不应被访问。
-	if _, ok := stats.VisitedDirIDs["skip-dir"]; ok {
+	if _, ok := stats.EnumeratedDirIDs["skip-dir"]; ok {
 		t.Fatalf("visited skipped dir, want no recursion into skip-dir")
 	}
-	if _, ok := stats.VisitedDirIDs["nested-dir"]; ok {
+	if _, ok := stats.EnumeratedDirIDs["nested-dir"]; ok {
 		t.Fatalf("visited nested dir under skipped, want no descent")
 	}
 	if _, ok := stats.SeenFileIDs["skipped-file"]; ok {
@@ -847,6 +848,351 @@ func TestRunSkipsConfiguredDirIDsAndDoesNotRecurse(t *testing.T) {
 	}
 	if _, err := cat.GetVideo(ctx, "p115-115-normal-file"); err != nil {
 		t.Fatalf("normal video was not added: %v", err)
+	}
+}
+
+func TestDiscoverDoesNotWriteCatalogBeforeReconcile(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	drv := &discoveryTestSource{entries: map[string][]drives.Entry{
+		"root": {{ID: "file-1", Name: "clip.mp4", Size: 123}},
+	}}
+	scan := New(cat, drv, []string{".mp4"}, nil, nil)
+	snapshot, stats, err := scan.Discover(ctx, "")
+	if err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if !snapshot.Complete() || !snapshot.PresenceAuthoritative() {
+		t.Fatalf("snapshot = complete:%v authoritative:%v, want both true", snapshot.Complete(), snapshot.PresenceAuthoritative())
+	}
+	if stats.Scanned != 1 || len(snapshot.Files) != 1 {
+		t.Fatalf("discovery candidates = stats:%d files:%d, want 1", stats.Scanned, len(snapshot.Files))
+	}
+	if _, err := cat.GetVideo(ctx, "fake-drive-file-1"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("discover wrote catalog, lookup error = %v", err)
+	}
+
+	result, err := scan.Reconcile(ctx, snapshot)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if result.Stats.Added != 1 || len(result.NewVideos) != 1 {
+		t.Fatalf("reconcile result = added:%d new:%d, want 1", result.Stats.Added, len(result.NewVideos))
+	}
+	if _, err := cat.GetVideo(ctx, "fake-drive-file-1"); err != nil {
+		t.Fatalf("reconciled video missing: %v", err)
+	}
+}
+
+func TestDiscoverCarriesAncestorDirectoryChain(t *testing.T) {
+	drv := &discoveryTestSource{entries: map[string][]drives.Entry{
+		"root":   {{ID: "series", Name: "Series", IsDir: true}},
+		"series": {{ID: "season", Name: "Season", IsDir: true}},
+		"season": {{ID: "episode", Name: "episode.mp4", Size: 123}},
+	}}
+	snapshot, _, err := New(nil, drv, []string{".mp4"}, nil, nil).Discover(context.Background(), "")
+	if err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if len(snapshot.Files) != 1 {
+		t.Fatalf("files = %#v, want one", snapshot.Files)
+	}
+	if got, want := snapshot.Files[0].AncestorDirIDs, []string{"root", "series", "season"}; !sameStrings(got, want) {
+		t.Fatalf("ancestor dir ids = %#v, want %#v", got, want)
+	}
+}
+
+func TestRunScansDirectoryNamedPreviews(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	drv := &discoveryTestSource{entries: map[string][]drives.Entry{
+		"root":         {{ID: "previews-dir", Name: "previews", IsDir: true}},
+		"previews-dir": {{ID: "user-video", Name: "user-video.mp4", Size: 123}},
+	}}
+	result, err := New(cat, drv, []string{".mp4"}, nil, nil).Scan(ctx, "")
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if result.Stats.Added != 1 {
+		t.Fatalf("added = %d, want 1", result.Stats.Added)
+	}
+	if _, excluded := result.Snapshot.ExcludedDirIDs["previews-dir"]; excluded {
+		t.Fatal("ordinary previews directory was policy-excluded")
+	}
+	if _, err := cat.GetVideo(ctx, "fake-drive-user-video"); err != nil {
+		t.Fatalf("video in previews directory missing: %v", err)
+	}
+}
+
+func TestScanRateLimitWaitsAndRetriesSameDirectory(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	drv := &discoveryTestSource{
+		entries: map[string][]drives.Entry{
+			"root": {
+				{ID: "limited-dir", Name: "Limited", IsDir: true},
+				{ID: "healthy-file", Name: "healthy.mp4", Size: 123},
+			},
+			"limited-dir": {{ID: "limited-file", Name: "limited.mp4", Size: 456}},
+		},
+		errorSequences: map[string][]error{
+			"limited-dir": {&drives.RateLimitError{Provider: "fake", RetryAfter: time.Second}},
+		},
+		listCalls: map[string]int{},
+	}
+	scan := New(cat, drv, []string{".mp4"}, nil, nil)
+	var waited time.Duration
+	scan.RetryWait = func(_ context.Context, duration time.Duration) error {
+		waited = duration
+		return nil
+	}
+	var cooldowns []time.Time
+	scan.OnCooldown = func(until time.Time) { cooldowns = append(cooldowns, until) }
+	result, err := scan.Scan(ctx, "")
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if waited != RateLimitCooldown || drv.listCalls["limited-dir"] != 2 {
+		t.Fatalf("rate-limit wait/calls = %s/%d, want %s/2", waited, drv.listCalls["limited-dir"], RateLimitCooldown)
+	}
+	if scan.RateLimitBudget.UsedRetries() != 1 {
+		t.Fatalf("used retries = %d, want 1", scan.RateLimitBudget.UsedRetries())
+	}
+	if len(cooldowns) != 2 || cooldowns[0].IsZero() || !cooldowns[1].IsZero() {
+		t.Fatalf("cooldown notifications = %#v, want start then clear", cooldowns)
+	}
+	if result.Stats.Added != 2 || !result.Snapshot.Complete() {
+		t.Fatalf("result added/complete = %d/%v, want 2/true", result.Stats.Added, result.Snapshot.Complete())
+	}
+}
+
+func TestScanCancellationDuringRateLimitDoesNotPartiallyReconcile(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	drv := &discoveryTestSource{
+		entries: map[string][]drives.Entry{
+			"root": {
+				{ID: "file-before-cancel", Name: "clip.mp4", Size: 123},
+				{ID: "limited-dir", Name: "Limited", IsDir: true},
+			},
+		},
+		errors: map[string]error{
+			"limited-dir": &drives.RateLimitError{Provider: "fake", RetryAfter: time.Second},
+		},
+	}
+	scan := New(cat, drv, []string{".mp4"}, nil, nil)
+	scan.RetryWait = func(_ context.Context, _ time.Duration) error {
+		cancel()
+		return ctx.Err()
+	}
+	result, err := scan.Scan(ctx, "")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("scan error = %v, want context.Canceled", err)
+	}
+	if result.Stats.Scanned != 1 || result.Stats.Added != 0 {
+		t.Fatalf("partial result = scanned:%d added:%d, want 1/0", result.Stats.Scanned, result.Stats.Added)
+	}
+	if _, err := cat.GetVideo(context.Background(), "fake-drive-file-before-cancel"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("canceled discovery partially reconciled catalog, lookup error = %v", err)
+	}
+}
+
+func TestScanStopsAfterThreeRateLimitCooldownRetries(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	drv := &discoveryTestSource{
+		errors:    map[string]error{"root": &drives.RateLimitError{Provider: "fake", RetryAfter: time.Second}},
+		listCalls: map[string]int{},
+	}
+	scan := New(cat, drv, []string{".mp4"}, nil, nil)
+	waits := 0
+	scan.RetryWait = func(_ context.Context, duration time.Duration) error {
+		waits++
+		if duration != RateLimitCooldown {
+			t.Fatalf("cooldown = %s, want %s", duration, RateLimitCooldown)
+		}
+		return nil
+	}
+	_, err = scan.Scan(ctx, "")
+	if !errors.Is(err, ErrRateLimitBudgetExhausted) {
+		t.Fatalf("scan error = %v, want ErrRateLimitBudgetExhausted", err)
+	}
+	if waits != RateLimitRetryLimit || drv.listCalls["root"] != RateLimitRetryLimit+1 {
+		t.Fatalf("waits/list calls = %d/%d, want %d/%d", waits, drv.listCalls["root"], RateLimitRetryLimit, RateLimitRetryLimit+1)
+	}
+}
+
+func TestScanStopsWhenChildExhaustsSharedRateLimitBudget(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	drv := &discoveryTestSource{
+		entries: map[string][]drives.Entry{
+			"root": {
+				{ID: "file-before-limit", Name: "before.mp4", Size: 123},
+				{ID: "limited-dir", Name: "Limited", IsDir: true},
+				{ID: "later-dir", Name: "Later", IsDir: true},
+			},
+			"later-dir": {{ID: "later-file", Name: "later.mp4", Size: 456}},
+		},
+		errors: map[string]error{
+			"limited-dir": &drives.RateLimitError{Provider: "fake", RetryAfter: time.Second},
+		},
+		listCalls: map[string]int{},
+	}
+	scan := New(cat, drv, []string{".mp4"}, nil, nil)
+	scan.RetryWait = func(context.Context, time.Duration) error { return nil }
+
+	result, err := scan.Scan(ctx, "")
+	if !errors.Is(err, ErrRateLimitBudgetExhausted) {
+		t.Fatalf("scan error = %v, want ErrRateLimitBudgetExhausted", err)
+	}
+	if drv.listCalls["limited-dir"] != RateLimitRetryLimit+1 {
+		t.Fatalf("limited directory list calls = %d, want %d", drv.listCalls["limited-dir"], RateLimitRetryLimit+1)
+	}
+	if drv.listCalls["later-dir"] != 0 {
+		t.Fatalf("later directory list calls = %d, want 0", drv.listCalls["later-dir"])
+	}
+	if result.Stats.Scanned != 1 || result.Stats.Added != 0 {
+		t.Fatalf("partial result = scanned:%d added:%d, want 1/0", result.Stats.Scanned, result.Stats.Added)
+	}
+	if _, err := cat.GetVideo(ctx, "fake-drive-file-before-limit"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("partially discovered video lookup error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestRateLimitBudgetIsSharedAcrossScanners(t *testing.T) {
+	ctx := context.Background()
+	budget := NewRateLimitBudget()
+	consume := func(rateLimits int) error {
+		sequence := make([]error, rateLimits)
+		for index := range sequence {
+			sequence[index] = &drives.RateLimitError{Provider: "fake"}
+		}
+		drv := &discoveryTestSource{
+			errorSequences: map[string][]error{"root": sequence},
+		}
+		scan := New(nil, drv, nil, nil, nil)
+		scan.RateLimitBudget = budget
+		scan.RetryWait = func(context.Context, time.Duration) error { return nil }
+		_, _, err := scan.Discover(ctx, "")
+		return err
+	}
+
+	if err := consume(1); err != nil {
+		t.Fatalf("first scanner: %v", err)
+	}
+	if err := consume(2); err != nil {
+		t.Fatalf("second scanner: %v", err)
+	}
+	if err := consume(1); !errors.Is(err, ErrRateLimitBudgetExhausted) {
+		t.Fatalf("third scanner error = %v, want shared budget exhaustion", err)
+	}
+	if budget.UsedRetries() != RateLimitRetryLimit {
+		t.Fatalf("used retries = %d, want %d", budget.UsedRetries(), RateLimitRetryLimit)
+	}
+}
+
+func TestScanRetriesDirectoryTimeoutThenProtectsFailedSubtree(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	drv := &discoveryTestSource{
+		entries: map[string][]drives.Entry{
+			"root": {
+				{ID: "timed-out-dir", Name: "Timed Out", IsDir: true},
+				{ID: "healthy-file", Name: "healthy.mp4", Size: 123},
+			},
+		},
+		errors:    map[string]error{"timed-out-dir": &net.DNSError{IsTimeout: true}},
+		listCalls: map[string]int{},
+	}
+	result, err := New(cat, drv, []string{".mp4"}, nil, nil).Scan(ctx, "")
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if drv.listCalls["timed-out-dir"] != directoryListTimeoutRetries+1 {
+		t.Fatalf("timeout list calls = %d, want %d", drv.listCalls["timed-out-dir"], directoryListTimeoutRetries+1)
+	}
+	if _, failed := result.Snapshot.FailedDirIDs["timed-out-dir"]; !failed {
+		t.Fatalf("failed dirs = %#v, want timed-out-dir", result.Snapshot.FailedDirIDs)
+	}
+	if result.Stats.Added != 1 {
+		t.Fatalf("added = %d, want healthy sibling", result.Stats.Added)
+	}
+}
+
+func TestScanReportsRecoverableDirectoryIssueSeparately(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	drv := &discoveryTestSource{
+		entries: map[string][]drives.Entry{
+			"root": {
+				{ID: "broken-dir", Name: "Broken", IsDir: true},
+				{ID: "live-file", Name: "live.mp4", Size: 123},
+			},
+		},
+		errors: map[string]error{"broken-dir": errors.New("temporary list failure")},
+	}
+	result, err := New(cat, drv, []string{".mp4"}, nil, nil).Scan(ctx, "")
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if result.Snapshot.Complete() {
+		t.Fatal("snapshot with a failed directory reported complete")
+	}
+	if len(result.Snapshot.Issues) != 1 || result.Snapshot.Issues[0].Stage != IssueDiscovery {
+		t.Fatalf("discovery issues = %#v, want one discovery issue", result.Snapshot.Issues)
+	}
+	if _, ok := result.Snapshot.FailedDirIDs["broken-dir"]; !ok {
+		t.Fatalf("failed dir ids = %#v, want broken-dir", result.Snapshot.FailedDirIDs)
+	}
+	if _, ok := result.Snapshot.EnumeratedDirIDs["broken-dir"]; ok {
+		t.Fatalf("broken-dir entered enumerated set: %#v", result.Snapshot.EnumeratedDirIDs)
+	}
+	if _, ok := result.Snapshot.EnumeratedDirIDs["root"]; !ok {
+		t.Fatalf("root missing from enumerated set: %#v", result.Snapshot.EnumeratedDirIDs)
+	}
+	if result.Stats.Added != 1 || result.Stats.Errors != 1 {
+		t.Fatalf("result = added:%d errors:%d, want 1/1", result.Stats.Added, result.Stats.Errors)
 	}
 }
 
@@ -894,6 +1240,56 @@ func TestRunDoesNotEnforceLegacyMaxDepth(t *testing.T) {
 	}
 	if _, err := cat.GetVideo(ctx, "fake-drive-deep-file"); err != nil {
 		t.Fatalf("deepest video not added (legacy max_depth still enforced?): %v", err)
+	}
+}
+
+func TestRunSynchronizesExistingVideoDirectoryIdentity(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:          "fake-drive-file-1",
+		DriveID:     "drive",
+		FileID:      "file-1",
+		FileName:    "episode.mp4",
+		ParentID:    "old-folder",
+		DirName:     "Old Series",
+		Title:       "episode",
+		Size:        123,
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+
+	drv := &scannerTreeFakeDrive{entries: map[string][]drives.Entry{
+		"root": {{ID: "new-folder", Name: "New Series", IsDir: true}},
+		"new-folder": {{
+			ID:       "file-1",
+			ParentID: "incorrect-provider-parent",
+			Name:     "episode.mp4",
+			Size:     123,
+		}},
+	}}
+	if _, err := New(cat, drv, []string{".mp4"}, nil, nil).Run(ctx, ""); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	got, err := cat.GetVideo(ctx, "fake-drive-file-1")
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.ParentID != "new-folder" || got.DirName != "New Series" {
+		t.Fatalf("directory = parent %q name %q, want new-folder / New Series", got.ParentID, got.DirName)
+	}
+	if want := []string{"root", "new-folder"}; !sameStrings(got.AncestorDirIDs, want) {
+		t.Fatalf("ancestor dir ids = %#v, want %#v", got.AncestorDirIDs, want)
 	}
 }
 
@@ -960,6 +1356,33 @@ func (d *scannerTreeFakeDrive) EnsureDir(context.Context, string) (string, error
 	return "", drives.ErrNotSupported
 }
 func (d *scannerTreeFakeDrive) RootID() string { return "root" }
+
+type discoveryTestSource struct {
+	entries        map[string][]drives.Entry
+	errors         map[string]error
+	errorSequences map[string][]error
+	listCalls      map[string]int
+}
+
+func (d *discoveryTestSource) Kind() string { return "fake" }
+func (d *discoveryTestSource) ID() string   { return "drive" }
+func (d *discoveryTestSource) List(_ context.Context, dirID string) ([]drives.Entry, error) {
+	if d.listCalls != nil {
+		d.listCalls[dirID]++
+	}
+	if sequence := d.errorSequences[dirID]; len(sequence) > 0 {
+		err := sequence[0]
+		d.errorSequences[dirID] = sequence[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := d.errors[dirID]; err != nil {
+		return nil, err
+	}
+	return d.entries[dirID], nil
+}
+func (d *discoveryTestSource) RootID() string { return "root" }
 
 // captureLog 把 log 包默认输出引到一个 bytes.Buffer，便于断言进度日志被打印；
 // 测试结束自动恢复。

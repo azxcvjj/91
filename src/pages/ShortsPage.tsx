@@ -6,7 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router";
 import {
   ChevronLeft,
   Heart,
@@ -14,19 +14,21 @@ import {
   Volume2,
   VolumeX,
   EyeOff,
-  Info,
   AlertCircle,
   Share2,
 } from "lucide-react";
-import { hideVideo, type ShortsItem } from "@/data/videos";
+import { hideVideo, setVideoLike, type ShortsItem } from "@/data/videos";
 import {
   averageBytesPerSecond,
   clamp,
+  FIRST_FRAME_WARM_TIME,
+  getPreloadAheadCount,
   getVideoWindowBounds,
   preloadBufferSecondsFor,
   preloadKeepSecondsFor,
   videoBufferIsCritical,
   videoHasBufferedData,
+  shouldWarmFirstFrame,
   videoHasComfortableBuffer,
 } from "@/shorts/mediaBuffer";
 import {
@@ -35,6 +37,7 @@ import {
   isWindowsPlatform,
   shouldUseDocumentScrollForShorts,
   shouldUseIOSSharedVideo,
+  shouldUseShortsSwipePager,
 } from "@/shorts/platform";
 import {
   isShortsDebugEnabled,
@@ -51,6 +54,12 @@ import {
   type ShortsKeyboardSeekPreview,
 } from "@/shorts/useShortsKeyboard";
 import { useShortsSlideGestures } from "@/shorts/useShortsSlideGestures";
+import { ShortsSlideVisibility } from "@/shorts/slideVisibility";
+import {
+  measureOffsetWithinSlide,
+  readShortsSlideTopWithinTrack,
+  useShortsSwipePager,
+} from "@/shorts/useShortsSwipePager";
 import { AdminEmptyVisual } from "@/admin/AdminEmptyVisual";
 import { useAuth } from "@/admin/AuthContext";
 import {
@@ -59,8 +68,6 @@ import {
 } from "@/lib/videoShareClipboard";
 import "@/styles/shorts.css";
 
-// 当前视频流畅播放后，向后预加载多少条视频。
-const PRELOAD_AHEAD_COUNT = 2;
 
 // 距当前屏多少条以内的 slide 才渲染真正的内容（背景、海报、文案、操作栏）。
 // 即使队列已经有几十条，也只让附近 slide 持有位图和完整子树；窗口外退化成
@@ -97,6 +104,9 @@ export default function ShortsPage() {
     : "";
   // 是否静音；首次必须静音才能 autoplay，用户点击后切换
   const [muted, setMuted] = useState(true);
+  // iOS/WebKit 的有声播放授权按 media element 管理。iOS 分支始终复用
+  // 同一个真实 <video>，滑动时只移动节点并更换 src。
+  const useIOSSharedVideo = shouldUseIOSSharedVideo();
   // 全局 Toast / HUD 提醒文字
   const [hudText, setHudText] = useState<{ id: number; text: string; icon?: React.ReactNode } | null>(null);
   const hudTimeoutRef = useRef<number | null>(null);
@@ -115,37 +125,45 @@ export default function ShortsPage() {
 
   const handleMuteButtonClick = useCallback(() => {
     const activeVideo = getVideoAtIndex(activeIndex);
-    const canResumeActiveVideo = () =>
-      Boolean(activeVideo) &&
-      getVideoAtIndex(activeIndexRef.current) === activeVideo &&
-      userPausedIndexRef.current !== activeIndexRef.current;
     const next = !muted;
     if (activeVideo) {
-      normalizeVideoPlaybackRate(activeVideo);
-      applyVideoMutedState(activeVideo, next);
-      // 必须直接发生在这个 click 回调中：这一次 play() 给 iOS 的持久
-      // media element 授予有声播放权限，之后切 src 仍复用同一元素。
-      if (canResumeActiveVideo()) {
-        activeVideo.play().catch(() => undefined);
+      // Android Chrome 切换静音时可能正在重建音频管线。对一个本来就在
+      // 播放的元素重复 play() 和延迟重试只会干扰这次切换，因此普通 video
+      // 路径到这里就结束；下面的恢复只服务于 iOS 持久 media element。
+      if (!useIOSSharedVideo) {
+        applyVideoMutedState(activeVideo, next);
+      } else {
+        const canResumeActiveVideo = () =>
+          getVideoAtIndex(activeIndexRef.current) === activeVideo &&
+          userPausedIndexRef.current !== activeIndexRef.current;
+        normalizeVideoPlaybackRate(activeVideo);
+        applyVideoMutedState(activeVideo, next);
+        // 必须直接发生在这个 click 回调中：这一次 play() 给 iOS 的持久
+        // media element 授予有声播放权限，之后切 src 仍复用同一元素。
+        if (canResumeActiveVideo()) {
+          activeVideo.play().catch(() => undefined);
+        }
+        stabilizeVideoAfterAudioToggle(
+          activeVideo,
+          canResumeActiveVideo
+        );
       }
-      stabilizeVideoAfterAudioToggle(
-        activeVideo,
-        canResumeActiveVideo
-      );
     }
     // 预载用的备用元素之后会被提升为播放元素，而 WebKit 的有声播放授权是
     // 按 media element 记账的。趁这次用户手势一并给它授权，否则它接管播放
     // 的那一刻会被当成"没有手势的有声自动播放"直接拒掉。
-    const standbyVideo = iosStandbyVideoRef.current;
-    if (standbyVideo && standbyVideo !== activeVideo) {
-      unlockVideoAudioPlayback(standbyVideo);
+    if (useIOSSharedVideo) {
+      const standbyVideo = iosStandbyVideoRef.current;
+      if (standbyVideo && standbyVideo !== activeVideo) {
+        unlockVideoAudioPlayback(standbyVideo);
+      }
     }
     setMuted(next);
     showHud(
       next ? "已静音" : "音量已开启",
       next ? <VolumeX size={16} /> : <Volume2 size={16} />
     );
-  }, [activeIndex, muted, showHud]);
+  }, [activeIndex, muted, showHud, useIOSSharedVideo]);
 
   // 组件卸载时清理 HUD 定时器
   useEffect(() => {
@@ -155,11 +173,17 @@ export default function ShortsPage() {
   }, []);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
+  // 承载滑动位移的轨道。它没有定位也没有常驻 transform，slide 的 offsetTop
+  // 和 nextElementSibling 关系都不受影响；只有手势 / 落点动画进行中才会被
+  // 写上 translate3d，落定立刻清掉——不给 WebKit 在 <video> 祖先上留常驻
+  // 合成层（本页在 iOS 合成路径上踩过坑，见 .shorts-page 的注释）。
+  const trackRef = useRef<HTMLDivElement | null>(null);
   const itemsLengthRef = useRef(items.length);
   itemsLengthRef.current = items.length;
   // 整页只建一个 slide 观察器，新批次到达时增量补充观察目标。
   const slideObserverRef = useRef<IntersectionObserver | null>(null);
   const observedSlidesRef = useRef<WeakSet<Element>>(new WeakSet());
+  const slideVisibilityRef = useRef(new ShortsSlideVisibility());
   // index → video element，用来精确控制播放/暂停
   const videoRefs = useRef<Map<number, HTMLVideoElement>>(new Map());
   const videoRefCallbacks = useRef<
@@ -184,10 +208,23 @@ export default function ShortsPage() {
   const pendingQueueTrimRef = useRef<{
     anchorKey: string;
     activeIndex: number;
+    /**
+     * 裁剪发生时滚动位置相对锚点 slide 顶端的偏移。切屏动画（原生吸附或
+     * 自定义落点动画）跑到一半时索引就已经推进，裁剪往往正好插在中间；
+     * 重贴时把这段偏移一并还原，视觉位置才是连续的，不会硬跳到吸附点。
+     */
+    offsetWithinAnchor: number;
   } | null>(null);
   // Windows 退出浏览器全屏时视口高度会改变。调整滚动位置期间锁住当前
   // slide，避免 IntersectionObserver 把新的像素位置误判成后续视频。
   const viewportResizeAnchorIndexRef = useRef<number | null>(null);
+  // 手指正在拖动期间冻结活跃屏判定：IO 看的是视觉位置，跟手时轨道位移一直
+  // 在变，它会在一次滑动里反复翻转，每翻一次都是一整套暂停/起播/授权清零。
+  const pagerGestureActiveRef = useRef(false);
+  // 用户当前的浏览方向（+1 往后看，-1 往回看）。iOS 只有两个持久 media
+  // element，覆盖不了 prev/active/next 三个位置，备用元素只能放一边——
+  // 放在用户正在去的那一边。
+  const browseDirectionRef = useRef(1);
   const userPausedIndexRef = useRef<number | null>(null);
   const [activeReadyForPreload, setActiveReadyForPreload] = useState(false);
   const [, setUserPausedIndexState] = useState<number | null>(null);
@@ -208,26 +245,32 @@ export default function ShortsPage() {
   );
   // iPhone 浏览器里改用页面滚动，让 Safari 工具栏能随刷动收起。
   const useDocumentScroll = shouldUseDocumentScrollForShorts();
+  // 全部滚动输入都由页面自己接管：手指、鼠标拖拽、滚轮共用同一条落点动画。
+  // 凡是留给浏览器的输入通道，"原生吸附手感不可控"这个问题就原样留在那里。
+  const usePagerGestures = shouldUseShortsSwipePager();
   // Windows 短视频页只保留静音图标；不挂载桌面 hover 音量条，避免点击
   // 图标时因鼠标仍停留在按钮上而展开滑杆。
   const isWindowsShortsPlatform = isWindowsPlatform();
-  // iOS/WebKit 的有声播放授权按 media element 管理。iOS 分支始终复用
-  // 同一个真实 <video>，滑动时只移动节点并更换 src。
-  const useIOSSharedVideo = shouldUseIOSSharedVideo();
-
-  const handleBackToHomeClick = useCallback(
-    (event: React.MouseEvent<HTMLAnchorElement>) => {
-      // 主页导航点击 documentElement 后进入的是“文档全屏”，SPA 路由切换
-      // 不会自动退出。先等待 Fullscreen API 完成，再渲染首页，避免首页继承
-      // 短视频的全屏状态或先以全屏闪现。
+  const handleShortsRouteClick = useCallback(
+    (event: React.MouseEvent<HTMLAnchorElement>, destination: string) => {
+      // 主导航点击 documentElement 后进入的是“文档全屏”，SPA 路由切换
+      // 不会自动退出。所有离开短视频页的站内链接都先等待 Fullscreen API
+      // 完成，再渲染目标页，避免目标页继承全屏状态或先以全屏闪现。
       const exitRequest = exitDocumentFullscreen();
       if (!exitRequest) return;
 
       event.preventDefault();
-      const returnHome = () => navigate("/");
-      void exitRequest.then(returnHome, returnHome);
+      const completeNavigation = () => navigate(destination);
+      void exitRequest.then(completeNavigation, completeNavigation);
     },
     [navigate]
+  );
+
+  const handleBackToHomeClick = useCallback(
+    (event: React.MouseEvent<HTMLAnchorElement>) => {
+      handleShortsRouteClick(event, "/");
+    },
+    [handleShortsRouteClick]
   );
 
   function getVideoAtIndex(index: number) {
@@ -245,6 +288,11 @@ export default function ShortsPage() {
   // 事件监听器和 iOS 持久 video effect 都通过 ref 读取当前索引。放在最前面的
   // layout effect 可避免长队列裁剪与上一轮 passive effect 交错时写回旧值。
   useLayoutEffect(() => {
+    const previous = activeIndexRef.current;
+    // 队列裁剪会整体重排索引，那次跳变不代表用户的浏览方向。
+    if (!queueTrimInProgressRef.current && activeIndex !== previous) {
+      browseDirectionRef.current = activeIndex > previous ? 1 : -1;
+    }
     activeIndexRef.current = activeIndex;
   }, [activeIndex]);
 
@@ -269,19 +317,22 @@ export default function ShortsPage() {
     []
   );
 
-  // 键盘快捷键：↑↓切换、空格播放/暂停（双空格点赞）、←→累计快进、M/L
-  const { keyboardSeekPreview, registerKeyboardLikeHandler } =
-    useShortsKeyboard({
-      containerRef,
-      activeIndexRef,
-      itemsLengthRef,
-      getVideoAtIndex,
-      isVideoPausedByUser,
-      setUserPausedForIndex,
-      onToggleMute: handleMuteButtonClick,
-      showHud,
-      isWindowsShortsPlatform,
-    });
+  // 键盘快捷键：↑↓切换、空格播放/暂停（双空格点赞）、←快退、→长按倍速、M/L
+  const {
+    keyboardSeekPreview,
+    keyboardFastPlaybackIndex,
+    registerKeyboardLikeHandler,
+  } = useShortsKeyboard({
+    containerRef,
+    activeIndexRef,
+    itemsLengthRef,
+    getVideoAtIndex,
+    isVideoPausedByUser,
+    setUserPausedForIndex,
+    onToggleMute: handleMuteButtonClick,
+    showHud,
+    isWindowsShortsPlatform,
+  });
 
   useEffect(() => {
     updateUserPausedIndex(null);
@@ -325,16 +376,7 @@ export default function ShortsPage() {
         likedIdsRef.current.delete(videoId);
       }
       try {
-        const res = await fetch(
-          `/api/video/${encodeURIComponent(videoId)}/like`,
-          {
-            method: liked ? "POST" : "DELETE",
-            credentials: "include",
-          }
-        );
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = (await res.json()) as { likes?: number };
-        return typeof data.likes === "number" ? data.likes : null;
+        return await setVideoLike(videoId, liked);
       } catch {
         // 请求失败：回滚集合，让 Slide 自己回滚 UI
         if (liked) {
@@ -377,14 +419,21 @@ export default function ShortsPage() {
     const removeCount = getShortsQueueTrimCount(activeIndex, items.length);
     const nextActiveIndex = activeIndex - removeCount;
     queueTrimInProgressRef.current = true;
+    const root = containerRef.current;
+    // 偏移必须在 DOM 变化之前量：重贴 effect 跑的时候旧 slide 已经不在了。
     pendingQueueTrimRef.current = {
       anchorKey: shortsQueueItemKey(activeItem),
       activeIndex: nextActiveIndex,
+      offsetWithinAnchor: measureOffsetWithinActiveSlide(
+        root,
+        trackRef.current,
+        activeIndex,
+        useDocumentScroll
+      ),
     };
 
     // IntersectionObserver 会持有 target；被裁掉前显式 unobserve，避免旧空壳
     // 继续留在观察器内部。裁剪期间忽略迟到的 observer 回调。
-    const root = containerRef.current;
     const observer = slideObserverRef.current;
     if (root && observer) {
       const slides =
@@ -442,6 +491,7 @@ export default function ShortsPage() {
     items,
     trimQueueBefore,
     updateUserPausedIndex,
+    useDocumentScroll,
   ]);
 
   // DOM 已按新索引提交后，把同一个逻辑视频重新贴到视口起点。用实际 offset
@@ -463,11 +513,17 @@ export default function ShortsPage() {
         )
       : undefined;
     if (root && slide) {
+      // 还原裁剪那一刻锚点内的偏移：切屏动画进行到一半时被裁剪打断，也只是
+      // 坐标系整体平移，画面不会跳回吸附点。偏移已在测量时夹在一屏之内。
+      // 位置和测量用同一个参照系（轨道），两边都不受 transform 影响。
+      const track = trackRef.current;
+      const top = track
+        ? readShortsSlideTopWithinTrack(slide, track) + pending.offsetWithinAnchor
+        : slide.offsetTop + pending.offsetWithinAnchor;
       if (useDocumentScroll) {
-        const top = window.scrollY + slide.getBoundingClientRect().top;
-        window.scrollTo({ top, behavior: "auto" });
+        window.scrollTo({ top: Math.max(0, top), behavior: "auto" });
       } else {
-        root.scrollTop = slide.offsetTop;
+        root.scrollTop = Math.max(0, top);
       }
     }
     pendingQueueTrimRef.current = null;
@@ -533,6 +589,30 @@ export default function ShortsPage() {
     };
   }, [isWindowsShortsPlatform]);
 
+  const handleSlideIntersections = useCallback(
+    (entries: IntersectionObserverEntry[]) => {
+      if (
+        viewportResizeAnchorIndexRef.current !== null ||
+        queueTrimInProgressRef.current
+      ) {
+        slideVisibilityRef.current.clear();
+        return;
+      }
+      const bestIndex = slideVisibilityRef.current.update(
+        entries,
+        pagerGestureActiveRef.current
+      );
+      if (bestIndex >= 0 && bestIndex !== activeIndexRef.current) {
+        activeIndexRef.current = bestIndex;
+        const sharedVideo = iosSharedVideoRef.current;
+        if (sharedVideo && !sharedVideo.paused) sharedVideo.pause();
+        setActiveReadyForPreload(false);
+        setActiveIndex(bestIndex);
+      }
+    },
+    []
+  );
+
   // 用 IntersectionObserver 找出当前进入视口的 item。
   // root 直接用 viewport：普通模式和 iPhone 页面滚动模式都能正确观测。
   //
@@ -546,32 +626,7 @@ export default function ShortsPage() {
     if (!root) return;
 
     const observer = new IntersectionObserver(
-      (entries) => {
-        if (
-          viewportResizeAnchorIndexRef.current !== null ||
-          queueTrimInProgressRef.current
-        ) {
-          return;
-        }
-        let bestIndex = -1;
-        let bestRatio = 0.6;
-        for (const entry of entries) {
-          if (entry.intersectionRatio > bestRatio) {
-            bestRatio = entry.intersectionRatio;
-            const idx = Number(
-              (entry.target as HTMLElement).dataset.index ?? -1
-            );
-            if (!Number.isNaN(idx)) bestIndex = idx;
-          }
-        }
-        if (bestIndex >= 0 && bestIndex !== activeIndexRef.current) {
-          activeIndexRef.current = bestIndex;
-          const sharedVideo = iosSharedVideoRef.current;
-          if (sharedVideo && !sharedVideo.paused) sharedVideo.pause();
-          setActiveReadyForPreload(false);
-          setActiveIndex(bestIndex);
-        }
-      },
+      handleSlideIntersections,
       {
         root: null,
         threshold: [0.6, 0.85],
@@ -583,8 +638,9 @@ export default function ShortsPage() {
       slideObserverRef.current = null;
       observedSlidesRef.current = new WeakSet();
       observer.disconnect();
+      slideVisibilityRef.current.clear();
     };
-  }, []);
+  }, [handleSlideIntersections]);
 
   // 新一批 slide 进入 DOM 后补充观察。WeakSet 记账避免对同一节点重复调用，
   // 节点被 React 丢弃时条目自动消失。
@@ -599,6 +655,42 @@ export default function ShortsPage() {
       observer.observe(el);
     });
   }, [items.length]);
+
+  // 视口尺寸变化后（旋转、输入法）重新对齐用的当前屏。接管手势后原生吸附
+  // 已关闭，浏览器不会再自己纠正，这个查询就是唯一的锚点来源。
+  const getActiveSlideElement = useCallback(() => {
+    const root = containerRef.current;
+    if (!root) return null;
+    return root.querySelector<HTMLElement>(
+      `[data-shorts-slide][data-index="${activeIndexRef.current}"]`
+    );
+  }, []);
+
+  // 移动端的上下滑动手势。activeIndex 仍然只由上面的 IntersectionObserver
+  // 决定：这个 hook 只负责把手指位移写进同一个 scrollTop，播放 / 预载 /
+  // iOS 共享元素那条链路完全不受影响。
+  const handlePagerGestureActiveChange = useCallback(
+    (active: boolean) => {
+      pagerGestureActiveRef.current = active;
+      if (!active) {
+        const observer = slideObserverRef.current;
+        if (!observer) return;
+        // 松手前可能已经越过最后一个 IO 阈值，之后不会再收到通知。
+        // 合并尚未分发的通知，再处理拖动期间每屏最后一次观测结果。
+        handleSlideIntersections(observer.takeRecords());
+      }
+    },
+    [handleSlideIntersections]
+  );
+
+  useShortsSwipePager({
+    enabled: usePagerGestures,
+    containerRef,
+    trackRef,
+    usesDocumentScroll: useDocumentScroll,
+    getAnchorSlide: getActiveSlideElement,
+    onGestureActiveChange: handlePagerGestureActiveChange,
+  });
 
   // 先停掉所有非当前屏。当前屏的 play() 由 ShortsSlide 负责，
   // 那里能在 Safari 拒绝/中断播放时同步 UI，并在 canplay 后安全重试。
@@ -687,7 +779,6 @@ export default function ShortsPage() {
         // 在 ended 后受控重播，桌面/Android 的 JSX video 仍保留原生 loop。
         video.loop = false;
         video.playsInline = true;
-        video.preload = "auto";
         video.disablePictureInPicture = true;
         video.setAttribute("playsinline", "");
         video.setAttribute("webkit-playsinline", "");
@@ -775,22 +866,25 @@ export default function ShortsPage() {
     useIOSSharedVideo,
   ]);
 
-  // 下一屏：用备用元素提前把下一条视频拉起来。iOS 分支此前完全没有预加载，
-  // 唯一的 media element 要等滑动到位后才换 src，网盘取链 + 首帧解码整条
-  // 串行发生在用户眼前；桌面/Android 早就预载了 PRELOAD_AHEAD_COUNT 条。
-  // 开始时机沿用同一套高低水位（activeReadyForPreload），当前视频缓冲不
-  // 健康时不去抢它的带宽。
+  // 下一屏：用备用元素提前准备下一条视频。
+  //
+  // 备用元素一直保留下一条的 src：当前屏缓冲不足时只取 metadata，缓冲健康后
+  // 再切到 auto。降级时不重设 src，因此已经下载的数据仍能复用。
   //
   // 这里是普通 useEffect 而不是 useLayoutEffect：备用元素处于隐藏角色，
   // 移动插槽和起 src 都没有当帧的视觉后果，没必要把一次 appendChild 和一次
   // load()（会立刻发网络请求）压进浏览器绘制前的同步块里。上面那个提升
   // effect 必须保持 useLayoutEffect——活跃元素得在这一帧画出来之前就位。
   useEffect(() => {
-    if (!useIOSSharedVideo || iosStandbyPreloadDisabled || !activeReadyForPreload) {
-      return;
-    }
-    const nextIndex = activeIndex + 1;
-    const nextItem = items[nextIndex];
+    if (!useIOSSharedVideo || iosStandbyPreloadDisabled) return;
+    // 备用元素跟着浏览方向放，而不是死盯着下一屏。原来只放 activeIndex+1，
+    // 于是往回看时每一条都是冷启动：共享元素得重新换 src、重新取流、重新
+    // 解首帧，用户看到的就是一张静态封面加一段等待。往回连看几条是很常见
+    // 的用法，不该每条都付这个代价。
+    // 方向反转的那一次仍然是冷的——两个持久元素覆盖不了三个位置，这是
+    // iOS 分支的固有约束（见上面关于 WebKit 有声播放授权的注释）。
+    const nextIndex = activeIndex + browseDirectionRef.current;
+    const nextItem = nextIndex >= 0 ? items[nextIndex] : undefined;
     const nextSlot = iosSharedVideoSlots.current.get(nextIndex);
     if (!nextItem || !nextSlot) return;
 
@@ -799,6 +893,7 @@ export default function ShortsPage() {
     if (standby === iosSharedVideoRef.current) return;
 
     applyIOSVideoRole(standby, "standby");
+    standby.preload = activeReadyForPreload ? "auto" : "metadata";
     // 直接停进下一屏的插槽：滑动到位后连 DOM 移动都省了。
     if (standby.parentElement !== nextSlot) nextSlot.appendChild(standby);
     iosStandbyVideoIndexRef.current = nextIndex;
@@ -813,6 +908,9 @@ export default function ShortsPage() {
     standby.poster = nextItem.poster;
     standby.src = nextItem.videoSrc;
     standby.load();
+    // 光把字节拉下来还是一张静态图：video 在真正播放前一直画 poster。
+    // 拿到元数据后 seek 一次逼它解码首帧，滑到位就直接有画面。
+    warmStandbyFirstFrame(standby);
   }, [
     acquireIOSVideoElement,
     activeIndex,
@@ -849,6 +947,12 @@ export default function ShortsPage() {
     if (useDocumentScroll) {
       html.classList.add("shorts-document-scroll");
       body.classList.add("shorts-document-scroll");
+      // 文档滚动 + 自接管手势（?shortsPager=1）时要一并关掉根元素的吸附点，
+      // 否则程序化写入的 scrollY 会被浏览器重新吸附，逐帧跟手直接失效。
+      if (usePagerGestures) {
+        html.classList.add("is-pager-driven");
+        body.classList.add("is-pager-driven");
+      }
     } else {
       html.style.overflow = "hidden";
       body.style.overflow = "hidden";
@@ -872,6 +976,8 @@ export default function ShortsPage() {
     return () => {
       html.classList.remove("shorts-document-scroll");
       body.classList.remove("shorts-document-scroll");
+      html.classList.remove("is-pager-driven");
+      body.classList.remove("is-pager-driven");
       html.style.overflow = prevHtmlOverflow;
       body.style.overflow = prevBodyOverflow;
       body.style.background = prevBodyBg;
@@ -883,7 +989,7 @@ export default function ShortsPage() {
         }
       }
     };
-  }, [useDocumentScroll]);
+  }, [useDocumentScroll, usePagerGestures]);
 
   // 用稳定 feed key 在真实 DOM 中找下一条；不闭包 items/index，既能跨队列
   // 裁剪，也不会每取回一批就换回调引用、击穿 ShortsSlide 的 memo。
@@ -913,8 +1019,8 @@ export default function ShortsPage() {
   return (
     <div
       className={`shorts-page${useDocumentScroll ? " is-document-scroll" : ""}${
-        legacyVideoTransitionEnabled ? " has-video-transition" : ""
-      }`}
+        usePagerGestures ? " is-pager-driven" : ""
+      }${legacyVideoTransitionEnabled ? " has-video-transition" : ""}`}
     >
       <header className="shorts-header">
         <Link
@@ -984,135 +1090,204 @@ export default function ShortsPage() {
         />
       )}
 
-      <div className="shorts-feed" ref={containerRef}>
-        {loading && items.length === 0 && !empty && !loadError && (
-          <div className="shorts-empty shorts-loading" aria-live="polite">
-            <div className="shorts-empty__content">
-              <ShortsLoadingSpinner size={30} />
-              <p>正在加载短视频</p>
+      <div
+        className={`shorts-feed${usePagerGestures ? " is-pager-driven" : ""}`}
+        ref={containerRef}
+      >
+        <div className="shorts-feed__track" ref={trackRef}>
+          {loading && items.length === 0 && !empty && !loadError && (
+            <div className="shorts-empty shorts-loading" aria-live="polite">
+              <div className="shorts-empty__content">
+                <ShortsLoadingSpinner size={30} />
+                <p>正在加载短视频</p>
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {loadError && items.length === 0 && (
-          <div className="shorts-empty" role="alert">
-            <div className="shorts-empty__content">
-              <p>短视频加载失败，请检查网络后重试</p>
-              <button
-                type="button"
-                className="shorts-empty__link"
-                onClick={() => void loadMore()}
-              >
-                重新加载
-              </button>
+          {loadError && items.length === 0 && (
+            <div className="shorts-empty" role="alert">
+              <div className="shorts-empty__content">
+                <p>短视频加载失败，请检查网络后重试</p>
+                <button
+                  type="button"
+                  className="shorts-empty__link"
+                  onClick={() => void loadMore()}
+                >
+                  重新加载
+                </button>
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {empty && items.length === 0 && (
-          <div className="shorts-empty">
-            <AdminEmptyVisual
-              variant="empty"
-              text="当前库中没有视频"
-              className="shorts-empty__visual"
-            />
-          </div>
-        )}
-
-        {items.map((item, index) => {
-          const itemKey = shortsQueueItemKey(item);
-          const isActiveSlide = index === activeIndex;
-          const isInCacheWindow =
-            index >= videoWindow.start && index <= videoWindow.end;
-          const preloadOffset = index - activeIndex;
-          const shouldPreload =
-            !useIOSSharedVideo &&
-            activeReadyForPreload &&
-            preloadOffset > 0 &&
-            preloadOffset <= PRELOAD_AHEAD_COUNT;
-          const shouldMount =
-            isActiveSlide ||
-            (!useIOSSharedVideo && (isInCacheWindow || shouldPreload));
-          // 视频窗口内已经缓冲过的视频保留 src：
-          // 在窗口内来回切换时，直接复用浏览器已缓冲数据。
-          const shouldRetainCached =
-            !useIOSSharedVideo &&
-            isInCacheWindow &&
-            !isActiveSlide &&
-            cacheableSourceIds.has(item.id);
-          const shouldLoad = isActiveSlide || shouldPreload || shouldRetainCached;
-          const shouldEagerLoad = isActiveSlide || shouldPreload;
-          // 视口附近的照常渲染；再加上所有还挂着 <video> 的 slide——那些是
-          // 有意保留的缓冲，不能因为离开视口就被拆掉。两者之和有上限，
-          // 与队列长度无关。
-          const shouldRenderContent =
-            Math.abs(preloadOffset) <= SLIDE_CONTENT_WINDOW_RADIUS ||
-            shouldMount ||
-            shouldRetainCached;
-          return (
-            <ShortsSlide
-              key={itemKey}
-              item={item}
-              itemKey={itemKey}
-              index={index}
-              isActive={isActiveSlide}
-              // 固定 4 条视频窗口内才挂载 <video> 壳；
-              // 当前屏先绑定 src；后两个视频等当前屏缓冲健康后再预加载；
-              // 已缓冲过的窗口内视频保留 src，便于来回切换复用缓存。
-              shouldMount={shouldMount}
-              shouldLoad={shouldLoad}
-              shouldEagerLoad={shouldEagerLoad}
-              shouldRenderContent={shouldRenderContent}
-              keyboardSeekPreview={
-                keyboardSeekPreview?.videoIndex === index
-                  ? keyboardSeekPreview
-                  : undefined
-              }
-              sharedVideoRef={
-                useIOSSharedVideo ? iosSharedVideoRef : undefined
-              }
-              sharedVideoSlotRef={
-                useIOSSharedVideo
-                  ? setIOSSharedVideoSlotRef(index)
-                  : undefined
-              }
-              muted={muted}
-              videoRef={setVideoRef(index)}
-              onLikeToggle={handleLikeToggle}
-              hasLiked={hasLiked}
-              registerKeyboardLikeHandler={registerKeyboardLikeHandler}
-              canHide={isAdmin}
-              onHideSuccess={handleHideSuccess}
-              onActiveReadyForPreload={handleActiveReadyForPreload}
-              onActiveNeedsPriority={handleActiveNeedsPriority}
-              onSourceCached={handleSourceCached}
-              onUserPausedChange={setUserPausedForIndex}
-              isVideoPausedByUser={isVideoPausedByUser}
-              showHud={showHud}
-              loopDebugProbeRef={
-                debugHudEnabled ? loopDebugProbeRef : undefined
-              }
-            />
-          );
-        })}
-
-        {loadError && items.length > 0 && (
-          <div className="shorts-empty" role="alert">
-            <div className="shorts-empty__content">
-              <p>后续视频加载失败</p>
-              <button
-                type="button"
-                className="shorts-empty__link"
-                onClick={() => void loadMore()}
-              >
-                重新加载
-              </button>
+          {empty && items.length === 0 && (
+            <div className="shorts-empty">
+              <AdminEmptyVisual
+                variant="empty"
+                text="当前库中没有视频"
+                className="shorts-empty__visual"
+              />
             </div>
-          </div>
-        )}
+          )}
+
+          {items.map((item, index) => {
+            const itemKey = shortsQueueItemKey(item);
+            const isActiveSlide = index === activeIndex;
+            const isInCacheWindow =
+              index >= videoWindow.start && index <= videoWindow.end;
+            const preloadOffset = index - activeIndex;
+            // 下一条始终挂源做轻量准备；只有当前屏缓冲健康时，后续视频才允许
+            // 用 preload="auto" 全速拉取。卡顿时只降级 preload，不删除已有 src。
+            const shouldPrepareNext =
+              !useIOSSharedVideo && preloadOffset === 1;
+            const shouldPreload =
+              !useIOSSharedVideo &&
+              preloadOffset > 0 &&
+              preloadOffset <= getPreloadAheadCount(activeReadyForPreload);
+            const shouldMount =
+              isActiveSlide ||
+              (!useIOSSharedVideo &&
+                (isInCacheWindow || shouldPrepareNext || shouldPreload));
+            // 视频窗口内已经缓冲过的视频保留 src：
+            // 在窗口内来回切换时，直接复用浏览器已缓冲数据。
+            const shouldRetainCached =
+              !useIOSSharedVideo &&
+              isInCacheWindow &&
+              !isActiveSlide &&
+              cacheableSourceIds.has(item.id);
+            const shouldLoad =
+              isActiveSlide ||
+              shouldPrepareNext ||
+              shouldPreload ||
+              shouldRetainCached;
+            const shouldEagerLoad = isActiveSlide || shouldPreload;
+            // 视口附近的照常渲染；再加上所有还挂着 <video> 的 slide——那些是
+            // 有意保留的缓冲，不能因为离开视口就被拆掉。两者之和有上限，
+            // 与队列长度无关。
+            const shouldRenderContent =
+              Math.abs(preloadOffset) <= SLIDE_CONTENT_WINDOW_RADIUS ||
+              shouldMount ||
+              shouldRetainCached;
+            return (
+              <ShortsSlide
+                key={itemKey}
+                item={item}
+                itemKey={itemKey}
+                index={index}
+                isActive={isActiveSlide}
+                // 固定 4 条视频窗口内才挂载 <video> 壳；
+                // 下一屏先用 metadata 轻量准备；当前屏缓冲健康后再全速预加载；
+                // 已缓冲过的窗口内视频保留 src，便于来回切换复用缓存。
+                shouldMount={shouldMount}
+                shouldLoad={shouldLoad}
+                shouldEagerLoad={shouldEagerLoad}
+                shouldRenderContent={shouldRenderContent}
+                keyboardSeekPreview={
+                  keyboardSeekPreview?.videoIndex === index
+                    ? keyboardSeekPreview
+                    : undefined
+                }
+                keyboardFastPlayback={keyboardFastPlaybackIndex === index}
+                sharedVideoRef={
+                  useIOSSharedVideo ? iosSharedVideoRef : undefined
+                }
+                sharedVideoSlotRef={
+                  useIOSSharedVideo
+                    ? setIOSSharedVideoSlotRef(index)
+                    : undefined
+                }
+                muted={muted}
+                videoRef={setVideoRef(index)}
+                onLikeToggle={handleLikeToggle}
+                hasLiked={hasLiked}
+                registerKeyboardLikeHandler={registerKeyboardLikeHandler}
+                canHide={isAdmin}
+                onHideSuccess={handleHideSuccess}
+                onActiveReadyForPreload={handleActiveReadyForPreload}
+                onActiveNeedsPriority={handleActiveNeedsPriority}
+                onSourceCached={handleSourceCached}
+                onUserPausedChange={setUserPausedForIndex}
+                isVideoPausedByUser={isVideoPausedByUser}
+                onRouteClick={handleShortsRouteClick}
+                showHud={showHud}
+                loopDebugProbeRef={
+                  debugHudEnabled ? loopDebugProbeRef : undefined
+                }
+              />
+            );
+          })}
+
+          {loadError && items.length > 0 && (
+            <div className="shorts-empty" role="alert">
+              <div className="shorts-empty__content">
+                <p>后续视频加载失败</p>
+                <button
+                  type="button"
+                  className="shorts-empty__link"
+                  onClick={() => void loadMore()}
+                >
+                  重新加载
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
+}
+
+/**
+ * iOS 备用元素的首帧预热。它停在下一屏的插槽里，绑了源却只画 poster——
+ * 按 HTML 渲染模型，video 在播放真正开始前一直呈现 poster frame，缓冲多满
+ * 都一样。seek 一次即可清掉这个标志并强制解码首帧。
+ * 一次性监听：src 换了会重新走这条路。
+ */
+function warmStandbyFirstFrame(video: HTMLVideoElement) {
+  const nudge = () => {
+    if (
+      !shouldWarmFirstFrame({
+        isActive: false,
+        shouldLoad: true,
+        isPlaybackElement: false,
+        readyState: video.readyState,
+        currentTime: video.currentTime,
+      })
+    ) {
+      return;
+    }
+    try {
+      video.currentTime = FIRST_FRAME_WARM_TIME;
+    } catch {
+      // 部分 ready state 下 seek 会抛错；另一个事件还会再试一次。
+    }
+  };
+  video.addEventListener("loadedmetadata", nudge, { once: true });
+  video.addEventListener("loadeddata", nudge, { once: true });
+}
+
+/**
+ * 队列裁剪前，当前屏在滚动方向上偏离吸附点多少。
+ *
+ * slide 的位置必须相对**轨道**来量，不能相对 feed 或视口：滑动手势进行中
+ * 轨道上挂着 translateY，相对视口的 rect 会把这段位移重复计入，重贴时画面
+ * 会跳一整屏。两个 rect 受同一个 transform 影响，相减正好把它消掉。
+ */
+function measureOffsetWithinActiveSlide(
+  root: HTMLElement | null,
+  track: HTMLElement | null,
+  activeIndex: number,
+  usesDocumentScroll: boolean
+): number {
+  if (!root || !track) return 0;
+  const slide = root.querySelector<HTMLElement>(
+    `[data-shorts-slide][data-index="${activeIndex}"]`
+  );
+  if (!slide) return 0;
+  return measureOffsetWithinSlide({
+    scrollTop: usesDocumentScroll ? window.scrollY : root.scrollTop,
+    slideTop: readShortsSlideTopWithinTrack(slide, track),
+    viewportHeight: usesDocumentScroll ? window.innerHeight : root.clientHeight,
+  });
 }
 
 type SlideProps = {
@@ -1134,6 +1309,8 @@ type SlideProps = {
     ShortsKeyboardSeekPreview,
     "currentTime" | "duration"
   >;
+  /** 当前 slide 是否正由键盘右键长按驱动 2 倍速播放。 */
+  keyboardFastPlayback: boolean;
   /** iOS 所有 slide 共用的同一个持久 video DOM 节点 */
   sharedVideoRef?: React.RefObject<HTMLVideoElement>;
   /** 持久 video 当前应移动到的 slide 插槽 */
@@ -1160,10 +1337,20 @@ type SlideProps = {
   onSourceCached: (videoId: string) => void;
   onUserPausedChange: (index: number, isPaused: boolean) => void;
   isVideoPausedByUser: (index: number) => boolean;
+  /** 离开沉浸式短视频页前统一退出文档全屏。 */
+  onRouteClick: (
+    event: React.MouseEvent<HTMLAnchorElement>,
+    destination: string
+  ) => void;
   showHud: (text: string, icon?: React.ReactNode) => void;
   /** ?debug=1 时活跃 slide 在这里挂一个循环重启状态读取器，供面板轮询。 */
   loopDebugProbeRef?: React.MutableRefObject<ShortsLoopDebugProbe | null>;
 };
+
+type ShortsPlaybackFailure =
+  | "media-error"
+  | "play-rejected"
+  | "loop-restart";
 
 /**
  * 一屏短视频。
@@ -1183,6 +1370,7 @@ function ShortsSlideImpl({
   shouldEagerLoad,
   shouldRenderContent,
   keyboardSeekPreview,
+  keyboardFastPlayback,
   sharedVideoRef,
   sharedVideoSlotRef,
   muted,
@@ -1197,6 +1385,7 @@ function ShortsSlideImpl({
   onSourceCached,
   onUserPausedChange,
   isVideoPausedByUser,
+  onRouteClick,
   showHud,
   loopDebugProbeRef,
 }: SlideProps) {
@@ -1230,6 +1419,8 @@ function ShortsSlideImpl({
     return localRef.current;
   }, [sharedVideoRef]);
   const [paused, setPaused] = useState(false);
+  const [playbackFailure, setPlaybackFailure] =
+    useState<ShortsPlaybackFailure | null>(null);
   const [fastActive, setFastActive] = useState(false);
 
   // 视频缓冲状态
@@ -1251,6 +1442,7 @@ function ShortsSlideImpl({
     averageBytesPerSecond(item)
   );
   const preloadKeepSeconds = preloadKeepSecondsFor(preloadBufferSeconds);
+  const detailPath = `/video/${encodeURIComponent(item.id)}`;
 
   // 时长是低频元数据，保留在 state。播放进度是高频信号：放进 ref 并直接
   // 写进度条 CSS 变量，避免 timeupdate/rVFC 让整棵 ShortsSlide 每秒重渲染。
@@ -1397,6 +1589,23 @@ function ShortsSlideImpl({
     playbackMotionFrameCountRef.current = 0;
   }, [clearLoopRestartWatchdog]);
 
+  // 媒体故障和用户暂停是两种不同状态。所有不可自行恢复的播放路径都汇总
+  // 到这里，统一收起瞬时手势/缓冲态，并交给显式的“重新播放”入口恢复。
+  const exposePlaybackFailure = useCallback(
+    (failure: ShortsPlaybackFailure) => {
+      hasStartedPlayingRef.current = false;
+      playbackMotionFrameCountRef.current = 0;
+      scrubbingRef.current = false;
+      setScrubbing(false);
+      setFastActive(false);
+      setPlaybackFailure(failure);
+      setPaused(true);
+      setIsBuffering(false);
+      onActiveNeedsPriority(index);
+    },
+    [index, onActiveNeedsPriority, setIsBuffering]
+  );
+
   const confirmPresentedPlayback = useCallback(
     (mediaTime?: number) => {
       clearLoopRestartWatchdog();
@@ -1405,6 +1614,7 @@ function ShortsSlideImpl({
       loopRestartReloadedRef.current = false;
       hasStartedPlayingRef.current = true;
       playbackMotionFrameCountRef.current = 0;
+      setPlaybackFailure(null);
       setPaused(false);
       setIsBuffering(false);
       if (
@@ -1466,6 +1676,7 @@ function ShortsSlideImpl({
 
   // 非当前屏/后续预加载/视频窗口内缓存视频不保留媒体源，确保离开窗口后浏览器中止原始网盘流。
   useEffect(() => {
+    if (!shouldLoad) setPlaybackFailure(null);
     if (usesSharedVideo) {
       if (!shouldLoad) {
         resetLoopRestartState();
@@ -1514,9 +1725,16 @@ function ShortsSlideImpl({
 
     const markPlayBlocked = () => {
       if (!canContinue()) return;
+      // NotAllowedError 是浏览器的自动播放策略，不代表媒体源损坏。
+      setPlaybackFailure(null);
       setIsBuffering(false);
       setPaused(true);
       onActiveNeedsPriority(index);
+    };
+
+    const markPlayFailed = () => {
+      if (!canContinue()) return;
+      exposePlaybackFailure("play-rejected");
     };
 
     const attemptPlay = () => {
@@ -1537,8 +1755,12 @@ function ShortsSlideImpl({
       let request: Promise<void> | undefined;
       try {
         request = video.play();
-      } catch {
-        markPlayBlocked();
+      } catch (error: unknown) {
+        if (getMediaErrorName(error) === "NotAllowedError") {
+          markPlayBlocked();
+        } else {
+          markPlayFailed();
+        }
         return;
       }
 
@@ -1553,7 +1775,11 @@ function ShortsSlideImpl({
           retryTimer = window.setTimeout(attemptPlay, retryCount * 120);
           return;
         }
-        markPlayBlocked();
+        if (errorName === "NotAllowedError") {
+          markPlayBlocked();
+          return;
+        }
+        markPlayFailed();
       });
     };
 
@@ -1581,6 +1807,7 @@ function ShortsSlideImpl({
       video.removeEventListener("canplay", retryWhenReady);
     };
   }, [
+    exposePlaybackFailure,
     getVideoElement,
     index,
     isActive,
@@ -1629,9 +1856,7 @@ function ShortsSlideImpl({
         // ignore
       }
       resetLoopRestartState();
-      setIsBuffering(false);
-      setPaused(true);
-      onActiveNeedsPriority(index);
+      exposePlaybackFailure("loop-restart");
     };
 
     const attemptRestart = (attempt: number) => {
@@ -1667,7 +1892,7 @@ function ShortsSlideImpl({
         }
 
         // 同一节点已经重建过一次播放管线仍没有任何呈现帧，就退出永久
-        // buffering，展示可点击的暂停态，让用户可以主动重试。
+        // buffering，展示明确的失败态，让用户可以主动重试。
         if (loopRestartReloadedRef.current) {
           failRestart(attempt);
           return;
@@ -1810,6 +2035,7 @@ function ShortsSlideImpl({
     };
   }, [
     clearLoopRestartWatchdog,
+    exposePlaybackFailure,
     getVideoElement,
     index,
     isActive,
@@ -2051,10 +2277,7 @@ function ShortsSlideImpl({
       if (usesSharedVideo && !video.error) return;
       if (!isActive) return;
       if (usesSharedVideo) resetLoopRestartState();
-      hasStartedPlayingRef.current = false;
-      setIsBuffering(false);
-      setPaused(true);
-      onActiveNeedsPriority(index);
+      exposePlaybackFailure("media-error");
     };
 
     function syncActivePreloadReadiness(currentVideo: HTMLVideoElement) {
@@ -2079,8 +2302,36 @@ function ShortsSlideImpl({
       }
     }
 
+    /**
+     * 预载条的首帧预热。字节下下来了不等于有画面：video 元素在真正开始播放
+     * 之前一直画 poster，哪怕缓冲已满。写一次 currentTime 触发 seek，强制它
+     * 解码并呈现真实首帧，滑到这一屏时就不再是一张静态封面。
+     * 全程静音、不播放，判定条件见 shouldWarmFirstFrame。
+     */
+    const warmFirstFrame = () => {
+      if (
+        !shouldWarmFirstFrame({
+          isActive,
+          shouldLoad,
+          isPlaybackElement: usesSharedVideo,
+          readyState: video.readyState,
+          currentTime: video.currentTime,
+        })
+      ) {
+        return;
+      }
+      try {
+        video.currentTime = FIRST_FRAME_WARM_TIME;
+      } catch {
+        // 少数 ready state 下 seek 会抛错；下一次 loadeddata 还会再试。
+      }
+    };
+
     handleLoaded();
     handleTime();
+    warmFirstFrame();
+    video.addEventListener("loadedmetadata", warmFirstFrame);
+    video.addEventListener("loadeddata", warmFirstFrame);
     video.addEventListener("loadedmetadata", handleLoaded);
     video.addEventListener("durationchange", handleLoaded);
     video.addEventListener("timeupdate", handleTime);
@@ -2100,6 +2351,8 @@ function ShortsSlideImpl({
     }
 
     return () => {
+      video.removeEventListener("loadedmetadata", warmFirstFrame);
+      video.removeEventListener("loadeddata", warmFirstFrame);
       video.removeEventListener("loadedmetadata", handleLoaded);
       video.removeEventListener("durationchange", handleLoaded);
       video.removeEventListener("timeupdate", handleTime);
@@ -2117,6 +2370,7 @@ function ShortsSlideImpl({
     clearBufferingIndicatorTimer,
     clearLoopRestartWatchdog,
     confirmPresentedPlayback,
+    exposePlaybackFailure,
     getVideoElement,
     index,
     isActive,
@@ -2254,18 +2508,16 @@ function ShortsSlideImpl({
 
   function togglePlayInternal() {
     const video = getVideoElement();
-    if (!video) return;
+    if (!video || playbackFailure) return;
     const shouldResume =
       isVideoPausedByUser(index) || (video.paused && !isBuffering);
     if (shouldResume) {
       onUserPausedChange(index, false);
       setPaused(false);
       if (video.readyState < 3) setIsBuffering(true);
-      video.play().catch(() => {
-        if (getVideoElement() !== video || !isActiveRef.current) return;
-        setPaused(true);
-        setIsBuffering(false);
-      });
+      video
+        .play()
+        .catch((error: unknown) => handleUserPlayFailure(video, error));
     } else {
       onUserPausedChange(index, true);
       video.pause();
@@ -2278,22 +2530,64 @@ function ShortsSlideImpl({
   // 首次点击必须在原始 click 回调内直接 play()；分发时序见 useShortsSlideGestures。
   function shouldResumeImmediatelyOnClick() {
     const video = getVideoElement();
-    return Boolean(video?.paused && !isBuffering);
+    return Boolean(video?.paused && !isBuffering && !playbackFailure);
   }
 
   function handleImmediateResume() {
     const video = getVideoElement();
-    if (!video) return;
+    if (!video || playbackFailure) return;
     onUserPausedChange(index, false);
     setPaused(false);
     if (video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
       setIsBuffering(true);
     }
-    video.play().catch(() => {
-      if (getVideoElement() !== video || !isActiveRef.current) return;
+    video
+      .play()
+      .catch((error: unknown) => handleUserPlayFailure(video, error));
+  }
+
+  function handleUserPlayFailure(
+    video: HTMLVideoElement,
+    error: unknown
+  ) {
+    if (getVideoElement() !== video || !isActiveRef.current) return;
+    if (getMediaErrorName(error) === "NotAllowedError") {
+      setPlaybackFailure(null);
       setPaused(true);
       setIsBuffering(false);
-    });
+      onActiveNeedsPriority(index);
+      return;
+    }
+    exposePlaybackFailure("play-rejected");
+  }
+
+  function handlePlaybackRetry(e: React.MouseEvent<HTMLButtonElement>) {
+    e.stopPropagation();
+    const video = getVideoElement();
+    if (!video || !isActiveRef.current || !shouldLoadRef.current) return;
+
+    resetLoopRestartState();
+    hasStartedPlayingRef.current = false;
+    playbackMotionFrameCountRef.current = 0;
+    onUserPausedChange(index, false);
+    setPlaybackFailure(null);
+    setPaused(false);
+    setFastActive(false);
+    normalizeVideoPlaybackRate(video);
+    applyVideoMutedState(video, mutedRef.current);
+    setIsBuffering(true);
+    onActiveNeedsPriority(index);
+
+    try {
+      // 复用当前 media element，只重建已经失败的媒体管线。iOS 上不能替换
+      // 节点，否则会丢失用户授予这个元素的有声播放权限。
+      video.load();
+      video
+        .play()
+        .catch((error: unknown) => handleUserPlayFailure(video, error));
+    } catch (error: unknown) {
+      handleUserPlayFailure(video, error);
+    }
   }
 
   // 手势输入：长按倍速、横滑快进、单/双击分发、进度条拖动
@@ -2305,7 +2599,7 @@ function ShortsSlideImpl({
   } = useShortsSlideGestures({
     getVideoElement,
     shouldMount,
-    disabled: isMarkedHidden,
+    disabled: isMarkedHidden || playbackFailure !== null,
     scrubbingRef,
     setScrubbing,
     setFastActive,
@@ -2509,7 +2803,7 @@ function ShortsSlideImpl({
         />
       )}
 
-      {fastActive && (
+      {(fastActive || keyboardFastPlayback) && (
         <div className="shorts-slide__rate-hint" aria-hidden="true">
           2x 速播放中
         </div>
@@ -2517,7 +2811,11 @@ function ShortsSlideImpl({
 
 
 
-      {paused && isActive && !scrubbing && (
+      {paused &&
+        !playbackFailure &&
+        isActive &&
+        !scrubbing &&
+        !isMarkedHidden && (
         <div className="shorts-slide__paused" aria-hidden="true">
           <span className="shorts-slide__paused-icon">
             <Play size={22} fill="currentColor" strokeWidth={1.75} />
@@ -2526,9 +2824,32 @@ function ShortsSlideImpl({
       )}
 
       {/* 视频加载/缓冲旋转器 */}
-      {isBuffering && isActive && shouldLoad && !isMarkedHidden && (
+      {isBuffering &&
+        !playbackFailure &&
+        isActive &&
+        shouldLoad &&
+        !isMarkedHidden && (
         <div className="shorts-slide__buffering" aria-hidden="true">
           <ShortsLoadingSpinner size={30} />
+        </div>
+      )}
+
+      {playbackFailure && isActive && !isMarkedHidden && (
+        <div
+          className="shorts-slide__playback-error"
+          role="alert"
+          data-playback-failure={playbackFailure}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <AlertCircle size={28} aria-hidden="true" />
+          <div className="shorts-slide__playback-error-title">播放失败</div>
+          <button
+            type="button"
+            className="shorts-slide__playback-retry"
+            onClick={handlePlaybackRetry}
+          >
+            重试播放
+          </button>
         </div>
       )}
 
@@ -2540,7 +2861,7 @@ function ShortsSlideImpl({
         </div>
       )}
 
-      <div className="shorts-slide__overlay" onClick={(e) => e.stopPropagation()}>
+      <div className="shorts-slide__overlay">
         <h2 className="shorts-slide__title">{item.title}</h2>
         <div className="shorts-slide__meta">
           {item.sourceLabel && (
@@ -2555,13 +2876,6 @@ function ShortsSlideImpl({
             </span>
           )}
         </div>
-        <Link
-          to={`/video/${encodeURIComponent(item.id)}`}
-          className="shorts-slide__detail"
-        >
-          <Info size={13} />
-          <span>查看详情</span>
-        </Link>
       </div>
 
       {/* 右下角操作栏 */}
@@ -2569,10 +2883,16 @@ function ShortsSlideImpl({
         className="shorts-slide__actions"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* 云盘来源徽章 */}
-        <div className="shorts-drive-badge" title={`来源: ${item.sourceLabel || "本地"}`}>
+        {/* 云盘来源徽章同时是当前视频唯一的详情入口。 */}
+        <Link
+          to={detailPath}
+          className="shorts-drive-badge"
+          aria-label={`查看视频详情，来源：${item.sourceLabel || "本地"}`}
+          title={`查看视频详情 · 来源：${item.sourceLabel || "本地"}`}
+          onClick={(event) => onRouteClick(event, detailPath)}
+        >
           {getDriveShortName(item.sourceLabel || "本地")}
-        </div>
+        </Link>
 
         {/* 点赞 */}
         <button
@@ -2629,7 +2949,11 @@ function ShortsSlideImpl({
 
       {/* 移动端左右滑动 / 拖动进度时的时间提示。独立于底部进度条，
           这样可以在触屏设备上放到页面顶部且不受底部容器定位限制。 */}
-      {scrubbing && isActive && shouldLoad && !isMarkedHidden && (
+      {scrubbing &&
+        !playbackFailure &&
+        isActive &&
+        shouldLoad &&
+        !isMarkedHidden && (
         <div
           ref={progressTimeRef}
           className="shorts-slide__progress-time"
@@ -2640,11 +2964,13 @@ function ShortsSlideImpl({
       )}
 
       {/* 进度条 */}
-      {isActive && shouldLoad && !isMarkedHidden && (
+      {isActive && shouldLoad && !isMarkedHidden && !playbackFailure && (
         <div
           className={`shorts-slide__progress ${
             scrubbing ? "is-scrubbing" : ""
           }`}
+          // 进度条自己就要吃掉整根手指：横向定位、纵向也不该误触发翻页。
+          data-shorts-no-swipe=""
           onPointerDown={handleProgressPointerDown}
           onPointerMove={handleProgressPointerMove}
           onPointerUp={handleProgressPointerEnd}
@@ -2703,18 +3029,21 @@ function applyVideoMutedState(video: HTMLVideoElement, nextMuted: boolean) {
 }
 
 /**
- * 两个持久 media element 的角色。备用元素只负责把下一条的数据先拉下来：
- * 不能带 autoplay（有数据后会在屏幕外真的播起来），也必须保持静音。
+ * 两个持久 media element 的角色。播放元素始终优先加载；备用元素默认只做
+ * metadata 准备，页面会在当前视频缓冲健康时把它提升为 auto。备用元素不能
+ * 带 autoplay（有数据后会在屏幕外真的播起来），也必须保持静音。
  */
 function applyIOSVideoRole(
   video: HTMLVideoElement,
   role: "active" | "standby"
 ) {
   if (role === "active") {
+    video.preload = "auto";
     video.autoplay = true;
     video.setAttribute("autoplay", "");
     return;
   }
+  video.preload = "metadata";
   video.autoplay = false;
   video.removeAttribute("autoplay");
   applyVideoMutedState(video, true);

@@ -42,6 +42,10 @@ const adminLayoutSource = readFileSync(
   new URL("../src/admin/AdminLayout.tsx", import.meta.url),
   "utf8"
 );
+const loginPageSource = readFileSync(
+  new URL("../src/admin/LoginPage.tsx", import.meta.url),
+  "utf8"
+);
 const spiderIconSource = readFileSync(
   new URL("../src/admin/icons/SpiderIcon.tsx", import.meta.url),
   "utf8"
@@ -66,12 +70,24 @@ const adminCss = readFileSync(
   new URL("../src/styles/admin.css", import.meta.url),
   "utf8"
 );
+const adminControlsCss = readFileSync(
+  new URL("../src/styles/admin-controls.css", import.meta.url),
+  "utf8"
+);
+const loginCss = readFileSync(
+  new URL("../src/styles/login.css", import.meta.url),
+  "utf8"
+);
 const apiSource = readFileSync(
   new URL("../src/admin/api.ts", import.meta.url),
   "utf8"
 );
 const constantsSource = readFileSync(
   new URL("../src/admin/drive/constants.ts", import.meta.url),
+  "utf8"
+);
+const credentialsSource = readFileSync(
+  new URL("../src/admin/drive/credentials.ts", import.meta.url),
   "utf8"
 );
 const p123QRCodeLoginSource = readFileSync(
@@ -95,7 +111,7 @@ const qrLoginSources = [
 ]
   .join("\n");
 
-const combinedSource = drivesPageSource + "\n" + driveFormSource + "\n" + constantsSource + "\n" + crawlerUploadTargetSource;
+const combinedSource = drivesPageSource + "\n" + driveFormSource + "\n" + constantsSource + "\n" + credentialsSource + "\n" + crawlerUploadTargetSource;
 const driveIconKinds = [
   "p115",
   "p123",
@@ -142,9 +158,9 @@ test("crawler upload target uses explicit local-save option instead of auto targ
   assert.match(combinedSource, /本地保存，不上传/);
   assert.match(
     crawlerPageSource,
-    /UPLOAD_TARGET_KINDS\s*=\s*new Set\(\["p115", "pikpak", "p123", "googledrive", "onedrive", "wopan", "guangyapan", "webdav"\]\)/
+    /drives\.filter\(\(d\) => d\.canUpload\)/
   );
-  assert.match(crawlerPageSource, /drives\.filter\(\(d\) => UPLOAD_TARGET_KINDS\.has\(d\.kind\)\)/);
+  assert.match(apiSource, /canUpload: boolean/);
   assert.doesNotMatch(combinedSource, /自动：唯一/);
   assert.doesNotMatch(combinedSource, /自动模式/);
   assert.doesNotMatch(combinedSource, /较早的视频会上传到该云盘根目录下/);
@@ -183,7 +199,7 @@ test("drive form labels the optional root directory and hides it for localstorag
   assert.doesNotMatch(combinedSource, /set\("scanRootId"/);
 });
 
-test("onedrive drive form only exposes required default-app fields", () => {
+test("onedrive drive form supports default and custom OAuth applications", () => {
   const match =
     /case "onedrive":\s*return \[([\s\S]*?)\];\s*case "googledrive":/.exec(
       combinedSource
@@ -191,12 +207,31 @@ test("onedrive drive form only exposes required default-app fields", () => {
   assert.ok(match, "onedrive credential field block should be present");
   const fields = match[1];
 
+  assert.match(fields, /key: "auth_mode"/);
+  assert.match(fields, /label: "认证方式"/);
+  assert.match(fields, /defaultValue: ONEDRIVE_AUTH_MODE_OPENLIST_API/);
+  assert.match(fields, /label: "OpenList API"/);
+  assert.match(fields, /label: "自建应用"/);
+  assert.match(fields, /key: "client_id"/);
+  assert.match(fields, /label: "客户端 ID"/);
+  assert.match(fields, /key: "client_secret"/);
+  assert.match(fields, /label: "客户端密钥"/);
+  assert.match(fields, /visibleWhen:[\s\S]*?ONEDRIVE_AUTH_MODE_CUSTOM_APP/);
+  assert.match(fields, /请填写客户端密钥值，不是密钥 ID/);
   assert.match(fields, /key: "refresh_token"/);
+  assert.match(fields, /与所用应用匹配的 OneDrive refresh_token/);
   assert.doesNotMatch(fields, /key: "access_token"/);
   assert.doesNotMatch(fields, /key: "api_url_address"/);
   assert.doesNotMatch(fields, /key: "region"/);
   assert.doesNotMatch(fields, /key: "is_sharepoint"/);
   assert.doesNotMatch(fields, /key: "site_id"/);
+  assert.match(driveFormSource, /const visibleFields = fields\.filter/);
+  assert.match(driveFormSource, /\{visibleFields\.map\(\(f\) => \(/);
+  assert.match(
+    driveFormSource,
+    /v === ONEDRIVE_AUTH_MODE_OPENLIST_API[\s\S]*?creds\.client_id = "";[\s\S]*?creds\.client_secret = "";/
+  );
+  assert.match(drivesPageSource, /driveCredentialsForForm\(/);
 });
 
 test("googledrive drive form only supports a custom OAuth client", () => {
@@ -242,7 +277,7 @@ test("webdav drive form asks for a standard endpoint and basic auth credentials"
   assert.doesNotMatch(fields, /encrypt|crypt|302/i);
 });
 
-test("pikpak drive form only exposes account login fields", () => {
+test("pikpak drive form presents email login before refresh token fallback", () => {
   const match =
     /case "pikpak":\s*return \[([\s\S]*?)\];\s*case "wopan":/.exec(
       combinedSource
@@ -250,13 +285,49 @@ test("pikpak drive form only exposes account login fields", () => {
   assert.ok(match, "pikpak credential field block should be present");
   const fields = match[1];
 
-  assert.match(fields, /key: "username"/);
-  assert.match(fields, /key: "password"/);
+  assert.match(
+    fields,
+    /key: "username"[\s\S]*?label: "邮箱"[\s\S]*?methodLabel: "方式一"[\s\S]*?key: "password"[\s\S]*?key: "refresh_token"[\s\S]*?label: "refresh_token"[\s\S]*?methodLabel: "方式二"/
+  );
   assert.doesNotMatch(fields, /key: "platform"/);
-  assert.doesNotMatch(fields, /key: "refresh_token"/);
   assert.doesNotMatch(fields, /key: "captcha_token"/);
   assert.doesNotMatch(fields, /key: "device_id"/);
   assert.doesNotMatch(fields, /key: "disable_media_link"/);
+  assert.doesNotMatch(fields, /推荐/);
+  assert.doesNotMatch(
+    driveFormSource,
+    /优先填写 refresh_token；没有时请同时填写用户名和密码/
+  );
+  assert.match(
+    driveFormSource,
+    /className="admin-form__method-label">\{f\.methodLabel\}<\/div>/
+  );
+  assert.match(
+    drivesPageSource,
+    /driveCredentialError\(form\.kind, form\.creds, !form\.id\)/
+  );
+  assert.match(drivesPageSource, /changedCredentialValues\(/);
+});
+
+test("all existing drive edits submit credential deltas", () => {
+  assert.match(
+    drivesPageSource,
+    /const credentials = existing\s*\? changedCredentialValues\(/
+  );
+  assert.doesNotMatch(
+    drivesPageSource,
+    /existing\s*&&\s*form\.kind\s*===\s*["']pikpak["']/
+  );
+});
+
+test("busy drive edits are saved and report deferred activation", () => {
+  assert.doesNotMatch(drivesPageSource, /const runtimeConfigChanged = Boolean/);
+  assert.doesNotMatch(
+    drivesPageSource,
+    /runtimeConfigChanged && isDriveBusy\(existing\)/
+  );
+  assert.match(drivesPageSource, /resp\.deferred/);
+  assert.match(drivesPageSource, /已保存，将在当前网盘任务结束后生效/);
 });
 
 test("wopan drive form omits the optional family space field", () => {
@@ -287,6 +358,7 @@ test("p115 drive form supports qr login and manual cookie fallback", () => {
   assert.ok(match, "p115 credential field block should be present");
   assert.match(match[1], /key: "cookie"/);
   assert.match(match[1], /UID=xxx; CID=xxx; SEID=xxx; KID=xxx/);
+  assert.match(match[1], /methodLabel: "方式二"/);
 });
 
 test("quark drive form supports qr login and manual cookie fallback", () => {
@@ -307,18 +379,20 @@ test("quark drive form supports qr login and manual cookie fallback", () => {
     );
   assert.ok(match, "quark credential field block should be present");
   assert.match(match[1], /key: "cookie"/);
+  assert.match(match[1], /methodLabel: "方式二"/);
   assert.match(match[1], /__pus=\.\.\.; __puus=\.\.\.; \.\.\./);
+  assert.doesNotMatch(match[1], /use_transcoding_address|客户端 302/);
 });
 
 test("p123 drive form exposes qr login and phone or email password login", () => {
   assertDriveTypeOption("p123", "123网盘");
   assert.match(driveFormSource, /P123QRCodeLogin/);
   assert.match(p123QRCodeLoginSource, /<label>方式一<\/label>/);
-  assert.match(driveFormSource, /className="admin-form__method-label">方式二<\/div>/);
+  assert.match(driveFormSource, /className="admin-form__method-label">\{f\.methodLabel\}<\/div>/);
   assert.doesNotMatch(p123QRCodeLoginSource, /方式一：扫码登录/);
   assert.doesNotMatch(driveFormSource, /方式二：手机号密码登录/);
-  assert.match(drivesPageSource, /hasScannedToken/);
-  assert.match(drivesPageSource, /请使用方式一扫码登录，或填写方式二的手机号\/邮箱和密码/);
+  assert.match(credentialsSource, /hasScannedToken/);
+  assert.match(credentialsSource, /请使用方式一扫码登录，或填写方式二的手机号\/邮箱和密码/);
 
   const match =
     /case "p123":\s*return \[([\s\S]*?)\];\s*case "pikpak":/.exec(
@@ -329,6 +403,7 @@ test("p123 drive form exposes qr login and phone or email password login", () =>
 
   assert.match(fields, /key: "username"/);
   assert.match(fields, /label: "手机号\/邮箱"/);
+  assert.match(fields, /methodLabel: "方式二"/);
   assert.match(fields, /key: "password"/);
   assert.match(fields, /label: "密码"/);
   assert.doesNotMatch(fields, /key: "access_token"/);
@@ -599,7 +674,9 @@ test("crawler management is a separate admin section", () => {
   assert.doesNotMatch(crawlerDeleteModal, /details=/);
   assert.doesNotMatch(crawlerDeleteModal, /danger/);
   assert.doesNotMatch(crawlerDeleteModal, /confirmText=/);
-  assert.doesNotMatch(crawlerDeleteModal, /爬虫配置和脚本文件会被删除|已爬取的视频、封面和预览会保留/);
+  assert.match(crawlerDeleteModal, /正在运行的任务将先自动停止/);
+  assert.match(crawlerDeleteModal, /本地保留的视频、封面、预览和抓取文件将一并删除/);
+  assert.match(crawlerDeleteModal, /已迁移到网盘的视频不受影响/);
   assert.match(confirmModalSource, /plainConfirm \? "" : danger \? " is-danger" : " is-primary"/);
   assert.match(confirmModalSource, /hideIcon \? " has-no-icon" : ""/);
   assert.match(adminCss, /\.admin-confirm\.has-no-icon\s*\{[^}]*grid-template-columns\s*:\s*minmax\(0,\s*1fr\)/s);
@@ -619,6 +696,10 @@ test("crawler management is a separate admin section", () => {
   assert.match(crawlerPageSource, /type="file"/);
   assert.match(crawlerPageSource, /<button className="admin-btn" type="button" onClick=\{importURL\} disabled=\{importing\}>[\s\S]*导入[\s\S]*<\/button>/);
   assert.match(crawlerPageSource, /placeholder="支持http或socks5代理"/);
+  assert.match(crawlerPageSource, /<label htmlFor="crawler-proxy">抓取代理<\/label>/);
+  assert.match(crawlerPageSource, /<label htmlFor="crawler-upload-proxy">上传代理<\/label>/);
+  assert.match(crawlerPageSource, /uploadProxy: form\.uploadProxy\.trim\(\)/);
+  assert.match(crawlerPageSource, /placeholder="仅本地视频上传到网盘时使用"/);
   assert.doesNotMatch(crawlerPageSource, /LinkIcon/);
   assert.match(crawlerPageSource, /<div className="admin-crawler-local-import">\s*<span>本地导入<\/span>[\s\S]*?className=\{`admin-crawler-dropzone/);
   assert.match(crawlerPageSource, /<label htmlFor="crawler-script-url">链接导入<\/label>/);
@@ -663,6 +744,7 @@ test("crawler management is a separate admin section", () => {
   assert.doesNotMatch(crawlerPageSource, /预览：开/);
   assert.doesNotMatch(crawlerPageSource, /预览：关/);
   assert.match(crawlerPageSource, /触发上传/);
+  assert.match(crawlerPageSource, /已触发当前爬虫的上传任务/);
   assert.match(crawlerPageSource, /暂停使用/);
   assert.match(crawlerPageSource, /恢复使用/);
   assert.doesNotMatch(crawlerPageSource, /<Download size=\{13\} \/>\s*\{running \? "触发中\.\.\." : "立即抓取"\}/);
@@ -689,7 +771,7 @@ test("crawler management is a separate admin section", () => {
   assert.doesNotMatch(adminCss, /admin-crawler-(pipeline|stage)/);
   assert.doesNotMatch(crawlerPageSource, /teaserEnabled: form\.teaserEnabled/);
   assert.doesNotMatch(crawlerPageSource, /aria-pressed=\{form\.teaserEnabled\}/);
-  assert.match(crawlerPageSource, /UPLOAD_TARGET_KINDS/);
+  assert.match(crawlerPageSource, /drives\.filter\(\(d\) => d\.canUpload\)/);
   assert.doesNotMatch(crawlerPageSource, /新建脚本/);
   assert.doesNotMatch(crawlerPageSource, /爬虫 ID/);
   assert.doesNotMatch(crawlerPageSource, /crawler-id/);
@@ -704,6 +786,7 @@ test("crawler management is a separate admin section", () => {
   assert.doesNotMatch(crawlerPageSource, /内置 91/);
   assert.match(apiSource, /type AdminCrawler/);
   assert.match(apiSource, /uploadDriveId\?: string/);
+  assert.match(apiSource, /uploadProxy\?: string/);
   assert.match(apiSource, /paused: boolean/);
   assert.match(apiSource, /teaserEnabled: boolean/);
   assert.doesNotMatch(apiSource, /teaserEnabled\?: boolean/);
@@ -729,8 +812,26 @@ test("system sidebar contains navigation only while global actions live in the l
   assert.match(adminLayoutSource, /<AdminGlobalActions[\s\S]*?onCheckUpdate=[\s\S]*?onLogout=/);
 });
 
-test("admin shell stays mounted while lazy admin pages load", () => {
-  assert.match(appSource, /import \{ AdminLayout \} from "@\/admin\/AdminLayout";/);
+test("admin layout and its stylesheet load as one lazy route chunk", () => {
+  assert.doesNotMatch(appSource, /import \{ AdminLayout \} from "@\/admin\/AdminLayout";/);
+  assert.match(
+    appSource,
+    /const AdminLayout\s*=\s*lazy\(\(\) =>[\s\S]*?import\("@\/admin\/AdminLayout"\)[\s\S]*?default: module\.AdminLayout/
+  );
+  assert.match(
+    adminLayoutSource,
+    /import "@\/styles\/admin-controls\.css";\s*import "@\/styles\/admin\.css";/
+  );
+  assert.match(
+    loginPageSource,
+    /import "@\/styles\/admin-controls\.css";\s*import "@\/styles\/login\.css";/
+  );
+  for (const selector of ["admin-form", "admin-password-input", "admin-btn"]) {
+    const baseRule = new RegExp(`^\\.${selector}\\s*\\{`, "m");
+    assert.match(adminControlsCss, baseRule);
+    assert.doesNotMatch(adminCss, baseRule);
+    assert.doesNotMatch(loginCss, baseRule);
+  }
   assert.match(
     appSource,
     /import \{ DrivesPageLoading \} from "@\/admin\/DrivesPageLoading";/
@@ -739,10 +840,9 @@ test("admin shell stays mounted while lazy admin pages load", () => {
     appSource,
     /import \{ CrawlersPageLoading \} from "@\/admin\/CrawlersPageLoading";/
   );
-  assert.doesNotMatch(appSource, /const AdminLayout\s*=\s*lazy/);
   assert.doesNotMatch(appSource, /<Suspense fallback=\{null\}>\s*<Routes>/);
   assert.match(appSource, /function PageSuspense\(\{[\s\S]*fallback = null,[\s\S]*fallback\?: ReactNode/);
-  assert.match(appSource, /path="\/admin"[\s\S]*<AdminLayout \/>/);
+  assert.match(appSource, /path="\/admin"[\s\S]*?<PageSuspense>\s*<AdminLayout \/>\s*<\/PageSuspense>/);
   assert.match(
     appSource,
     /path="drives"[\s\S]*<PageSuspense fallback=\{<DrivesPageLoading \/>\}>[\s\S]*<DrivesPage \/>[\s\S]*<\/PageSuspense>/
@@ -1050,7 +1150,7 @@ test("drive detail actions use ordinary text buttons", () => {
   );
   assert.match(
     drivesPageSource,
-    /className="admin-btn"\s+onClick=\{\(\) => openEdit\(d\)\}/
+    /className="admin-btn admin-detail-actions__credentials"\s+onClick=\{\(\) => openEdit\(d\)\}/
   );
   assert.match(
     drivesPageSource,
@@ -1067,6 +1167,29 @@ test("drive detail actions use ordinary text buttons", () => {
   assert.doesNotMatch(adminCss, /\.admin-detail-actions > \.admin-btn:not\(\.is-danger\)/);
 });
 
+test("mobile drive detail actions use an explicit two-by-two grid", () => {
+  assert.match(
+    adminCss,
+    /@media \(max-width: 640px\) \{\s*\.admin-detail-actions \{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);[^}]*grid-template-areas:\s*"tasks tasks"\s*"credentials danger";/s
+  );
+  assert.match(
+    adminCss,
+    /\.admin-detail-actions > \.admin-task-controls \{[^}]*grid-area:\s*tasks;[^}]*display:\s*grid;[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);/s
+  );
+  assert.match(
+    adminCss,
+    /\.admin-detail-actions__credentials \{[^}]*grid-area:\s*credentials;/s
+  );
+  assert.match(
+    adminCss,
+    /\.admin-detail-actions__danger \{[^}]*grid-area:\s*danger;[^}]*margin-left:\s*0;/s
+  );
+  assert.match(
+    drivesPageLoadingSource,
+    /className="admin-btn admin-detail-actions__credentials"[\s\S]*?>\s*编辑凭证\s*<\/button>/
+  );
+});
+
 test("drive delete and credential confirm buttons use ordinary styling", () => {
   const detailViewSource = drivesPageSource.slice(
     drivesPageSource.indexOf("if (selectedDriveId && selectedDrive)"),
@@ -1074,6 +1197,7 @@ test("drive delete and credential confirm buttons use ordinary styling", () => {
   );
 
   assert.match(deleteDriveModalSource, /const primaryText = deleting \? "删除中\.\.\." : "确认"/);
+  assert.match(deleteDriveModalSource, /正在运行的任务将先自动停止，完全退出后再删除/);
   assert.match(deleteDriveModalSource, /className="admin-btn"\s+onClick=\{onConfirm\}/);
   assert.doesNotMatch(deleteDriveModalSource, /Trash2|确认删除|is-danger/);
   assert.match(
@@ -1162,6 +1286,10 @@ test("drive detail refresh state uses the detail skeleton without list actions",
   assert.match(
     drivesPageLoadingSource,
     /className="admin-detail-tree-container"[\s\S]*<SkipDirsLoadingIndicator \/>/
+  );
+  assert.doesNotMatch(
+    drivesPageLoadingSource,
+    /保存更改|修改后自动保存|admin-skipdirs-autosave/
   );
   assert.doesNotMatch(drivesPageLoadingSource, /admin-drive-detail-loading__tree/);
   assert.doesNotMatch(adminCss, /admin-drive-detail-loading__tree/);
@@ -1260,6 +1388,11 @@ test("drive preview generation uses an accessible slider switch", () => {
   assert.match(driveComponentsSource, /role="switch"/);
   assert.match(driveComponentsSource, /aria-checked=\{d\.teaserEnabled\}/);
   assert.match(driveComponentsSource, /className="toggle-switch__dot"/);
+  assert.match(
+    driveComponentsSource,
+    /disabled=\{togglingTeaserId === d\.id\}/
+  );
+  assert.doesNotMatch(driveComponentsSource, /previewSettingBusy|暂不能修改预览开关/);
   assert.doesNotMatch(driveComponentsSource, /预览视频：开|预览视频：关|PowerOff/);
 });
 
@@ -1275,6 +1408,39 @@ test("drive skip directory tree uses a solid selection box without status pills"
     /\.admin-skipdirs-checkbox:checked\s*\{[^}]*border-color:\s*var\(--accent\)[^}]*background:\s*var\(--accent\)/s
   );
   assert.doesNotMatch(adminCss, /\.admin-skipdirs-flag\s*\{/);
+});
+
+test("drive skip directory panel omits the deferred policy cleanup notice", () => {
+  assert.doesNotMatch(
+    skipDirsPanelSource,
+    /下次扫盘时从媒体库移除|在此之前取消即可保留|手动标签和播放记录不会恢复/
+  );
+  assert.doesNotMatch(skipDirsPanelSource, /admin-skipdirs-note/);
+});
+
+test("drive skip directory selections auto-save without polling away local edits", () => {
+  assert.doesNotMatch(skipDirsPanelSource, /保存更改|handleSave/);
+  assert.match(skipDirsPanelSource, /const AUTO_SAVE_DELAY_MS = 300/);
+  assert.match(
+    skipDirsPanelSource,
+    /saveChainRef\.current = saveChainRef\.current\.then/
+  );
+  assert.match(
+    skipDirsPanelSource,
+    /draftRevisionRef\.current !== savedRevisionRef\.current/
+  );
+  assert.match(skipDirsPanelSource, /保存失败，正在重试…/);
+  assert.match(skipDirsPanelSource, /已保存，任务结束后生效/);
+  assert.doesNotMatch(skipDirsPanelSource, /drive\.scanGenerationStatus\?\.state/);
+  assert.match(skipDirsPanelSource, /disabled=\{disabled\}/);
+  assert.doesNotMatch(skipDirsPanelSource, /等待任务完成后再修改跳过目录/);
+  assert.doesNotMatch(skipDirsPanelSource, /修改后自动保存/);
+  assert.match(skipDirsPanelSource, /saveStatus === "idle"[\s\S]*\? null/);
+  assert.match(drivesPageSource, /driveListRequestVersion\.current \+= 1/);
+  assert.doesNotMatch(
+    drivesPageSource,
+    /onSaved=\{\(saved\)[\s\S]*?refreshDriveList\(\);[\s\S]*?\}\}/
+  );
 });
 
 test("drive cards label fingerprint count as video fingerprint count", () => {

@@ -11,14 +11,29 @@ import {
 } from "yaml";
 
 export type SettingsDraft = {
+  nightlyDisabled: boolean;
   nightlyStartTime: string;
+  nightlyTimezone: string;
+  builtinTagsEnabled: boolean;
+  previewConcurrency: number;
+  thumbnailConcurrency: number;
+  fingerprintConcurrency: number;
 };
 
 export type VisualField = keyof SettingsDraft;
 
 export const DEFAULT_DRAFT: SettingsDraft = {
+  nightlyDisabled: false,
   nightlyStartTime: "01:00",
+  nightlyTimezone: "Asia/Shanghai",
+  builtinTagsEnabled: true,
+  previewConcurrency: 1,
+  thumbnailConcurrency: 1,
+  fingerprintConcurrency: 1,
 };
+
+export const MIN_GENERATION_CONCURRENCY = 1;
+export const MAX_GENERATION_CONCURRENCY = 5;
 
 type ParsedMap = YAMLMap<ParsedNode, ParsedNode | null>;
 type ParsedPair = Pair<ParsedNode, ParsedNode | null>;
@@ -39,6 +54,16 @@ export function isValidStartTime(value: string) {
   return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
 }
 
+export function isValidTimezone(value: string) {
+  if (value === "Local" || value === "" || value !== value.trim()) return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value }).format(0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function configDocument(source: string) {
   const document = parseDocument(source, {
     keepSourceTokens: true,
@@ -55,6 +80,15 @@ export function configDocument(source: string) {
 }
 
 function draftFromDocument(document: ReturnType<typeof configDocument>): SettingsDraft {
+  const nightlyNode = document.get("nightly", true);
+  if (
+    nightlyNode !== undefined &&
+    nightlyNode !== null &&
+    !isMap(nightlyNode) &&
+    !(isScalar(nightlyNode) && nightlyNode.value === null)
+  ) {
+    throw new Error("nightly 必须是映射对象");
+  }
   const configuredStart = document.getIn(["nightly", "start_time"]);
   let nightlyStartTime = DEFAULT_DRAFT.nightlyStartTime;
   if (configuredStart !== undefined && configuredStart !== null) {
@@ -68,7 +102,92 @@ function draftFromDocument(document: ReturnType<typeof configDocument>): Setting
       nightlyStartTime = `${String(legacyHour).padStart(2, "0")}:00`;
     }
   }
-  return { nightlyStartTime };
+
+  const configuredTimezone = document.getIn(["nightly", "timezone"]);
+  let nightlyTimezone = DEFAULT_DRAFT.nightlyTimezone;
+  if (configuredTimezone !== undefined && configuredTimezone !== null) {
+    if (typeof configuredTimezone !== "string" || !isValidTimezone(configuredTimezone)) {
+      throw new Error("nightly.timezone 必须是有效的 IANA 时区名");
+    }
+    nightlyTimezone = configuredTimezone;
+  }
+
+  const configuredDisabled = document.getIn(["nightly", "disabled"]);
+  let nightlyDisabled = DEFAULT_DRAFT.nightlyDisabled;
+  if (configuredDisabled !== undefined && configuredDisabled !== null) {
+    if (typeof configuredDisabled !== "boolean") {
+      throw new Error("nightly.disabled 必须是布尔值");
+    }
+    nightlyDisabled = configuredDisabled;
+  }
+
+  const previewNode = document.get("preview", true);
+  if (
+    previewNode !== undefined &&
+    previewNode !== null &&
+    !isMap(previewNode) &&
+    !(isScalar(previewNode) && previewNode.value === null)
+  ) {
+    throw new Error("preview 必须是映射对象");
+  }
+  const generationNode = document.get("generation", true);
+  if (
+    generationNode !== undefined &&
+    generationNode !== null &&
+    !isMap(generationNode) &&
+    !(isScalar(generationNode) && generationNode.value === null)
+  ) {
+    throw new Error("generation 必须是映射对象");
+  }
+  function generationConcurrency(key: string, fallback: number) {
+    const value = document.getIn(["generation", key]);
+    if (value === undefined || value === null) return fallback;
+    if (
+      typeof value !== "number" ||
+      !Number.isInteger(value) ||
+      value < MIN_GENERATION_CONCURRENCY ||
+      value > MAX_GENERATION_CONCURRENCY
+    ) {
+      throw new Error(`generation.${key} 必须是 ${MIN_GENERATION_CONCURRENCY}-${MAX_GENERATION_CONCURRENCY} 之间的整数`);
+    }
+    return value;
+  }
+  const thumbnailConcurrency = generationConcurrency(
+    "thumbnail_concurrency", DEFAULT_DRAFT.thumbnailConcurrency
+  );
+  const previewConcurrency = generationConcurrency(
+    "preview_concurrency", DEFAULT_DRAFT.previewConcurrency
+  );
+  const fingerprintConcurrency = generationConcurrency(
+    "fingerprint_concurrency", DEFAULT_DRAFT.fingerprintConcurrency
+  );
+
+  const tagsNode = document.get("tags", true);
+  if (
+    tagsNode !== undefined &&
+    tagsNode !== null &&
+    !isMap(tagsNode) &&
+    !(isScalar(tagsNode) && tagsNode.value === null)
+  ) {
+    throw new Error("tags 必须是映射对象");
+  }
+  const configuredBuiltinTags = document.getIn(["tags", "builtin_pack_enabled"]);
+  let builtinTagsEnabled = DEFAULT_DRAFT.builtinTagsEnabled;
+  if (configuredBuiltinTags !== undefined && configuredBuiltinTags !== null) {
+    if (typeof configuredBuiltinTags !== "boolean") {
+      throw new Error("tags.builtin_pack_enabled 必须是布尔值");
+    }
+    builtinTagsEnabled = configuredBuiltinTags;
+  }
+  return {
+    nightlyDisabled,
+    nightlyStartTime,
+    nightlyTimezone,
+    builtinTagsEnabled,
+    previewConcurrency,
+    thumbnailConcurrency,
+    fingerprintConcurrency,
+  };
 }
 
 export function parseConfig(source: string) {
@@ -147,14 +266,15 @@ function insertLinesAtBoundary(
   };
 }
 
-function replacePairValue(
+function replaceStringPairValue(
   source: string,
   pair: ParsedPair,
-  value: string
+  value: string,
+  path: string
 ): SourceEdit {
   const node = pair.value;
   if (node && !isScalar(node)) {
-    throw new Error("nightly.start_time 必须是字符串值");
+    throw new Error(`${path} 必须是字符串值`);
   }
 
   if (node?.range && node.range[0] < node.range[1]) {
@@ -166,13 +286,13 @@ function replacePairValue(
   }
 
   if (!isScalar(pair.key)) {
-    throw new Error("无法定位 nightly.start_time 的键名");
+    throw new Error(`无法定位 ${path} 的键名`);
   }
-  const keyRange = requiredRange(pair.key, "nightly.start_time");
+  const keyRange = requiredRange(pair.key, path);
   const endOfLine = lineEndIncludingBreak(source, keyRange[1]);
   const colon = source.indexOf(":", keyRange[1]);
   if (colon === -1 || colon >= endOfLine) {
-    throw new Error("无法定位 nightly.start_time 的值");
+    throw new Error(`无法定位 ${path} 的值`);
   }
 
   let whitespaceEnd = colon + 1;
@@ -265,33 +385,36 @@ function insertFlowMapEntry(source: string, map: ParsedMap, entry: string): Sour
 function insertBlockMapEntry(
   source: string,
   map: ParsedMap,
-  entry: string
+  entry: string,
+  description = "YAML 映射"
 ): SourceEdit {
   const firstPair = map.items[0];
   if (!firstPair || !isScalar(firstPair.key)) {
-    throw new Error("无法确定 nightly 配置项的缩进");
+    throw new Error(`无法确定 ${description} 配置项的缩进`);
   }
-  const keyRange = requiredRange(firstPair.key, "nightly 配置项");
+  const keyRange = requiredRange(firstPair.key, `${description} 配置项`);
   const indent = source.slice(lineStart(source, keyRange[0]), keyRange[0]);
-  const mapRange = requiredRange(map, "nightly");
+  const mapRange = requiredRange(map, description);
   return insertLinesAtBoundary(source, mapRange[2], [`${indent}${entry}`]);
 }
 
 function insertAfterEmptyMapKey(
   source: string,
   pair: ParsedPair,
-  entry: string
+  entry: string,
+  description = "YAML 映射"
 ): SourceEdit {
-  const keyRange = requiredRange(pair.key, "nightly");
+  const keyRange = requiredRange(pair.key, description);
   const parentIndent = source.slice(lineStart(source, keyRange[0]), keyRange[0]);
   const lineEnd = lineEndIncludingBreak(source, keyRange[1]);
   return insertLinesAtBoundary(source, lineEnd, [`${parentIndent}  ${entry}`]);
 }
 
-function addNightlySection(
+function addNightlyStringSection(
   source: string,
   document: ReturnType<typeof configDocument>,
   root: ParsedMap | null,
+  key: "start_time" | "timezone",
   value: string
 ): SourceEdit {
   const renderedValue = yamlString(value);
@@ -299,14 +422,14 @@ function addNightlySection(
     return insertFlowMapEntry(
       source,
       root,
-      `nightly: { start_time: ${renderedValue} }`
+      `nightly: { ${key}: ${renderedValue} }`
     );
   }
 
   const position = root?.range?.[2] ?? document.range?.[1] ?? source.length;
   return insertLinesAtBoundary(source, position, [
     "nightly:",
-    `  start_time: ${renderedValue}`,
+    `  ${key}: ${renderedValue}`,
   ]);
 }
 
@@ -317,7 +440,9 @@ function nightlyStartTimeEdits(
 ): SourceEdit[] {
   const root = isMap(document.contents) ? (document.contents as ParsedMap) : null;
   const nightlyPair = root ? findPair(root, "nightly") : undefined;
-  if (!nightlyPair) return [addNightlySection(source, document, root, value)];
+  if (!nightlyPair) {
+    return [addNightlyStringSection(source, document, root, "start_time", value)];
+  }
 
   const nightlyNode = nightlyPair.value;
   if (
@@ -352,14 +477,16 @@ function nightlyStartTimeEdits(
   const startTimePair = findPair(nightly, "start_time");
   const legacyHourPair = findPair(nightly, "cron_hour");
   if (startTimePair) {
-    const edits = [replacePairValue(source, startTimePair, value)];
+    const edits = [
+      replaceStringPairValue(source, startTimePair, value, "nightly.start_time"),
+    ];
     if (legacyHourPair) edits.push(removeMapPair(source, nightly, legacyHourPair));
     return edits;
   }
   if (legacyHourPair) {
     return [
       replacePairKey(legacyHourPair, "start_time"),
-      replacePairValue(source, legacyHourPair, value),
+      replaceStringPairValue(source, legacyHourPair, value, "nightly.start_time"),
     ];
   }
 
@@ -368,6 +495,315 @@ function nightlyStartTimeEdits(
     isFlowMap(nightly)
       ? insertFlowMapEntry(source, nightly, entry)
       : insertBlockMapEntry(source, nightly, entry),
+  ];
+}
+
+function nightlyTimezoneEdits(
+  source: string,
+  document: ReturnType<typeof configDocument>,
+  value: string
+): SourceEdit[] {
+  const root = isMap(document.contents) ? (document.contents as ParsedMap) : null;
+  const nightlyPair = root ? findPair(root, "nightly") : undefined;
+  if (!nightlyPair) {
+    return [addNightlyStringSection(source, document, root, "timezone", value)];
+  }
+
+  const nightlyNode = nightlyPair.value;
+  if (
+    !nightlyNode ||
+    (isScalar(nightlyNode) &&
+      nightlyNode.value === null &&
+      (!nightlyNode.range || nightlyNode.range[0] === nightlyNode.range[1]))
+  ) {
+    return [
+      insertAfterEmptyMapKey(source, nightlyPair, `timezone: ${yamlString(value)}`),
+    ];
+  }
+  if (isScalar(nightlyNode) && nightlyNode.value === null) {
+    const range = requiredRange(nightlyNode, "nightly");
+    return [
+      {
+        start: range[0],
+        end: range[1],
+        text: `{ timezone: ${yamlString(value)} }`,
+      },
+    ];
+  }
+  if (!isMap(nightlyNode)) {
+    throw new Error("nightly 必须是映射对象");
+  }
+
+  const nightly = nightlyNode as ParsedMap;
+  const timezonePair = findPair(nightly, "timezone");
+  if (timezonePair) {
+    return [
+      replaceStringPairValue(source, timezonePair, value, "nightly.timezone"),
+    ];
+  }
+
+  const entry = `timezone: ${yamlString(value)}`;
+  return [
+    isFlowMap(nightly)
+      ? insertFlowMapEntry(source, nightly, entry)
+      : insertBlockMapEntry(source, nightly, entry),
+  ];
+}
+
+function replaceBooleanPairValue(
+  source: string,
+  pair: ParsedPair,
+  value: boolean,
+  path: string
+): SourceEdit {
+  const node = pair.value;
+  if (node && !isScalar(node)) {
+    throw new Error(`${path} 必须是布尔值`);
+  }
+  const rendered = value ? "true" : "false";
+
+  if (node?.range && node.range[0] < node.range[1]) {
+    return {
+      start: node.range[0],
+      end: node.range[1],
+      text: rendered,
+    };
+  }
+
+  if (!isScalar(pair.key)) {
+    throw new Error(`无法定位 ${path} 的键名`);
+  }
+  const keyRange = requiredRange(pair.key, path);
+  const endOfLine = lineEndIncludingBreak(source, keyRange[1]);
+  const colon = source.indexOf(":", keyRange[1]);
+  if (colon === -1 || colon >= endOfLine) {
+    throw new Error(`无法定位 ${path} 的值`);
+  }
+
+  let whitespaceEnd = colon + 1;
+  while (source[whitespaceEnd] === " " || source[whitespaceEnd] === "\t") {
+    whitespaceEnd += 1;
+  }
+  const commentGap = source[whitespaceEnd] === "#" ? " " : "";
+  return {
+    start: colon + 1,
+    end: whitespaceEnd,
+    text: ` ${rendered}${commentGap}`,
+  };
+}
+
+type BooleanField = {
+  section: string;
+  key: string;
+  path: string;
+};
+
+function addBooleanSection(
+  source: string,
+  document: ReturnType<typeof configDocument>,
+  root: ParsedMap | null,
+  field: BooleanField,
+  value: boolean
+): SourceEdit {
+  const rendered = value ? "true" : "false";
+  if (root && isFlowMap(root)) {
+    return insertFlowMapEntry(
+      source,
+      root,
+      `${field.section}: { ${field.key}: ${rendered} }`
+    );
+  }
+
+  const position = root?.range?.[2] ?? document.range?.[1] ?? source.length;
+  return insertLinesAtBoundary(source, position, [
+    `${field.section}:`,
+    `  ${field.key}: ${rendered}`,
+  ]);
+}
+
+function booleanFieldEdits(
+  source: string,
+  document: ReturnType<typeof configDocument>,
+  field: BooleanField,
+  value: boolean
+): SourceEdit[] {
+  const root = isMap(document.contents) ? (document.contents as ParsedMap) : null;
+  const sectionPair = root ? findPair(root, field.section) : undefined;
+  if (!sectionPair) {
+    return [addBooleanSection(source, document, root, field, value)];
+  }
+
+  const rendered = value ? "true" : "false";
+  const sectionNode = sectionPair.value;
+  if (
+    !sectionNode ||
+    (isScalar(sectionNode) &&
+      sectionNode.value === null &&
+      (!sectionNode.range || sectionNode.range[0] === sectionNode.range[1]))
+  ) {
+    return [
+      insertAfterEmptyMapKey(
+        source,
+        sectionPair,
+        `${field.key}: ${rendered}`,
+        field.section
+      ),
+    ];
+  }
+  if (isScalar(sectionNode) && sectionNode.value === null) {
+    const range = requiredRange(sectionNode, field.section);
+    return [
+      {
+        start: range[0],
+        end: range[1],
+        text: `{ ${field.key}: ${rendered} }`,
+      },
+    ];
+  }
+  if (!isMap(sectionNode)) {
+    throw new Error(`${field.section} 必须是映射对象`);
+  }
+
+  const section = sectionNode as ParsedMap;
+  const fieldPair = findPair(section, field.key);
+  if (fieldPair) {
+    return [replaceBooleanPairValue(source, fieldPair, value, field.path)];
+  }
+
+  const entry = `${field.key}: ${rendered}`;
+  return [
+    isFlowMap(section)
+      ? insertFlowMapEntry(source, section, entry)
+      : insertBlockMapEntry(source, section, entry, field.section),
+  ];
+}
+
+function nightlyDisabledEdits(
+  source: string,
+  document: ReturnType<typeof configDocument>,
+  value: boolean
+) {
+  return booleanFieldEdits(
+    source,
+    document,
+    { section: "nightly", key: "disabled", path: "nightly.disabled" },
+    value
+  );
+}
+
+function builtinTagsEnabledEdits(
+  source: string,
+  document: ReturnType<typeof configDocument>,
+  value: boolean
+) {
+  return booleanFieldEdits(
+    source,
+    document,
+    {
+      section: "tags",
+      key: "builtin_pack_enabled",
+      path: "tags.builtin_pack_enabled",
+    },
+    value
+  );
+}
+
+function replaceIntegerPairValue(
+  source: string,
+  pair: ParsedPair,
+  value: number,
+  path: string
+): SourceEdit {
+  const node = pair.value;
+  if (node && !isScalar(node)) {
+    throw new Error(`${path} 必须是整数`);
+  }
+  if (node && node.value !== null && typeof node.value !== "number") {
+    throw new Error(`${path} 必须是整数`);
+  }
+  const rendered = String(value);
+
+  if (node?.range && node.range[0] < node.range[1]) {
+    return {
+      start: node.range[0],
+      end: node.range[1],
+      text: rendered,
+    };
+  }
+
+  if (!isScalar(pair.key)) {
+    throw new Error(`无法定位 ${path} 的键名`);
+  }
+  const keyRange = requiredRange(pair.key, path);
+  const endOfLine = lineEndIncludingBreak(source, keyRange[1]);
+  const colon = source.indexOf(":", keyRange[1]);
+  if (colon === -1 || colon >= endOfLine) {
+    throw new Error(`无法定位 ${path} 的值`);
+  }
+
+  let whitespaceEnd = colon + 1;
+  while (source[whitespaceEnd] === " " || source[whitespaceEnd] === "\t") {
+    whitespaceEnd += 1;
+  }
+  const commentGap = source[whitespaceEnd] === "#" ? " " : "";
+  return {
+    start: colon + 1,
+    end: whitespaceEnd,
+    text: ` ${rendered}${commentGap}`,
+  };
+}
+
+function integerSettingEdits(
+  source: string,
+  document: ReturnType<typeof configDocument>,
+  section: string,
+  key: string,
+  value: number
+): SourceEdit[] {
+  const root = isMap(document.contents) ? (document.contents as ParsedMap) : null;
+  const sectionPair = root ? findPair(root, section) : undefined;
+  const entry = `${key}: ${value}`;
+  if (!sectionPair) {
+    if (root && isFlowMap(root)) {
+      return [insertFlowMapEntry(source, root, `${section}: { ${entry} }`)];
+    }
+    const position = root?.range?.[2] ?? document.range?.[1] ?? source.length;
+    return [insertLinesAtBoundary(source, position, [`${section}:`, `  ${entry}`])];
+  }
+
+  const sectionNode = sectionPair.value;
+  if (
+    !sectionNode ||
+    (isScalar(sectionNode) &&
+      sectionNode.value === null &&
+      (!sectionNode.range || sectionNode.range[0] === sectionNode.range[1]))
+  ) {
+    return [insertAfterEmptyMapKey(source, sectionPair, entry, section)];
+  }
+  if (isScalar(sectionNode) && sectionNode.value === null) {
+    const range = requiredRange(sectionNode, section);
+    return [{ start: range[0], end: range[1], text: `{ ${entry} }` }];
+  }
+  if (!isMap(sectionNode)) {
+    throw new Error(`${section} 必须是映射对象`);
+  }
+
+  const sectionMap = sectionNode as ParsedMap;
+  const valuePair = findPair(sectionMap, key);
+  if (valuePair) {
+    return [
+      replaceIntegerPairValue(
+        source,
+        valuePair,
+        value,
+        `${section}.${key}`
+      ),
+    ];
+  }
+  return [
+    isFlowMap(sectionMap)
+      ? insertFlowMapEntry(source, sectionMap, entry)
+      : insertBlockMapEntry(source, sectionMap, entry, section),
   ];
 }
 
@@ -396,13 +832,48 @@ export function applyVisualFields(
   draft: SettingsDraft,
   fields: ReadonlySet<VisualField>
 ) {
-  if (!fields.has("nightlyStartTime")) return source;
-
-  const document = configDocument(source);
-  const updated = applySourceEdits(
-    source,
-    nightlyStartTimeEdits(source, document, draft.nightlyStartTime)
-  );
+  let updated = source;
+  if (fields.has("nightlyDisabled")) {
+    const document = configDocument(updated);
+    updated = applySourceEdits(
+      updated,
+      nightlyDisabledEdits(updated, document, draft.nightlyDisabled)
+    );
+  }
+  if (fields.has("nightlyStartTime")) {
+    const document = configDocument(updated);
+    updated = applySourceEdits(
+      updated,
+      nightlyStartTimeEdits(updated, document, draft.nightlyStartTime)
+    );
+  }
+  if (fields.has("nightlyTimezone")) {
+    const document = configDocument(updated);
+    updated = applySourceEdits(
+      updated,
+      nightlyTimezoneEdits(updated, document, draft.nightlyTimezone)
+    );
+  }
+  for (const [field, key] of [
+    ["thumbnailConcurrency", "thumbnail_concurrency"],
+    ["previewConcurrency", "preview_concurrency"],
+    ["fingerprintConcurrency", "fingerprint_concurrency"],
+  ] as const) {
+    if (fields.has(field)) {
+      const document = configDocument(updated);
+      updated = applySourceEdits(
+        updated,
+        integerSettingEdits(updated, document, "generation", key, draft[field])
+      );
+    }
+  }
+  if (fields.has("builtinTagsEnabled")) {
+    const document = configDocument(updated);
+    updated = applySourceEdits(
+      updated,
+      builtinTagsEnabledEdits(updated, document, draft.builtinTagsEnabled)
+    );
+  }
 
   // Source ranges perform the write, while a fresh parse verifies that the
   // localized edit still produced one valid YAML document.
@@ -412,8 +883,26 @@ export function applyVisualFields(
 
 export function changedVisualFields(saved: SettingsDraft, draft: SettingsDraft) {
   const fields = new Set<VisualField>();
+  if (saved.nightlyDisabled !== draft.nightlyDisabled) {
+    fields.add("nightlyDisabled");
+  }
   if (saved.nightlyStartTime !== draft.nightlyStartTime) {
     fields.add("nightlyStartTime");
+  }
+  if (saved.nightlyTimezone !== draft.nightlyTimezone) {
+    fields.add("nightlyTimezone");
+  }
+  if (saved.builtinTagsEnabled !== draft.builtinTagsEnabled) {
+    fields.add("builtinTagsEnabled");
+  }
+  if (saved.previewConcurrency !== draft.previewConcurrency) {
+    fields.add("previewConcurrency");
+  }
+  if (saved.thumbnailConcurrency !== draft.thumbnailConcurrency) {
+    fields.add("thumbnailConcurrency");
+  }
+  if (saved.fingerprintConcurrency !== draft.fingerprintConcurrency) {
+    fields.add("fingerprintConcurrency");
   }
   return fields;
 }

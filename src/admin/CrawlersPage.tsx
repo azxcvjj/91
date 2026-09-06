@@ -24,7 +24,10 @@ import { generationStateClass, generationStateLabel } from "./drive/constants";
 import { CrawlerUploadTargetField } from "./drive/CrawlerUploadTargetField";
 import { SpiderIcon } from "./icons/SpiderIcon";
 import { AdminEmptyVisual } from "./AdminEmptyVisual";
-import { CrawlerListSkeleton } from "./CrawlersPageLoading";
+import {
+  CrawlerListControlsPlaceholder,
+  CrawlerListSkeleton,
+} from "./CrawlersPageLoading";
 import { useAdminFloatingActionSpace } from "./useAdminFloatingActionSpace";
 import {
   useAdminRouteActive,
@@ -33,7 +36,6 @@ import {
 
 const BUSY_STATES = new Set(["scanning", "generating", "uploading", "queued"]);
 const POLL_INTERVAL_MS = 5000;
-const UPLOAD_TARGET_KINDS = new Set(["p115", "pikpak", "p123", "googledrive", "onedrive", "wopan", "guangyapan", "webdav"]);
 
 function statusBusy(status?: api.DriveGenerationStatus) {
   return BUSY_STATES.has(status?.state ?? "");
@@ -76,7 +78,7 @@ export function CrawlersPage() {
       try {
         const [data, drives] = await Promise.all([api.listCrawlers(), api.listDrives()]);
         setList(data);
-        setUploadTargets(drives.filter((d) => UPLOAD_TARGET_KINDS.has(d.kind)));
+        setUploadTargets(drives.filter((d) => d.canUpload));
       } catch (e) {
         if (!silent) show(e instanceof Error ? e.message : "加载爬虫失败", "error");
       } finally {
@@ -130,7 +132,7 @@ export function CrawlersPage() {
         show(resp.message || "当前爬虫暂不满足上传条件", "info");
         return;
       }
-      show("已触发上传任务", "success");
+      show("已触发当前爬虫的上传任务", "success");
       await refresh(true);
     } catch (e) {
       show(e instanceof Error ? e.message : "触发上传失败", "error");
@@ -176,12 +178,21 @@ export function CrawlersPage() {
     setTogglingTeasers(true);
     setList((prev) => prev.map((item) => ({ ...item, teaserEnabled: next })));
     try {
+      let deferred = false;
       for (const crawler of previous) {
         if (crawler.teaserEnabled !== next) {
-          await api.setDriveTeaserEnabled(crawler.id, next);
+          const resp = await api.setDriveTeaserEnabled(crawler.id, next);
+          deferred = deferred || Boolean(resp.deferred);
         }
       }
-      show(next ? "已开启所有爬虫预览视频生成" : "已关闭所有爬虫预览视频生成", "success");
+      show(
+        deferred
+          ? "已保存，相关爬虫任务结束后生效"
+          : next
+            ? "已开启所有爬虫预览视频生成"
+            : "已关闭所有爬虫预览视频生成",
+        "success"
+      );
       await refresh(true);
     } catch (e) {
       setList(previous);
@@ -199,7 +210,7 @@ export function CrawlersPage() {
       if (resp.warning) {
         show(`已删除爬虫配置，但脚本文件清理失败：${resp.warning}`, "error");
       } else {
-        show("已删除爬虫，已爬取的视频保留", "success");
+        show(`已删除爬虫，并清理 ${resp.deletedVideos} 个本地视频`, "success");
       }
       setDeleteTarget(null);
       if (detailTargetId === deleteTarget.id) setDetailTargetId("");
@@ -225,6 +236,7 @@ export function CrawlersPage() {
           className="admin-card admin-crawler-list"
           aria-busy={loading || undefined}
         >
+          {loading && !hasCrawlers && <CrawlerListControlsPlaceholder />}
           {hasCrawlers && (
             <div className="admin-crawler-list__controls">
               <div className="admin-crawler-global-teaser">
@@ -320,7 +332,7 @@ export function CrawlersPage() {
       <ConfirmModal
         open={deleteTarget !== null}
         title="删除爬虫"
-        message={`确定删除爬虫「${deleteTarget?.name ?? ""}」？`}
+        message={`确定删除爬虫「${deleteTarget?.name ?? ""}」？正在运行的任务将先自动停止；退出后，本地保留的视频、封面、预览和抓取文件将一并删除，已迁移到网盘的视频不受影响。`}
         plainConfirm
         hideIcon
         loading={deleting}
@@ -572,6 +584,7 @@ type EditorForm = {
   name: string;
   targetNew: string;
   proxy: string;
+  uploadProxy: string;
   uploadDriveId: string;
 };
 
@@ -582,6 +595,7 @@ function editorFormFromCrawler(crawler: api.AdminCrawler | null): EditorForm {
     name: crawler?.name ?? "",
     targetNew: crawler?.targetNew || "10",
     proxy: crawler?.proxy ?? "",
+    uploadProxy: crawler?.uploadProxy ?? "",
     uploadDriveId: crawler?.uploadDriveId ?? "",
   };
 }
@@ -750,12 +764,15 @@ function CrawlerEditorModal({
         scriptSourceUrl: form.scriptSourceUrl.trim(),
         targetNew: target,
         proxy: form.proxy.trim(),
+        uploadProxy: form.uploadProxy.trim(),
         uploadDriveId: form.uploadDriveId,
       });
       if (resp.warning) {
         show(`已保存，但初始化失败：${resp.warning}`, "error");
+      } else if (resp.deferred) {
+        show(resp.message || "已保存，将在当前爬虫任务结束后生效", "success");
       } else {
-        show("已保存", "success");
+        show("已保存并生效", "success");
       }
       onSaved();
     } catch (e) {
@@ -960,7 +977,7 @@ function CrawlerEditorModal({
                   />
                 </div>
                 <div className="admin-form__row">
-                  <label htmlFor="crawler-proxy">代理地址</label>
+                  <label htmlFor="crawler-proxy">抓取代理</label>
                   <input
                     id="crawler-proxy"
                     value={form.proxy}
@@ -976,6 +993,15 @@ function CrawlerEditorModal({
                   onChange={(value) => set("uploadDriveId", value)}
                   uploadTargets={uploadTargets}
                 />
+                <div className="admin-form__row">
+                  <label htmlFor="crawler-upload-proxy">上传代理</label>
+                  <input
+                    id="crawler-upload-proxy"
+                    value={form.uploadProxy}
+                    onChange={(e) => set("uploadProxy", e.target.value)}
+                    placeholder="仅本地视频上传到网盘时使用"
+                  />
+                </div>
               </div>
             </section>
           </div>

@@ -35,15 +35,31 @@ scanner:
   # 现在所有定时任务统一由 nightly 调度器控制（默认每天 01:00 跑一条完整流水线）。
   # 字段保留仅为兼容旧 yaml，运行时被忽略。
   interval_seconds: 0
-  # 单次扫描每家网盘目录递归层数上限
+  # 已废弃：扫描会递归到叶子目录，不限制目录深度。
+  # 字段保留仅为兼容旧 yaml，运行时被忽略。
   max_depth: 5
   # 被扫描的扩展名
   video_extensions: [".mp4", ".mkv", ".mov", ".webm", ".avi", ".strm"]
 
 nightly:
+  # 停止每日定时任务；不影响后台手动执行“扫描所有网盘”。
+  disabled: false
   # 凌晨流水线的每日启动时间，24 小时制 HH:mm；后台保存后会热更新。
   # 运行时会统一编排扫描、媒体资产生成和后续清理任务。
   start_time: "01:00"
+  # 启动时间使用的 IANA 时区；仅影响应用调度，不修改服务器系统时区。
+  timezone: "Asia/Shanghai"
+
+tags:
+  # 是否启用系统内置标签包；后台保存后会热更新。
+  builtin_pack_enabled: true
+
+# 全局媒体生成额度，所有网盘（含本地上传与爬虫）共享，范围 1-5，支持热更新。
+# 默认最多同时生成 1 个封面、1 个预览、1 个指纹，三类任务独立；扫盘仍按网盘并行。
+generation:
+  thumbnail_concurrency: 1
+  preview_concurrency: 1
+  fingerprint_concurrency: 1
 
 preview:
   # 是否启用 ffmpeg 抽帧生成预览视频
@@ -51,6 +67,8 @@ preview:
   # ffmpeg / ffprobe 可执行文件名或绝对路径
   ffmpeg_path: "ffmpeg"
   ffprobe_path: "ffprobe"
+  # 每个封面/预览 ffmpeg 的解码、编码和滤镜线程数，范围 1-16，修改后重启生效。
+  ffmpeg_threads: 1
   # 预览视频每段时长（秒），实际生成时每段最多 3 秒
   duration_seconds: 3
   # 兼容旧配置；当前 30 秒以下最多 3 段，30 秒及以上固定 4 段
@@ -68,53 +86,3 @@ remote_upload:
   disk_reserve_bytes: 1073741824
   # 已收到响应头后，正文连续无数据多久判定失败。
   idle_timeout_seconds: 120
-
-# 盘列表。上线后请通过管理后台添加，本文件可留空。
-# kind 支持 quark / p115 / p123 / pikpak / wopan / guangyapan / onedrive / googledrive / webdav / localstorage。
-# OneDrive 示例：
-# - id: "my-onedrive"
-#   kind: "onedrive"
-#   name: "我的 OneDrive"
-#   root_id: "root"
-#   params:
-#     refresh_token: "..."
-# Google Drive 示例：
-# - id: "my-google"
-#   kind: "googledrive"
-#   name: "我的 Google Drive"
-#   root_id: "root"
-#   params:
-#     refresh_token: "..."
-#     client_id: "..."
-#     client_secret: "..."
-# 光鸭网盘示例：
-# - id: "my-guangyapan"
-#   kind: "guangyapan"
-#   name: "我的光鸭网盘"
-#   # 留空表示光鸭网盘根目录；也可以填写光鸭目录 fileId
-#   root_id: ""
-#   params:
-#     # 推荐在后台使用扫码登录自动写入 access_token / refresh_token。
-#     refresh_token: "..."
-#     # 可选：按路径解析扫描根目录，优先于 root_id
-#     # root_path: "影视/电影"
-# WebDAV 示例（OpenList 通常为 https://example.com/dav）：
-# - id: "my-webdav"
-#   kind: "webdav"
-#   name: "我的 WebDAV"
-#   # WebDAV 端点下的绝对路径；留空时为 /
-#   root_id: "/影视"
-#   params:
-#     base_url: "https://example.com/dav"
-#     username: "..."
-#     password: "..."
-# 本地存储示例：
-# - id: "local-media"
-#   kind: "localstorage"
-#   name: "本地视频目录"
-#   root_id: "/"
-#   params:
-#     # Docker 部署时这里和 .strm 里的绝对路径都必须使用容器内路径。
-#     # 例如宿主机 /mnt/videos 挂载为 /media，就填写 /media。
-#     path: "/mnt/videos"
-drives: []

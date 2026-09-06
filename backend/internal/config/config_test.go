@@ -109,6 +109,19 @@ func TestLoadDefaultScannerVideoExtensionsIncludeSTRM(t *testing.T) {
 	}
 }
 
+func TestExampleConfigOmitsDatabaseManagedDriveDefinitions(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "config.example.yaml"))
+	if err != nil {
+		t.Fatalf("read example config: %v", err)
+	}
+	text := string(data)
+	for _, obsolete := range []string{"drives:", "# 盘列表", "my-onedrive", "my-webdav"} {
+		if strings.Contains(text, obsolete) {
+			t.Fatalf("example config still exposes database-managed drive definition %q", obsolete)
+		}
+	}
+}
+
 func TestResolveStoragePathsUsesStartupDirectoryWithoutMutatingConfig(t *testing.T) {
 	baseDir := t.TempDir()
 	storage := Storage{
@@ -216,6 +229,44 @@ scanner:
 	}
 }
 
+func TestGlobalPreviewConcurrency(t *testing.T) {
+	cfg, err := Parse([]byte(`
+generation:
+  preview_concurrency: 3
+`))
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	if got := cfg.Generation.PreviewConcurrency; got != 3 {
+		t.Fatalf("preview concurrency = %d, want 3", got)
+	}
+	maximum, err := Parse([]byte("generation:\n  preview_concurrency: 5\n"))
+	if err != nil {
+		t.Fatalf("parse maximum preview concurrency: %v", err)
+	}
+	if got := maximum.Generation.PreviewConcurrency; got != MaxGenerationConcurrency {
+		t.Fatalf("maximum preview concurrency = %d, want %d", got, MaxGenerationConcurrency)
+	}
+
+	defaults, err := Parse([]byte(`{}`))
+	if err != nil {
+		t.Fatalf("parse default config: %v", err)
+	}
+	if got := defaults.Generation.PreviewConcurrency; got != DefaultGenerationConcurrency {
+		t.Fatalf("default preview concurrency = %d, want %d", got, DefaultGenerationConcurrency)
+	}
+}
+
+func TestGlobalPreviewConcurrencyRejectsInvalidValue(t *testing.T) {
+	_, err := Parse([]byte(`
+generation:
+  preview_concurrency: 6
+`))
+	if err == nil || !strings.Contains(err.Error(), "must be between 1 and 5") {
+		t.Fatalf("parse error = %v, want concurrency validation error", err)
+	}
+}
+
 func TestLoadDefaultNightlyCronHour(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
@@ -232,6 +283,12 @@ func TestLoadDefaultNightlyCronHour(t *testing.T) {
 	if cfg.Nightly.StartTime != DefaultNightlyStartTime {
 		t.Fatalf("nightly start time = %q, want %q", cfg.Nightly.StartTime, DefaultNightlyStartTime)
 	}
+	if cfg.Nightly.Timezone != DefaultNightlyTimezone {
+		t.Fatalf("nightly timezone = %q, want %q", cfg.Nightly.Timezone, DefaultNightlyTimezone)
+	}
+	if cfg.Nightly.Disabled != DefaultNightlyDisabled {
+		t.Fatalf("nightly disabled = %v, want %v", cfg.Nightly.Disabled, DefaultNightlyDisabled)
+	}
 }
 
 func TestParseNightlyStartTime(t *testing.T) {
@@ -242,12 +299,80 @@ func TestParseNightlyStartTime(t *testing.T) {
 	if cfg.Nightly.StartTime != "00:15" {
 		t.Fatalf("start time = %q", cfg.Nightly.StartTime)
 	}
+	if cfg.Nightly.Timezone != DefaultNightlyTimezone {
+		t.Fatalf("default timezone = %q", cfg.Nightly.Timezone)
+	}
+}
+
+func TestParseNightlyTimezone(t *testing.T) {
+	cfg, err := Parse([]byte("nightly:\n  timezone: Asia/Shanghai\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Nightly.Timezone != "Asia/Shanghai" {
+		t.Fatalf("timezone = %q", cfg.Nightly.Timezone)
+	}
+}
+
+func TestParseNightlyDisabled(t *testing.T) {
+	disabled, err := Parse([]byte("nightly:\n  disabled: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !disabled.Nightly.Disabled {
+		t.Fatal("explicitly disabled nightly schedule was enabled")
+	}
+
+	enabled, err := Parse([]byte("nightly:\n  disabled: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enabled.Nightly.Disabled {
+		t.Fatal("explicitly enabled nightly schedule was disabled")
+	}
+
+	if _, err := Parse([]byte("nightly:\n  disabled: not-a-boolean\n")); err == nil {
+		t.Fatal("non-boolean nightly.disabled was accepted")
+	}
+}
+
+func TestParseBuiltinTagConfiguration(t *testing.T) {
+	defaults, err := Parse([]byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !defaults.Tags.IsBuiltinPackEnabled() {
+		t.Fatal("built-in tags should default to enabled")
+	}
+
+	disabled, err := Parse([]byte("tags:\n  builtin_pack_enabled: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.Tags.IsBuiltinPackEnabled() {
+		t.Fatal("explicitly disabled built-in tags were enabled")
+	}
+
+	if _, err := Parse([]byte("tags:\n  builtin_pack_enabled: not-a-boolean\n")); err == nil {
+		t.Fatal("non-boolean built-in tag configuration was accepted")
+	}
 }
 
 func TestParseRejectsInvalidNightlyStartTime(t *testing.T) {
 	_, err := Parse([]byte("nightly:\n  start_time: \"24:00\"\n"))
 	if !errors.Is(err, ErrInvalidNightlyStartTime) {
 		t.Fatalf("error = %v, want ErrInvalidNightlyStartTime", err)
+	}
+}
+
+func TestParseRejectsInvalidNightlyTimezone(t *testing.T) {
+	for _, timezone := range []string{"Local", "Mars/Olympus"} {
+		t.Run(timezone, func(t *testing.T) {
+			_, err := Parse([]byte("nightly:\n  timezone: \"" + timezone + "\"\n"))
+			if !errors.Is(err, ErrInvalidNightlyTimezone) {
+				t.Fatalf("error = %v, want ErrInvalidNightlyTimezone", err)
+			}
+		})
 	}
 }
 
@@ -345,4 +470,29 @@ func hasVideoExtension(exts []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestGenerationConcurrencyDefaultsAndValidation(t *testing.T) {
+	cfg, err := Parse([]byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Generation.ThumbnailConcurrency != 1 || cfg.Generation.PreviewConcurrency != 1 || cfg.Generation.FingerprintConcurrency != 1 || cfg.Preview.FFmpegThreads != 1 {
+		t.Fatalf("unsafe generation defaults: generation=%+v threads=%d", cfg.Generation, cfg.Preview.FFmpegThreads)
+	}
+	for _, key := range []string{"thumbnail_concurrency", "preview_concurrency", "fingerprint_concurrency"} {
+		for _, value := range []string{"-1", "6", "abc"} {
+			if _, err := Parse([]byte("generation:\n  " + key + ": " + value + "\n")); err == nil {
+				t.Fatalf("accepted %s=%s", key, value)
+			}
+		}
+		if _, err := Parse([]byte("generation:\n  " + key + ": 5\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, value := range []string{"-1", "17"} {
+		if _, err := Parse([]byte("preview:\n  ffmpeg_threads: " + value + "\n")); err == nil {
+			t.Fatalf("accepted threads=%s", value)
+		}
+	}
 }

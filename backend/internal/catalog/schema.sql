@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS videos (
     fingerprint_status TEXT DEFAULT 'pending',  -- pending / ready / failed
     fingerprint_error  TEXT DEFAULT '',
     parent_id        TEXT,
+    ancestor_dir_ids TEXT NOT NULL DEFAULT '',  -- JSON array；扫描起点到直接父目录（含两端）
     dir_name         TEXT DEFAULT '',           -- 所在目录名（扫盘时落库，供标签重算使用）
     title            TEXT NOT NULL,
     author           TEXT,
@@ -16,17 +17,14 @@ CREATE TABLE IF NOT EXISTS videos (
     duration_seconds INTEGER DEFAULT 0,
     size_bytes       INTEGER DEFAULT 0,
     ext              TEXT,
-    quality          TEXT,                      -- HD / SD
     thumbnail_url    TEXT,
+    thumbnail_updated_at INTEGER DEFAULT 0,     -- thumbnail-only revision; unrelated metadata must not invalidate image caches
     thumbnail_status TEXT DEFAULT 'pending',    -- pending / ready / failed / skipped
     thumbnail_failures INTEGER DEFAULT 0,        -- consecutive transient thumbnail generation failures
     preview_file_id  TEXT,                      -- deprecated: 旧版回写网盘后的预览视频 file id
     preview_local    TEXT,                      -- 本地预览视频路径（兜底）
+    preview_updated_at INTEGER DEFAULT 0,       -- preview-only revision; unrelated metadata must not invalidate teaser caches
     preview_status   TEXT DEFAULT 'pending',    -- pending / ready / failed / disabled
-    transcode_status TEXT DEFAULT '',           -- '' / pending / ready / skipped / failed（浏览器兼容性转码）
-    transcode_error  TEXT DEFAULT '',
-    transcoded_file_id TEXT DEFAULT '',         -- 转码产物在同一 drive 上的 fileID，播放源优先用它
-    transcoded_size  INTEGER DEFAULT 0,
     views            INTEGER DEFAULT 0,
     last_viewed_at   INTEGER DEFAULT 0,
     favorites        INTEGER DEFAULT 0,
@@ -35,6 +33,7 @@ CREATE TABLE IF NOT EXISTS videos (
     last_liked_at    INTEGER DEFAULT 0,
     dislikes         INTEGER DEFAULT 0,
     hidden           INTEGER DEFAULT 0,          -- 1 = hidden from public display
+    is_canonical     INTEGER NOT NULL DEFAULT 1, -- derived by dedup triggers; hidden rows still participate
     tags_manual      INTEGER DEFAULT 0,          -- 1 = user explicitly curated tags
     badges           TEXT,                      -- JSON array
     description      TEXT,
@@ -48,6 +47,19 @@ CREATE INDEX IF NOT EXISTS idx_videos_pub   ON videos(published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_videos_created ON videos(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_videos_duration ON videos(duration_seconds);
 CREATE INDEX IF NOT EXISTS idx_videos_views ON videos(views DESC);
+
+-- Exact per-basis representatives used to project tags from duplicate source
+-- rows without collapsing the three independent deduplication relations into
+-- one lossy canonical_video_id.
+CREATE TABLE IF NOT EXISTS video_dedup_representatives (
+    video_id          TEXT NOT NULL,
+    basis             TEXT NOT NULL CHECK (basis IN ('self', 'content_hash', 'sampled_sha256', 'file_name_size')),
+    representative_id TEXT NOT NULL,
+    PRIMARY KEY (video_id, basis)
+);
+
+CREATE INDEX IF NOT EXISTS idx_video_dedup_representative
+    ON video_dedup_representatives(representative_id, video_id);
 
 -- 管理员提交的视频直链后台任务。source_url 只在任务排队或执行期间保留；
 -- 进入 completed / failed / canceled 后由状态更新语句立即清空。
@@ -173,6 +185,20 @@ CREATE INDEX IF NOT EXISTS idx_crawler_seen_sources_drive
 CREATE INDEX IF NOT EXISTS idx_crawler_seen_sources_video
     ON crawler_seen_sources(kind, drive_id, status, canonical_video_id);
 
+-- 去重事务提交后待清理的本地生成资产。数据库状态先原子落地，文件清理
+-- 随后幂等执行；进程中断或文件系统临时失败时由下一轮维护继续处理。
+CREATE TABLE IF NOT EXISTS duplicate_asset_cleanup_jobs (
+    video_id      TEXT PRIMARY KEY,
+    preview_local TEXT NOT NULL DEFAULT '',
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    last_error    TEXT NOT NULL DEFAULT '',
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_duplicate_asset_cleanup_jobs_updated
+    ON duplicate_asset_cleanup_jobs(updated_at, video_id);
+
 -- 网盘账户
 CREATE TABLE IF NOT EXISTS drives (
     id            TEXT PRIMARY KEY,
@@ -187,11 +213,22 @@ CREATE TABLE IF NOT EXISTS drives (
     -- 替代了早期的全局 preview.enabled 设置（保留旧 setting 行不再读）。
     teaser_enabled INTEGER NOT NULL DEFAULT 1,
     -- 扫描时要跳过的目录 ID 集合（JSON array of string）。命中其中任意一个的目录及其
-    -- 全部子目录都不会被递归扫描，也不会进入 SeenFileIDs / VisitedDirIDs 统计。
+    -- 全部子目录都不会被递归扫描，并进入发现快照的策略排除集合 X。
     -- 替代了早期硬编码"影视"目录的特例分支。
     skip_dir_ids  TEXT NOT NULL DEFAULT '[]',
+    -- 上一次完成精确策略清理时使用的跳过目录集合；NULL 表示从未执行。
+    skip_cleanup_dir_ids TEXT,
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
+);
+
+-- 升级前无祖先链记录的补课进度按跳过目录保存。一个永久不可达的目录
+-- 不会迫使已经完成的其它跳过目录在每次扫盘时重复遍历。
+CREATE TABLE IF NOT EXISTS drive_skip_cleanup_legacy_dirs (
+    drive_id     TEXT NOT NULL,
+    dir_id       TEXT NOT NULL,
+    completed_at INTEGER NOT NULL,
+    PRIMARY KEY (drive_id, dir_id)
 );
 
 -- 扫描任务状态
@@ -202,8 +239,38 @@ CREATE TABLE IF NOT EXISTS scans (
     finished_at INTEGER,
     scanned     INTEGER DEFAULT 0,
     added       INTEGER DEFAULT 0,
-    error       TEXT
+    error       TEXT,
+    result      TEXT
 );
+
+-- Presence-authoritative discovery removes eligible missing files immediately.
+-- Incomplete discovery uses this table to require two eligible missing
+-- observations; seeing the file clears its counter in either mode.
+CREATE TABLE IF NOT EXISTS drive_scan_misses (
+    drive_id            TEXT NOT NULL,
+    file_id             TEXT NOT NULL,
+    consecutive_misses  INTEGER NOT NULL DEFAULT 0,
+    last_missing_at     INTEGER NOT NULL,
+    PRIMARY KEY (drive_id, file_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_drive_scan_misses_threshold
+    ON drive_scan_misses(drive_id, consecutive_misses);
+
+CREATE TRIGGER IF NOT EXISTS cleanup_drive_scan_miss_after_video_delete
+AFTER DELETE ON videos
+WHEN NOT EXISTS (
+    SELECT 1 FROM videos WHERE drive_id = OLD.drive_id AND file_id = OLD.file_id
+)
+BEGIN
+    DELETE FROM drive_scan_misses WHERE drive_id = OLD.drive_id AND file_id = OLD.file_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS cleanup_drive_scan_misses_after_drive_delete
+AFTER DELETE ON drives
+BEGIN
+    DELETE FROM drive_scan_misses WHERE drive_id = OLD.id;
+END;
 
 -- 管理后台 session（简单 token 存储）
 CREATE TABLE IF NOT EXISTS admin_sessions (

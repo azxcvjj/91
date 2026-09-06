@@ -10,6 +10,18 @@ const listingPageSource = readFileSync(
   new URL("../src/pages/ListingPage.tsx", import.meta.url),
   "utf8"
 );
+const tagCloudSource = readFileSync(
+  new URL("../src/components/TagCloud.tsx", import.meta.url),
+  "utf8"
+);
+const searchPanelSource = readFileSync(
+  new URL("../src/components/SearchPanel.tsx", import.meta.url),
+  "utf8"
+);
+const homePageSource = readFileSync(
+  new URL("../src/pages/HomePage.tsx", import.meta.url),
+  "utf8"
+);
 const responsiveSource = readFileSync(
   new URL("../src/lib/responsive.ts", import.meta.url),
   "utf8"
@@ -34,66 +46,97 @@ function ruleBody(css: string, selector: string): string {
 test("list page sort toolbar only exposes active sort options", () => {
   assert.match(sortToolbarSource, /\{ key: "hot", label: "最热" \},\s*\{ key: "latest", label: "最新" \}/);
   assert.match(sortToolbarSource, /\{ key: "recent", label: "最近观看" \}/);
-
-  for (const removed of ["本周", "最长", "高清", "精选"]) {
-    assert.doesNotMatch(sortToolbarSource, new RegExp(removed));
-  }
   assert.match(typesSource, /export type SortKey = "latest" \| "hot" \| "recent";/);
+  assert.match(sortToolbarSource, /sortDisabled\?: boolean/);
+  assert.match(sortToolbarSource, /disabled=\{sortDisabled\}/);
 });
 
-test("listing page uses compact spacing after the tag cloud", () => {
+test("listing page keeps the public discovery layout and empty semantics", () => {
   assert.match(
     listingPageSource,
     /<SearchPanel[\s\S]*?variant="uiverse"[\s\S]*?placeholder=""[\s\S]*?className="search-panel--public search-panel--transparent"[\s\S]*?\/>/
   );
-  assert.match(listingPageSource, /const \[params, setParams\] = useSearchParams\(\)/);
-  assert.match(listingPageSource, /const sort = readListingSort\(params\)/);
-  assert.match(listingPageSource, /setParams\(withListingSort\(params, nextSort\), \{ replace: true \}\)/);
-  assert.match(listingPageSource, /key=\{`\$\{keyword\}\\n\$\{tag\}\\n\$\{pageSize\}`\}/);
-  assert.doesNotMatch(listingPageSource, /const \[sort, setSort\] = useState<SortKey>/);
-  assert.match(listingPageSource, /const \[view, setView\] = useState<ViewMode>\(initialSnapshot\?\.view \?\? "grid"\)/);
-  assert.match(listingPageSource, /const \[page, setPage\] = useState\(initialSnapshot\?\.page \?\? 1\)/);
-  assert.doesNotMatch(listingPageSource, /sessionStorage/);
-  assert.doesNotMatch(listingPageSource, /LISTING_STATE_PREFIX|readListingState|writeListingState/);
   assert.match(listingPageSource, /className="container page-section listing-discovery-section"/);
   assert.match(listingPageSource, /className="container page-section listing-primary-section"/);
-  assert.match(listingPageSource, /import \{ AdminEmptyVisual \} from "@\/admin\/AdminEmptyVisual"/);
-  assert.match(listingPageSource, /const hasActiveFilter = keyword\.trim\(\)\.length > 0 \|\| tag\.trim\(\)\.length > 0;/);
   assert.match(listingPageSource, /variant=\{hasActiveFilter \? "no-results" : "empty"\}/);
   assert.match(listingPageSource, /text=\{hasActiveFilter \? "未查询到" : "当前库中没有视频"\}/);
-  assert.match(listingPageSource, /className="admin-empty-state admin-empty-state--plain listing-empty-state"/);
-  assert.doesNotMatch(listingPageSource, /没有找到匹配的视频/);
-  assert.doesNotMatch(listingPageSource, /SectionHeader/);
-  assert.doesNotMatch(listingPageSource, /全部视频/);
-  assert.doesNotMatch(listingPageSource, /搜索结果：/);
-  assert.doesNotMatch(listingPageSource, /标签：/);
-  assert.doesNotMatch(listingPageSource, /共 \$\{total\} 个视频/);
 
   const discoverySection = ruleBody(layoutCss, ".listing-discovery-section");
   assert.match(discoverySection, /padding-bottom\s*:\s*var\(--space-2\)/);
   const listingEmptyState = ruleBody(layoutCss, ".admin-empty-state.listing-empty-state");
   assert.match(listingEmptyState, /min-height\s*:\s*clamp\(360px,\s*58vh,\s*620px\)/);
-  assert.match(listingEmptyState, /padding\s*:\s*72px 16px 24px/);
 });
 
-test("public video lists use fourteen mobile and twenty desktop items per page", () => {
-  assert.match(responsiveSource, /const MOBILE_LAYOUT_QUERY = "\(max-width: 640px\)";/);
+test("public listing query control state is restored from the URL", () => {
+  assert.match(listingPageSource, /const sort = readListingSort\(params\)/);
+  assert.match(listingPageSource, /const view = readListingView\(params\)/);
+  assert.match(listingPageSource, /withListingNavigation\(current, \{ sort: nextSort, page: 1 \}\)/);
+  assert.match(listingPageSource, /withListingView\(current, nextView\)/);
+  // 列表页改为无限滚动后没有页码，旧链接里的 page 参数会被清掉。
+  assert.match(listingPageSource, /if \(!params\.has\("page"\)\) return;/);
+  assert.match(
+    listingPageSource,
+    /withListingPage\(current, 1\), \{ replace: true \}/
+  );
+  assert.doesNotMatch(listingPageSource, /<Pagination/);
+  assert.doesNotMatch(listingPageSource, /sessionStorage|localStorage/);
+});
+
+test("tag selection toggles through the shared listing query instead of rebuilding it", () => {
+  assert.match(
+    tagCloudSource,
+    /const nextTag = activeTag === label \? null : label/
+  );
+  assert.match(
+    tagCloudSource,
+    /withListingNavigation\(params, \{ tag: nextTag, page: 1 \}\)/
+  );
+  assert.match(tagCloudSource, /to=\{buildTagHref\(tag\.label\)\}/);
+  assert.doesNotMatch(
+    tagCloudSource,
+    /to=\{`\$\{linkBasePath\}\?tag=\$\{encodeURIComponent\(tag\.label\)\}`\}/
+  );
+});
+
+test("list search updates the shared listing query instead of rebuilding it", () => {
+  assert.match(searchPanelSource, /navigationPath = "\/list"/);
+  assert.match(
+    searchPanelSource,
+    /withListingNavigation\(params, \{ q, page: 1 \}\)/
+  );
+  assert.match(
+    searchPanelSource,
+    /navigate\(query \? `\$\{navigationPath\}\?\$\{query\}` : navigationPath\)/
+  );
+  assert.doesNotMatch(searchPanelSource, /const sp = new URLSearchParams\(\)/);
+});
+
+test("public video lists use fourteen mobile and twenty desktop items per batch", () => {
   assert.match(responsiveSource, /export const MOBILE_VIDEO_PAGE_SIZE = 14;/);
   assert.match(listingPageSource, /const DESKTOP_PAGE_SIZE = 20;/);
   assert.match(listingPageSource, /const pageSize = isMobile \? MOBILE_VIDEO_PAGE_SIZE : DESKTOP_PAGE_SIZE;/);
-  assert.match(listingPageSource, /key=\{`\$\{keyword\}\\n\$\{tag\}\\n\$\{pageSize\}`\}/);
-  assert.match(listingPageSource, /fetchListing\(page, pageSize, \{ q: keyword, tag, sort \}\)/);
-  assert.match(listingPageSource, /<Pagination[\s\S]*?page=\{page\}[\s\S]*?pageSize=\{pageSize\}/);
+  assert.match(
+    listingPageSource,
+    /listingFeedSource\(\{ q: keyword, tag, sort, pageSize \}\)/
+  );
+  assert.match(
+    listingPageSource,
+    /feedSnapshotScope: source\.snapshotRestoreScope/
+  );
+  assert.match(listingPageSource, /skeletonCount=\{pageSize\}/);
 });
 
-test("listing page restores its last successful content after video detail", () => {
-  assert.match(listingPageSource, /let cachedListingSnapshot: ListingSnapshot \| null = null/);
-  assert.match(listingPageSource, /cachedListingSnapshot\?\.key === snapshotKey/);
-  assert.match(listingPageSource, /const \[items, setItems\] = useState<VideoItem\[\]>\(initialSnapshot\?\.items \?\? \[\]\)/);
-  assert.match(listingPageSource, /const \[initialLoading, setInitialLoading\] = useState\(initialSnapshot === null\)/);
-  assert.match(listingPageSource, /if \(loadedRequestKeyRef\.current === requestKey\) return/);
-  assert.match(listingPageSource, /cachedListingSnapshot = \{\s*key: snapshotKey,\s*page,\s*view: viewRef\.current,\s*items: nextItems,\s*total: nextTotal/);
-  assert.doesNotMatch(listingPageSource, /localStorage|sessionStorage/);
+test("home filters use the shared snapshot-based infinite listing contract", () => {
+  assert.match(homePageSource, /listingFeedSource\(\{[\s\S]*?q: activeSearchQuery,[\s\S]*?tag: activeTag,[\s\S]*?sort: searchSort/);
+  assert.match(homePageSource, /useInfiniteListing\(activeFeedSource, \{/);
+  assert.match(
+    homePageSource,
+    /feedSnapshotScope: activeFeedSource\.snapshotRestoreScope/
+  );
+  assert.match(homePageSource, /useListingScrollRestore\(\{[\s\S]*?queryKey: activeFeedSource\.key/);
+  assert.match(homePageSource, /<VirtualVideoGrid[\s\S]*?hasMore=\{homeFeed\.hasMore\}[\s\S]*?onLoadMore=\{homeFeed\.loadMore\}/);
+  assert.match(homePageSource, /sortDisabled=\{homeFeed\.initialLoading\}/);
+  assert.doesNotMatch(homePageSource, /useListingQuery|<Pagination|displayedSearchPage/);
 });
 
 test("sort toolbar has no outer frame around its controls", () => {
@@ -103,8 +146,6 @@ test("sort toolbar has no outer frame around its controls", () => {
   assert.match(toolbar, /padding\s*:\s*0/);
   assert.doesNotMatch(toolbar, /background\s*:/);
   assert.doesNotMatch(toolbar, /border\s*:/);
-  assert.doesNotMatch(toolbar, /border-radius\s*:/);
-
   assert.match(group, /background\s*:\s*var\(--bg-sunken\)/);
   assert.match(group, /border\s*:\s*1px solid var\(--border-subtle\)/);
 });

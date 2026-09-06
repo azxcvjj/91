@@ -3,8 +3,11 @@ package pikpak
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -180,6 +183,146 @@ func TestRefreshCaptchaTokenDoesNotLoopOn4002WithEmptyToken(t *testing.T) {
 	}
 }
 
+func TestLoginRecoversFromRejectedPersistedCaptchaToken(t *testing.T) {
+	for _, errorCode := range []int{4002, 9} {
+		t.Run(fmt.Sprintf("error_code_%d", errorCode), func(t *testing.T) {
+			var (
+				signinCalls  int32
+				captchaCalls int32
+				signinTokens []string
+				persisted    []string
+			)
+
+			mux := http.NewServeMux()
+			mux.HandleFunc("/v1/auth/signin", func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&signinCalls, 1)
+				var body struct {
+					CaptchaToken string `json:"captcha_token"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				signinTokens = append(signinTokens, body.CaptchaToken)
+				if len(signinTokens) == 1 {
+					writeErrorJSON(w, fmt.Sprintf(`{
+						"error_code": %d,
+						"error": "captcha_invalid",
+						"error_description": "captcha token rejected"
+					}`, errorCode))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{
+					"access_token": "fresh-access",
+					"refresh_token": "fresh-refresh",
+					"sub": "user-1"
+				}`))
+			})
+			mux.HandleFunc("/v1/shield/captcha/init", func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&captchaCalls, 1)
+				var body captchaTokenRequest
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				if body.CaptchaToken != "" {
+					t.Errorf("captcha init token = %q, want empty after signin rejection", body.CaptchaToken)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"captcha_token":"fresh-login-captcha","expires_in":300}`))
+			})
+			server := httptest.NewServer(mux)
+			defer server.Close()
+
+			d := newTestDriver(t, server)
+			d.captchaToken = "persisted-stale-captcha"
+			d.onTokenUpdate = func(_, _, captcha, _ string) {
+				persisted = append(persisted, captcha)
+			}
+
+			if err := d.login(context.Background()); err != nil {
+				t.Fatalf("login: %v", err)
+			}
+
+			if got := atomic.LoadInt32(&signinCalls); got != 2 {
+				t.Fatalf("signin calls = %d, want 2", got)
+			}
+			if got := atomic.LoadInt32(&captchaCalls); got != 1 {
+				t.Fatalf("captcha init calls = %d, want 1", got)
+			}
+			if len(signinTokens) != 2 || signinTokens[0] != "persisted-stale-captcha" || signinTokens[1] != "fresh-login-captcha" {
+				t.Fatalf("signin captcha tokens = %#v", signinTokens)
+			}
+			if len(persisted) < 3 || persisted[0] != "" || persisted[1] != "fresh-login-captcha" {
+				t.Fatalf("persisted captcha sequence = %#v, want clear then fresh token", persisted)
+			}
+		})
+	}
+}
+
+func TestLoginStopsAfterSingleCaptchaRecoveryAttempt(t *testing.T) {
+	var signinCalls, captchaCalls int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/signin", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&signinCalls, 1)
+		writeErrorJSON(w, `{"error_code":4002,"error":"captcha_invalid"}`)
+	})
+	mux.HandleFunc("/v1/shield/captcha/init", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&captchaCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"captcha_token":"fresh-login-captcha","expires_in":300}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	d := newTestDriver(t, server)
+	d.captchaToken = "persisted-stale-captcha"
+
+	err := d.login(context.Background())
+	if err == nil || !IsCaptchaError(err) {
+		t.Fatalf("login error = %v, want captcha error", err)
+	}
+	if got := atomic.LoadInt32(&signinCalls); got != 2 {
+		t.Fatalf("signin calls = %d, want exactly 2", got)
+	}
+	if got := atomic.LoadInt32(&captchaCalls); got != 1 {
+		t.Fatalf("captcha init calls = %d, want exactly 1", got)
+	}
+}
+
+func TestLoginAccessProhibitedExplainsSupportedAlternatives(t *testing.T) {
+	var signinCalls, captchaCalls int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/signin", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&signinCalls, 1)
+		writeErrorJSON(w, `{
+			"error_code":4126,
+			"error":"invalid_grant",
+			"error_description":"AccessProhibited"
+		}`)
+	})
+	mux.HandleFunc("/v1/shield/captcha/init", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&captchaCalls, 1)
+		t.Fatal("4126 must not trigger captcha refresh")
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	d := newTestDriver(t, server)
+	d.captchaToken = "fresh-captcha"
+
+	err := d.login(context.Background())
+	if err == nil {
+		t.Fatal("login succeeded, want AccessProhibited error")
+	}
+	for _, want := range []string{"4126", "refresh_token", "WebDAV"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("login error = %q, want %q guidance", err, want)
+		}
+	}
+	if got := atomic.LoadInt32(&signinCalls); got != 1 {
+		t.Fatalf("signin calls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&captchaCalls); got != 0 {
+		t.Fatalf("captcha init calls = %d, want 0", got)
+	}
+}
+
 func TestInitWithRefreshTokenDoesNotSendPersistedCaptchaToken(t *testing.T) {
 	var captchaCalls int32
 	var captchaBody struct {
@@ -313,6 +456,87 @@ func TestInitFallsBackToLoginWhenRefreshReturnsCaptchaInvalid(t *testing.T) {
 	if d.accessToken != "login-access" || d.refreshToken != "login-refresh" || d.captchaToken != "files-captcha" {
 		t.Errorf("driver tokens = (%q, %q, %q), want login/files tokens", d.accessToken, d.refreshToken, d.captchaToken)
 	}
+}
+
+func TestConcurrentExpiredAccessTokensShareOneRefresh(t *testing.T) {
+	var oldRequests atomic.Int32
+	var refreshes atomic.Int32
+	var persisted atomic.Int32
+	var releaseOld sync.Once
+	bothOldRequestsArrived := make(chan struct{})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/token", func(w http.ResponseWriter, r *http.Request) {
+		refreshes.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"access_token": "new-access",
+			"refresh_token": "new-refresh",
+			"sub": "user-1"
+		}`))
+	})
+	mux.HandleFunc("/drive/v1/files/file-a", func(w http.ResponseWriter, r *http.Request) {
+		handleConcurrentPikPakStat(w, r, &oldRequests, &releaseOld, bothOldRequestsArrived)
+	})
+	mux.HandleFunc("/drive/v1/files/file-b", func(w http.ResponseWriter, r *http.Request) {
+		handleConcurrentPikPakStat(w, r, &oldRequests, &releaseOld, bothOldRequestsArrived)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	d := newTestDriver(t, server)
+	d.onTokenUpdate = func(_, _, _, _ string) { persisted.Add(1) }
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, fileID := range []string{"file-a", "file-b"} {
+		wg.Add(1)
+		go func(fileID string) {
+			defer wg.Done()
+			_, err := d.Stat(context.Background(), fileID)
+			errs <- err
+		}(fileID)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent stat: %v", err)
+		}
+	}
+	if got := refreshes.Load(); got != 1 {
+		t.Fatalf("token refreshes = %d, want 1", got)
+	}
+	if got := persisted.Load(); got != 1 {
+		t.Fatalf("token persistence callbacks = %d, want 1", got)
+	}
+	auth := d.authSnapshot()
+	if auth.accessToken != "new-access" || auth.refreshToken != "new-refresh" {
+		t.Fatalf("auth = %#v, want refreshed token pair", auth)
+	}
+}
+
+func handleConcurrentPikPakStat(
+	w http.ResponseWriter,
+	r *http.Request,
+	oldRequests *atomic.Int32,
+	releaseOld *sync.Once,
+	bothOldRequestsArrived chan struct{},
+) {
+	if r.Header.Get("Authorization") == "Bearer test-access-token" {
+		if oldRequests.Add(1) == 2 {
+			releaseOld.Do(func() { close(bothOldRequestsArrived) })
+		}
+		<-bothOldRequestsArrived
+		writeErrorJSON(w, `{
+			"error_code": 4122,
+			"error": "unauthenticated",
+			"error_description": "access token expired"
+		}`)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = fmt.Fprintf(w, `{"id":%q,"name":"clip.mp4","kind":"drive#file","size":"1"}`, strings.TrimPrefix(r.URL.Path, "/drive/v1/files/"))
 }
 
 // TestRequestOnceRecoversFrom4002OnAPICall 验证一个普通 API 调用收到 4002

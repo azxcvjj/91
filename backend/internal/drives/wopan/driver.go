@@ -16,6 +16,7 @@ import (
 	sdk "github.com/OpenListTeam/wopan-sdk-go"
 	"github.com/go-resty/resty/v2"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/scopedproxy"
 )
 
 // Driver 封装联通网盘
@@ -28,6 +29,11 @@ type Driver struct {
 	client        *sdk.WoClient
 	onTokenUpdate func(access, refresh string)
 	uploadTempDir string
+
+	// The upstream SDK stores encryption and rotating-token state on WoClient
+	// without synchronization. Serialize SDK calls at the adapter boundary so a
+	// refresh cannot race another request or consume the same refresh token twice.
+	clientMu sync.Mutex
 
 	listMu       sync.Mutex
 	lastListAt   time.Time
@@ -75,7 +81,11 @@ func (d *Driver) RootID() string {
 }
 
 func (d *Driver) Init(ctx context.Context) error {
-	d.client = sdk.DefaultWithRefreshToken(d.refreshToken)
+	d.client = sdk.New(
+		sdk.WithUA(sdk.DefaultUA),
+		sdk.WithClient(scopedproxy.NewHTTPClient(0)),
+		sdk.WithRefreshToken(d.refreshToken),
+	)
 	d.client.SetAccessToken(d.accessToken)
 	d.client.OnRefreshToken(func(access, refresh string) {
 		d.accessToken = access
@@ -85,6 +95,8 @@ func (d *Driver) Init(ctx context.Context) error {
 		}
 	})
 	// InitData 会触发一次 token 校验
+	d.clientMu.Lock()
+	defer d.clientMu.Unlock()
 	return d.client.InitData()
 }
 
@@ -109,9 +121,11 @@ func (d *Driver) List(ctx context.Context, dirID string) ([]drives.Entry, error)
 				return nil, err
 			}
 			var err error
+			d.clientMu.Lock()
 			data, err = d.client.QueryAllFiles(d.spaceType(), dirID, pageNum, pageSize, 0, d.familyID, func(req *resty.Request) {
 				req.SetContext(ctx)
 			})
+			d.clientMu.Unlock()
 			if err == nil {
 				break
 			}
@@ -147,9 +161,11 @@ func (d *Driver) Stat(ctx context.Context, fileID string) (*drives.Entry, error)
 }
 
 func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLink, error) {
+	d.clientMu.Lock()
 	data, err := d.client.GetDownloadUrlV2([]string{fileID}, func(req *resty.Request) {
 		req.SetContext(ctx)
 	})
+	d.clientMu.Unlock()
 	if err != nil {
 		return nil, wopanRequestError("download url", err)
 	}
@@ -157,9 +173,10 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 		return nil, fmt.Errorf("wopan download url: empty response")
 	}
 	return &drives.StreamLink{
-		URL:     data.List[0].DownloadUrl,
-		Headers: http.Header{},
-		Expires: time.Now().Add(10 * time.Minute),
+		URL:                data.List[0].DownloadUrl,
+		Headers:            http.Header{},
+		Expires:            time.Now().Add(10 * time.Minute),
+		ClientRedirectSafe: true,
 	}, nil
 }
 
@@ -184,12 +201,14 @@ func (d *Driver) Upload(ctx context.Context, parentID, name string, r io.Reader,
 	if _, err := tmp.Seek(0, 0); err != nil {
 		return "", err
 	}
+	d.clientMu.Lock()
 	fid, err := d.client.Upload2C(d.spaceType(), sdk.Upload2CFile{
 		Name:        name,
 		Size:        size,
 		Content:     tmp,
 		ContentType: "application/octet-stream",
 	}, parentID, d.familyID, sdk.Upload2COption{Ctx: ctx})
+	d.clientMu.Unlock()
 	if err != nil {
 		return "", fmt.Errorf("wopan upload: %w", err)
 	}
@@ -223,9 +242,12 @@ func (d *Driver) Rename(ctx context.Context, fileID, newName string) error {
 	if cached := d.cachedDeleteFileID(fileID); cached != "" {
 		renameID = cached
 	}
-	if err := d.client.RenameFileOrDirectory(d.spaceType(), 1, renameID, newName, d.familyID, func(req *resty.Request) {
+	d.clientMu.Lock()
+	err := d.client.RenameFileOrDirectory(d.spaceType(), 1, renameID, newName, d.familyID, func(req *resty.Request) {
 		req.SetContext(ctx)
-	}); err != nil {
+	})
+	d.clientMu.Unlock()
+	if err != nil {
 		return wopanRequestError("rename", err)
 	}
 	return nil
@@ -268,12 +290,12 @@ func (d *Driver) RemoveSource(ctx context.Context, source drives.SourceFile) err
 }
 
 func (d *Driver) deleteFileByObjectID(ctx context.Context, fileID string) error {
-	if err := d.client.DeleteFile(d.spaceType(), nil, []string{fileID}, func(req *resty.Request) {
+	d.clientMu.Lock()
+	err := d.client.DeleteFile(d.spaceType(), nil, []string{fileID}, func(req *resty.Request) {
 		req.SetContext(ctx)
-	}); err != nil {
-		return err
-	}
-	return nil
+	})
+	d.clientMu.Unlock()
+	return err
 }
 
 func (d *Driver) resolveDeleteFileID(ctx context.Context, source drives.SourceFile) (string, error) {
@@ -304,9 +326,11 @@ func (d *Driver) findDeleteFileIDInParent(ctx context.Context, parentID string, 
 				return "", err
 			}
 			var err error
+			d.clientMu.Lock()
 			data, err = d.client.QueryAllFiles(d.spaceType(), parentID, pageNum, pageSize, 0, d.familyID, func(req *resty.Request) {
 				req.SetContext(ctx)
 			})
+			d.clientMu.Unlock()
 			if err == nil {
 				break
 			}
@@ -347,9 +371,11 @@ func (d *Driver) EnsureDir(ctx context.Context, pathFromRoot string) (string, er
 			return "", err
 		}
 		if childID == "" {
+			d.clientMu.Lock()
 			resp, err := d.client.CreateDirectory(d.spaceType(), currentID, name, d.familyID, func(req *resty.Request) {
 				req.SetContext(ctx)
 			})
+			d.clientMu.Unlock()
 			if err != nil {
 				return "", wopanRequestError("mkdir "+name, err)
 			}

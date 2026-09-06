@@ -10,6 +10,54 @@
   font-size: var(--font-base);
 }
 
+.app-primary-route {
+  min-height: 100%;
+}
+
+/*
+ * A detail opened from a listing is a foreground history layer. The listing
+ * remains mounted in the document underneath it, including the virtualizer's
+ * measurements and exact window scroll position. This element owns detail
+ * scrolling until that history layer is removed.
+ */
+.video-detail-foreground {
+  position: fixed;
+  inset: 0;
+  z-index: calc(var(--z-modal) - 1);
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  color: var(--text-default);
+  background-color: var(--bg-page);
+  background-image:
+    linear-gradient(to right, rgba(255, 138, 60, 0.09) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 138, 60, 0.09) 1px, transparent 1px);
+  background-position: 0 0;
+  background-size: 88px 88px;
+  isolation: isolate;
+}
+
+:root[data-theme="pink"] .video-detail-foreground {
+  background-image:
+    linear-gradient(to right, rgba(255, 91, 138, 0.13) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 91, 138, 0.13) 1px, transparent 1px);
+  background-position: 0 0;
+  background-size: 82px 82px;
+}
+
+:root[data-theme="sky"] .video-detail-foreground {
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.55) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.55) 1px, transparent 1px);
+  background-position: 0 0;
+  background-size: 80px 80px;
+}
+
 .app-shell__nav-stack {
   flex: 0 0 auto;
 }
@@ -55,6 +103,84 @@
   box-sizing: border-box;
   min-height: clamp(360px, 58vh, 620px);
   padding: 72px 16px 24px;
+}
+
+/* 文字 + 下划线的内容切换栏，首页和详情页推荐栏共用。 */
+.content-tabs {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  margin: var(--space-3) 0 var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.content-tabs__tab {
+  position: relative;
+  flex: 0 0 auto;
+  padding: 0 2px 10px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: var(--font-lg);
+  font-weight: var(--weight-semibold);
+  color: var(--text-muted);
+  transition: color var(--transition-fast);
+}
+
+.content-tabs__tab:hover:not(:disabled) {
+  color: var(--text-strong);
+}
+
+.content-tabs__tab[aria-selected="true"] {
+  color: var(--text-strong);
+}
+
+.content-tabs__tab[aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--accent-gradient);
+}
+
+.content-tabs__tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.content-tabs__tab:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+@media (max-width: 640px) {
+  .content-tabs {
+    gap: var(--space-4);
+    margin-top: var(--space-2);
+  }
+
+  .content-tabs__tab {
+    font-size: var(--font-md);
+  }
+}
+
+/* 无限滚动列表尾部的加载中 / 到底提示 */
+.listing-infinite-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-height: 56px;
+  padding: var(--space-4) 0;
+  color: var(--text-muted);
+  font-size: var(--font-sm);
+}
+
+.listing-infinite-status--end {
+  color: var(--text-faint);
 }
 
 /* =========================================================

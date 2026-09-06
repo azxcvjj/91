@@ -8,6 +8,11 @@ import pikpakIcon from "./icons/pikpak.png";
 import quarkIcon from "./icons/quark.png";
 import webdavIcon from "./icons/webdav.png";
 import wopanIcon from "./icons/wopan.png";
+import {
+  ONEDRIVE_AUTH_MODE_CUSTOM_APP,
+  ONEDRIVE_AUTH_MODE_OPENLIST_API,
+} from "./onedriveAuth";
+import { scanOutcomeClasses, scanOutcomeLabels } from "./scanResults";
 
 export type Kind = "quark" | "p115" | "p123" | "pikpak" | "wopan" | "guangyapan" | "onedrive" | "googledrive" | "webdav" | "localstorage";
 
@@ -99,6 +104,7 @@ export function maintenanceBusyText(status: { running: boolean; queued: boolean 
 }
 
 export function generationStateLabel(state: string): string {
+  if (Object.prototype.hasOwnProperty.call(scanOutcomeLabels, state)) return scanOutcomeLabels[state as keyof typeof scanOutcomeLabels];
   if (state === "scanning") return "扫盘中";
   if (state === "uploading") return "上传中";
   if (state === "generating") return "生成中";
@@ -108,6 +114,7 @@ export function generationStateLabel(state: string): string {
 }
 
 export function generationStateClass(state: string): string {
+  if (Object.prototype.hasOwnProperty.call(scanOutcomeClasses, state)) return scanOutcomeClasses[state as keyof typeof scanOutcomeClasses];
   if (state === "scanning" || state === "uploading" || state === "generating" || state === "cooling" || state === "queued") {
     if (state === "scanning" || state === "uploading") return "generating";
     return state;
@@ -179,11 +186,13 @@ export type CredentialField = {
   key: string;
   label: string;
   placeholder: string;
+  methodLabel?: "方式一" | "方式二";
   type?: "text" | "select";
   options?: Array<{ value: string; label: string }>;
   multiline?: boolean;
   required?: boolean;
   defaultValue?: string;
+  visibleWhen?: { key: string; value: string };
 };
 
 export function credentialFields(kind: Kind): CredentialField[] {
@@ -194,6 +203,7 @@ export function credentialFields(kind: Kind): CredentialField[] {
           key: "cookie",
           label: "Cookie",
           placeholder: "__pus=...; __puus=...; ...",
+          methodLabel: "方式二",
           multiline: true,
           required: true,
         },
@@ -204,6 +214,7 @@ export function credentialFields(kind: Kind): CredentialField[] {
           key: "cookie",
           label: "Cookie",
           placeholder: "UID=xxx; CID=xxx; SEID=xxx; KID=xxx",
+          methodLabel: "方式二",
           multiline: true,
           required: true,
         },
@@ -214,6 +225,7 @@ export function credentialFields(kind: Kind): CredentialField[] {
           key: "username",
           label: "手机号/邮箱",
           placeholder: "手机号或邮箱",
+          methodLabel: "方式二",
         },
         {
           key: "password",
@@ -225,15 +237,20 @@ export function credentialFields(kind: Kind): CredentialField[] {
       return [
         {
           key: "username",
-          label: "用户名 / 邮箱",
+          label: "邮箱",
           placeholder: "user@example.com",
-          required: true,
+          methodLabel: "方式一",
         },
         {
           key: "password",
           label: "密码",
           placeholder: "PikPak 密码",
-          required: true,
+        },
+        {
+          key: "refresh_token",
+          label: "refresh_token",
+          placeholder: "邮箱密码登录不可用时填写",
+          methodLabel: "方式二",
         },
       ];
     case "wopan":
@@ -269,9 +286,44 @@ export function credentialFields(kind: Kind): CredentialField[] {
     case "onedrive":
       return [
         {
+          key: "auth_mode",
+          label: "认证方式",
+          placeholder: "",
+          type: "select",
+          defaultValue: ONEDRIVE_AUTH_MODE_OPENLIST_API,
+          options: [
+            {
+              value: ONEDRIVE_AUTH_MODE_OPENLIST_API,
+              label: "OpenList API",
+            },
+            {
+              value: ONEDRIVE_AUTH_MODE_CUSTOM_APP,
+              label: "自建应用",
+            },
+          ],
+        },
+        {
+          key: "client_id",
+          label: "客户端 ID",
+          placeholder: "Microsoft Entra 应用程序（客户端）ID",
+          visibleWhen: {
+            key: "auth_mode",
+            value: ONEDRIVE_AUTH_MODE_CUSTOM_APP,
+          },
+        },
+        {
+          key: "client_secret",
+          label: "客户端密钥",
+          placeholder: "请填写客户端密钥值，不是密钥 ID",
+          visibleWhen: {
+            key: "auth_mode",
+            value: ONEDRIVE_AUTH_MODE_CUSTOM_APP,
+          },
+        },
+        {
           key: "refresh_token",
           label: "refresh_token",
-          placeholder: "OpenList OneDrive refresh_token",
+          placeholder: "与所用应用匹配的 OneDrive refresh_token",
           multiline: true,
           required: true,
         },

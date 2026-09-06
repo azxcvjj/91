@@ -52,7 +52,7 @@ export function computeTouchSeekTime(input: {
 export type ShortsSlideGesturesOptions = {
   getVideoElement: () => HTMLVideoElement | null;
   shouldMount: boolean;
-  /** 隐藏遮罩等禁用交互的状态下不响应点击 */
+  /** 隐藏遮罩、播放失败等禁用交互的状态下不响应媒体手势 */
   disabled: boolean;
   /** 拖动中标记；媒体事件回调靠它忽略拖动期间的进度更新 */
   scrubbingRef: React.MutableRefObject<boolean>;
@@ -219,10 +219,12 @@ export function useShortsSlideGestures(options: ShortsSlideGesturesOptions) {
       }
     };
     const start = () => {
+      if (optionsRef.current.disabled) return;
       if (video.paused || video.ended) return;
       clearTimer();
       timer = window.setTimeout(() => {
         timer = null;
+        if (optionsRef.current.disabled) return;
         if (video.paused || video.ended) return;
         video.playbackRate = 2;
         active = true;
@@ -256,6 +258,7 @@ export function useShortsSlideGestures(options: ShortsSlideGesturesOptions) {
     };
 
     const handleTouchStart = (event: TouchEvent) => {
+      if (optionsRef.current.disabled) return;
       if (event.touches.length !== 1) return;
       const touch = event.touches[0];
       touchSeekState = {
@@ -270,6 +273,11 @@ export function useShortsSlideGestures(options: ShortsSlideGesturesOptions) {
     };
 
     const handleTouchMove = (event: TouchEvent) => {
+      if (optionsRef.current.disabled) {
+        resetTouchSeek();
+        end();
+        return;
+      }
       if (!touchSeekState) return;
       if (event.touches.length !== 1) {
         resetTouchSeek();
@@ -336,14 +344,37 @@ export function useShortsSlideGestures(options: ShortsSlideGesturesOptions) {
       end();
     };
 
+    // 桌面现在也能用鼠标拖拽翻页，"按住不动 400ms = 2 倍速"因此必须能被
+    // 拖动取消：否则慢一点的拖拽会顺手把视频切成 2 倍速。触摸那侧本来就有
+    // 同样的取消（cancelFastForTouchSeek），这里补上鼠标的。
+    let mouseDownAt: { x: number; y: number } | null = null;
+
     const handleMouseDown = (event: MouseEvent) => {
-      if (event.button === 0) start();
+      if (event.button !== 0) return;
+      mouseDownAt = { x: event.clientX, y: event.clientY };
+      start();
+    };
+
+    const handleMouseMove = (event: MouseEvent) => {
+      if (!mouseDownAt) return;
+      const dx = event.clientX - mouseDownAt.x;
+      const dy = event.clientY - mouseDownAt.y;
+      // 与横向 seek 共用同一套方向判定的阈值：过了阈值就不再算"按住不动"。
+      if (classifyTouchSeekIntent(dx, dy) === "pending") return;
+      mouseDownAt = null;
+      cancelFastForTouchSeek();
     };
 
     const handleMouseUp = (event: MouseEvent) => {
       if (event.button !== 0) return;
+      mouseDownAt = null;
       const wasFastPress = active;
       if (wasFastPress) suppressNextSyntheticClick();
+      end();
+    };
+
+    const handleMouseLeave = () => {
+      mouseDownAt = null;
       end();
     };
 
@@ -354,8 +385,9 @@ export function useShortsSlideGestures(options: ShortsSlideGesturesOptions) {
     video.addEventListener("touchend", handleTouchEnd);
     video.addEventListener("touchcancel", handleTouchCancel);
     video.addEventListener("mousedown", handleMouseDown);
+    video.addEventListener("mousemove", handleMouseMove);
     video.addEventListener("mouseup", handleMouseUp);
-    video.addEventListener("mouseleave", end);
+    video.addEventListener("mouseleave", handleMouseLeave);
     video.addEventListener("pause", end);
     video.addEventListener("ended", end);
 
@@ -368,8 +400,9 @@ export function useShortsSlideGestures(options: ShortsSlideGesturesOptions) {
       video.removeEventListener("touchend", handleTouchEnd);
       video.removeEventListener("touchcancel", handleTouchCancel);
       video.removeEventListener("mousedown", handleMouseDown);
+      video.removeEventListener("mousemove", handleMouseMove);
       video.removeEventListener("mouseup", handleMouseUp);
-      video.removeEventListener("mouseleave", end);
+      video.removeEventListener("mouseleave", handleMouseLeave);
       video.removeEventListener("pause", end);
       video.removeEventListener("ended", end);
     };
@@ -441,6 +474,7 @@ export function useShortsSlideGestures(options: ShortsSlideGesturesOptions) {
   function handleProgressPointerDown(e: React.PointerEvent<HTMLDivElement>) {
     e.preventDefault();
     e.stopPropagation();
+    if (options.disabled) return;
     const video = options.getVideoElement();
     const seekDuration = options.getSeekDuration(video);
     if (!video || !seekDuration) return;

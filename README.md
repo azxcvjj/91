@@ -45,8 +45,7 @@ sudo bash install.sh
 ```bash
 mkdir video-site-91 && cd video-site-91
 ```
-**2. 创建 `docker-compose.yml`**
-拉取仓库内置docker-compose.yml：
+**2. 拉取仓库内置`docker-compose.yml`**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nianzhibai/91/main/docker-compose.yml -o docker-compose.yml
 ```
@@ -103,10 +102,25 @@ docker compose logs -f                        # 查看日志
 ## 使用须知
 
 - **本项目仅面向个人私有部署**
-- **请遵守法律**
+- **请遵守法律法规**
 
 ## 致谢
 
-- [OpenList](https://github.com/OpenListTeam/OpenList) — 优秀的开源项目
-- [LinuxDo](https://linux.do/) — 学 AI 上 L 站
-- [NodeSeek](https://nodeseek.com/) — MJJ 上 N 站
+- [Cli-Proxy-API-Management-Center](https://github.com/router-for-me/Cli-Proxy-API-Management-Center) — 参考其页面设计
+- [ArtPlayer](https://github.com/zhw2590582/ArtPlayer) — 当前项目使用的视频播放器
+- [OpenList](https://github.com/OpenListTeam/OpenList) — 参考其网盘接口
+
+## 捐赠
+
+💗如果这个项目对你有帮助，欢迎请我喝杯咖啡💗
+
+<table>
+  <tr>
+    <td width="50%"><img src="ReadMeImage/donate-wechat.webp" alt="微信" width="100%" /></td>
+    <td width="50%"><img src="ReadMeImage/donate-alipay.webp" alt="支付宝" width="100%" /></td>
+  </tr>
+  <tr>
+    <td align="center">微信</td>
+    <td align="center">支付宝</td>
+  </tr>
+</table>

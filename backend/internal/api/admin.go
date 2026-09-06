@@ -10,15 +10,45 @@ import (
 	"github.com/video-site/backend/internal/applog"
 	"github.com/video-site/backend/internal/auth"
 	"github.com/video-site/backend/internal/backup"
+	"github.com/video-site/backend/internal/backuptransfer"
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives/quark"
+	"github.com/video-site/backend/internal/scanjob"
 )
 
+type DriveConfigUpdateScope uint8
+
+const (
+	// DriveConfigUpdateRuntime covers kind, root, credentials, and provider
+	// options captured by a mounted Driver.
+	DriveConfigUpdateRuntime DriveConfigUpdateScope = 1 << iota
+	// DriveConfigUpdatePreview covers the per-drive preview switch.
+	DriveConfigUpdatePreview
+	// DriveConfigUpdateScan covers skip-directory settings.
+	DriveConfigUpdateScan
+	// DriveConfigUpdateDestructive reserves deletion. It blocks admissions while
+	// the API cancels and drains existing work; it is never coalesced as a normal
+	// deferred configuration callback.
+	DriveConfigUpdateDestructive
+)
+
+// DriveConfigUpdateLease serializes configuration writers for one drive.
+// Authorize reserves the transition before persistence. For configuration,
+// Commit applies the runtime callback immediately or coalesces it until the
+// current task generation drains. For deletion, Commit permanently retires the
+// old task gate after cleanup and row deletion succeed. Release is mandatory.
+type DriveConfigUpdateLease interface {
+	Authorize(scope DriveConfigUpdateScope) (busyReason string)
+	Commit(scope DriveConfigUpdateScope, apply func() error) (deferred bool, err error)
+	Release()
+}
+
 type AdminServer struct {
-	Catalog *catalog.Catalog
-	Auth    *auth.Authenticator
-	Backups *backup.Manager
+	Catalog         *catalog.Catalog
+	Auth            *auth.Authenticator
+	Backups         *backup.Manager
+	BackupTransfers *backuptransfer.Manager
 	// Logs is the durable runtime log store exposed only through the
 	// administrator-authenticated routes below.
 	Logs *applog.Store
@@ -42,29 +72,37 @@ type AdminServer struct {
 	OnSetup func(username, password string) error
 	// LocalPreviewDir is the local directory that stores generated preview videos and thumbs.
 	LocalPreviewDir string
-	// Hooks：外层注入实际执行者
-	OnDriveSaved              func(driveID string) error
-	OnDriveDeleteCleanup      func(ctx context.Context, driveID string) (int, error)
-	OnDriveRemoved            func(driveID string)
-	OnScanRequested           func(driveID string) bool
-	OnCrawlerUploadRequested  func(driveID string) (bool, string)
-	OnStopDriveTasks          func(driveID string) bool
-	OnStopAllTasks            func() int
-	OnRegenPreview            func(videoID string)
-	OnRegenAllPreviews        func()
-	OnRegenFailedPreviews     func(driveID string)
-	OnRegenFailedThumbnails   func(driveID string)
-	OnRegenFailedFingerprints func(driveID string)
-	// OnStartDriveTranscode 手动开启某盘的浏览器兼容性转码任务。
-	// 返回 (是否接受, 拒绝原因)。转码从不自动运行，只能在这里手动触发；
-	// 处理完候选列表后任务自然结束。
-	OnStartDriveTranscode func(driveID string) (bool, string)
-	// OnStopDriveTranscode 手动停止某盘正在进行的转码任务。返回是否有任务被停。
-	OnStopDriveTranscode           func(driveID string) bool
+	// Hooks：外层注入实际执行者。
+	// BeginDriveConfigUpdate reserves the per-drive writer slot before the API
+	// reads its current row. Active tasks keep their old snapshot; Commit applies
+	// immediately when idle or coalesces the latest update until those tasks drain.
+	BeginDriveConfigUpdate func(driveID string) (lease DriveConfigUpdateLease, busyReason string)
+	// OnDriveRuntimeConfigChanged 只在新建网盘，或 kind/root/credentials 等
+	// Driver 构造参数发生变化时调用。名称、跳过目录等纯元数据保存不得触发重挂载。
+	OnDriveRuntimeConfigChanged func(driveID string) error
+	// OnPrepareDriveDelete cancels all work for the drive and returns only after
+	// every tracked task has exited. The destructive lease is already blocking
+	// new admissions when this hook runs.
+	OnPrepareDriveDelete           func(ctx context.Context, driveID string) error
+	OnDriveDeleteCleanup           func(ctx context.Context, driveID string) (int, error)
+	OnDriveRemoved                 func(driveID string)
+	OnScanRequested                func(driveID string) bool
+	OnCrawlerUploadRequested       func(driveID string) (bool, string)
+	OnStopDriveTasks               func(driveID string) bool
+	OnStopAllTasks                 func() int
+	OnRegenPreview                 func(videoID string)
+	OnRegenAllPreviews             func()
+	OnRegenFailedPreviews          func(driveID string)
+	OnRegenFailedThumbnails        func(driveID string)
+	OnRegenFailedFingerprints      func(driveID string)
 	OnDeleteVideo                  func(ctx context.Context, videoID string, deleteSource bool) (DeleteVideoResult, error)
 	OnStartBlacklistSourceDelete   func(BlacklistSourceDeleteRequest) bool
 	GetBlacklistSourceDeleteStatus func() BlacklistSourceDeleteStatus
-	OnStartTagRetag                func() bool
+	// OnRemoveBlacklist owns the complete application-level restore operation:
+	// provider inspection, catalog mutation, source-delete coordination, and any
+	// post-restore generation/cache work. Tests may omit it for non-direct paths.
+	OnRemoveBlacklist func(ctx context.Context, videoID string) error
+	OnStartTagRetag   func() bool
 	// OnTagsChanged invalidates read-side tag caches after a catalog mutation.
 	OnTagsChanged                func()
 	GetTagJobStatus              func() TagJobStatus
@@ -120,14 +158,15 @@ type DriveDirEntry struct {
 }
 
 type GenerationStatus struct {
-	State         string `json:"state"`
-	CurrentTitle  string `json:"currentTitle,omitempty"`
-	QueueLength   int    `json:"queueLength"`
-	CooldownUntil string `json:"cooldownUntil,omitempty"`
-	ScannedCount  int    `json:"scannedCount"`
-	AddedCount    int    `json:"addedCount"`
-	DoneCount     int    `json:"doneCount"`
-	TotalCount    int    `json:"totalCount"`
+	Result        *scanjob.Result `json:"result,omitempty"`
+	State         string          `json:"state"`
+	CurrentTitle  string          `json:"currentTitle,omitempty"`
+	QueueLength   int             `json:"queueLength"`
+	CooldownUntil string          `json:"cooldownUntil,omitempty"`
+	ScannedCount  int             `json:"scannedCount"`
+	AddedCount    int             `json:"addedCount"`
+	DoneCount     int             `json:"doneCount"`
+	TotalCount    int             `json:"totalCount"`
 }
 
 type DriveGenerationStatuses struct {
@@ -136,15 +175,17 @@ type DriveGenerationStatuses struct {
 	Preview     GenerationStatus `json:"preview"`
 	Fingerprint GenerationStatus `json:"fingerprint"`
 	Upload      GenerationStatus `json:"upload"`
-	Transcode   GenerationStatus `json:"transcode"`
 }
 
 type NightlyJobStatus struct {
-	State          string `json:"state"`
-	Running        bool   `json:"running"`
-	Queued         bool   `json:"queued"`
-	StartedAt      string `json:"startedAt,omitempty"`
-	LastFinishedAt string `json:"lastFinishedAt,omitempty"`
+	Outcome        scanjob.State    `json:"outcome,omitempty"`
+	ScanResults    []scanjob.Result `json:"scanResults,omitempty"`
+	Issues         []scanjob.Issue  `json:"issues,omitempty"`
+	State          string           `json:"state"`
+	Running        bool             `json:"running"`
+	Queued         bool             `json:"queued"`
+	StartedAt      string           `json:"startedAt,omitempty"`
+	LastFinishedAt string           `json:"lastFinishedAt,omitempty"`
 }
 
 type TagJobStatus struct {
@@ -165,6 +206,7 @@ type BlacklistSourceDeleteStatus struct {
 	Total        int    `json:"total"`
 	Processed    int    `json:"processed"`
 	Deleted      int    `json:"deleted"`
+	Skipped      int    `json:"skipped"`
 	Failed       int    `json:"failed"`
 	CurrentFile  string `json:"currentFile,omitempty"`
 	LastError    string `json:"lastError,omitempty"`
@@ -225,8 +267,6 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Post("/drives/{id}/previews/failed/regenerate", a.handleRegenFailedPreviews)
 			r.Post("/drives/{id}/thumbnails/failed/regenerate", a.handleRegenFailedThumbnails)
 			r.Post("/drives/{id}/fingerprints/failed/regenerate", a.handleRegenFailedFingerprints)
-			r.Post("/drives/{id}/transcode/start", a.handleStartDriveTranscode)
-			r.Post("/drives/{id}/transcode/stop", a.handleStopDriveTranscode)
 
 			// 爬虫
 			r.Get("/crawlers", a.handleListCrawlers)
@@ -289,11 +329,20 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Get("/backups/{id}/download", a.handleDownloadBackup)
 			r.Delete("/backups/{id}", a.handleDeleteBackup)
 			r.Post("/backups/{id}/restore", a.handleRestoreBackup)
+			r.Post("/backups/{id}/transfers", a.handleCreateBackupTransfer)
 			r.Post("/backup-uploads", a.handleBeginBackupUpload)
 			r.Get("/backup-uploads/{id}", a.handleBackupUploadStatus)
 			r.Put("/backup-uploads/{id}/chunks/{index}", a.handleBackupUploadChunk)
 			r.Post("/backup-uploads/{id}/finalize", a.handleFinalizeBackupUpload)
 			r.Delete("/backup-uploads/{id}", a.handleCancelBackupUpload)
+			r.Get("/backup-transfers", a.handleListBackupTransfers)
+			r.Get("/backup-receives", a.handleListBackupReceiveTransfers)
+			r.Delete("/backup-receives/{id}", a.handleCancelBackupReceiveTransfer)
+			r.Delete("/backup-transfers/{id}", a.handleCancelBackupTransfer)
+			r.Post("/backup-transfers/{id}/retry", a.handleRetryBackupTransfer)
+			r.Get("/backup-receive-tokens", a.handleListBackupReceiveTokens)
+			r.Post("/backup-receive-tokens", a.handleCreateBackupReceiveToken)
+			r.Delete("/backup-receive-tokens/{id}", a.handleRevokeBackupReceiveToken)
 			r.Get("/jobs/scan-all/status", a.handleScanAllJobStatus)
 			r.Post("/jobs/scan-all/run", a.handleRunScanAllJob)
 			// 兼容旧前端缓存；旧路径现在也遵循“只扫盘 + 去重”的语义。
@@ -301,5 +350,17 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Post("/jobs/nightly/run", a.handleRunNightlyJob)
 			r.Post("/tasks/stop", a.handleStopAllTasks)
 		})
+	})
+
+	// Peer routes use narrowly scoped receive tokens rather than browser login
+	// sessions. Keeping them outside /admin/api prevents machine credentials
+	// from acquiring unrelated administrator capabilities.
+	r.Route(backuptransfer.PeerBackupPath, func(r chi.Router) {
+		r.Get("/capabilities", a.handlePeerBackupCapabilities)
+		r.Post("/imports", a.handlePeerBeginBackupImport)
+		r.Get("/imports/{id}", a.handlePeerBackupImportStatus)
+		r.Put("/imports/{id}/ranges/{index}", a.handlePeerBackupImportRange)
+		r.Post("/imports/{id}/finalize", a.handlePeerFinalizeBackupImport)
+		r.Delete("/imports/{id}", a.handlePeerCancelBackupImport)
 	})
 }

@@ -1,110 +1,81 @@
-import { useEffect, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useLocation, useSearchParams } from "react-router";
+import { AdminEmptyVisual } from "@/admin/AdminEmptyVisual";
 import { AppShell } from "@/components/AppShell";
+import { InfiniteFeedStatus } from "@/components/InfiniteFeedStatus";
+import { ListingLoadError } from "@/components/ListingLoadError";
 import { PromoStrip } from "@/components/PromoStrip";
 import { SearchPanel } from "@/components/SearchPanel";
-import { TagCloud } from "@/components/TagCloud";
 import { SortToolbar, type ViewMode } from "@/components/SortToolbar";
+import { TagCloud } from "@/components/TagCloud";
 import { VideoGrid } from "@/components/VideoGrid";
-import { Pagination } from "@/components/Pagination";
-import { AdminEmptyVisual } from "@/admin/AdminEmptyVisual";
-import { fetchListing } from "@/data/videos";
+import { VirtualVideoGrid } from "@/components/VirtualVideoGrid";
+import { listingFeedSource } from "@/lib/infiniteFeedSource";
 import {
   readListingSort,
-  withListingSort,
+  readListingView,
+  withListingNavigation,
+  withListingPage,
+  withListingView,
 } from "@/lib/listingSearchParams";
 import { MOBILE_VIDEO_PAGE_SIZE, useIsMobile } from "@/lib/responsive";
-import type { SortKey, VideoItem } from "@/types";
+import { useRouteActivity } from "@/lib/routeActivity";
+import { useInfiniteListing } from "@/lib/useInfiniteListing";
+import {
+  useListingRestoreTarget,
+  useListingScrollRestore,
+} from "@/lib/useListingScrollRestore";
+import type { SortKey } from "@/types";
 
 const DESKTOP_PAGE_SIZE = 20;
 
-type ListingSnapshot = {
-  key: string;
-  page: number;
-  view: ViewMode;
-  items: VideoItem[];
-  total: number;
-};
-
-// 只保留 SPA 生命周期内最后一次成功显示的列表。返回详情前的列表时直接
-// 恢复；刷新浏览器后模块重载，仍会正常请求最新内容。
-let cachedListingSnapshot: ListingSnapshot | null = null;
-
-function listingSnapshotKey(
-  keyword: string,
-  tag: string,
-  pageSize: number,
-  sort: SortKey
-): string {
-  return JSON.stringify([keyword, tag, pageSize, sort]);
-}
-
-function listingRequestKey(snapshotKey: string, page: number): string {
-  return `${snapshotKey}\n${page}`;
-}
-
-type ListingContentProps = {
-  keyword: string;
-  tag: string;
-  pageSize: number;
-  sort: SortKey;
-  snapshotKey: string;
-  onSortChange: (sort: SortKey) => void;
-};
+// 距列表尾部还有两行时就续下一批，滚动到底之前数据已经在路上。
+const PREFETCH_ROWS = 2;
 
 export default function ListingPage() {
   const [params, setParams] = useSearchParams();
+  const location = useLocation();
+  const routeActive = useRouteActivity();
   const keyword = params.get("q") ?? "";
   const tag = params.get("tag") ?? "";
   const sort = readListingSort(params);
+  const view = readListingView(params);
   const isMobile = useIsMobile();
   const pageSize = isMobile ? MOBILE_VIDEO_PAGE_SIZE : DESKTOP_PAGE_SIZE;
-  const snapshotKey = listingSnapshotKey(keyword, tag, pageSize, sort);
-
-  return (
-    <ListingContent
-      key={`${keyword}\n${tag}\n${pageSize}`}
-      keyword={keyword}
-      tag={tag}
-      pageSize={pageSize}
-      sort={sort}
-      snapshotKey={snapshotKey}
-      onSortChange={(nextSort) => {
-        setParams(withListingSort(params, nextSort), { replace: true });
-      }}
-    />
+  const source = useMemo(
+    () => listingFeedSource({ q: keyword, tag, sort, pageSize }),
+    [keyword, tag, sort, pageSize]
   );
-}
+  const queryKey = source.key;
 
-function ListingContent({
-  keyword,
-  tag,
-  pageSize,
-  sort,
-  snapshotKey,
-  onSortChange,
-}: ListingContentProps) {
-  const initialSnapshotRef = useRef(
-    cachedListingSnapshot?.key === snapshotKey
-      ? cachedListingSnapshot
-      : null
-  );
-  const initialSnapshot = initialSnapshotRef.current;
-  const loadedRequestKeyRef = useRef<string | null>(
-    initialSnapshot
-      ? listingRequestKey(snapshotKey, initialSnapshot.page)
-      : null
-  );
+  const restoreTarget = useListingRestoreTarget({
+    historyKey: location.key,
+    queryKey,
+    pageSize,
+    feedSnapshotScope: source.snapshotRestoreScope,
+  });
+  const listing = useInfiniteListing(source, {
+    pausePagination: !routeActive,
+    restoreCount: restoreTarget.count,
+    restoreFeedToken: restoreTarget.feedToken,
+  });
+  useListingScrollRestore({
+    target: restoreTarget,
+    queryKey,
+    requestedCount: listing.requestedCount,
+    feedToken: listing.feedToken,
+    itemCount: listing.items.length,
+    active: routeActive,
+  });
 
-  const [view, setView] = useState<ViewMode>(initialSnapshot?.view ?? "grid");
-  const viewRef = useRef(view);
-  viewRef.current = view;
-  const [page, setPage] = useState(initialSnapshot?.page ?? 1);
-  const [initialLoading, setInitialLoading] = useState(initialSnapshot === null);
-  const [listingError, setListingError] = useState(false);
-  const [items, setItems] = useState<VideoItem[]>(initialSnapshot?.items ?? []);
-  const [total, setTotal] = useState(initialSnapshot?.total ?? 0);
+  const items = listing.items;
+  const hasContent = items.length > 0;
+  const showSkeleton = listing.initialLoading && !hasContent;
+  const showEmptyError = listing.failed && !hasContent;
+  const showTailError = listing.failed && hasContent;
   const hasActiveFilter = keyword.trim().length > 0 || tag.trim().length > 0;
+  const eagerCount = isMobile ? 2 : 4;
+  const previousQueryKeyRef = useRef(queryKey);
 
   useEffect(() => {
     document.title = keyword
@@ -112,38 +83,43 @@ function ListingContent({
       : tag
       ? `标签 ${tag}`
       : "视频列表";
+  }, [keyword, tag]);
 
-    const requestKey = listingRequestKey(snapshotKey, page);
-    if (loadedRequestKeyRef.current === requestKey) return;
+  // 无限滚动没有页码，旧链接里的 page 参数只会让 URL 与实际内容不符。
+  useEffect(() => {
+    if (!params.has("page")) return;
+    setParams((current) => withListingPage(current, 1), { replace: true });
+  }, [params, setParams]);
 
-    let active = true;
-    setListingError(false);
-    fetchListing(page, pageSize, { q: keyword, tag, sort })
-      .then((r) => {
-        if (!active) return;
-        const nextItems = r.items ?? [];
-        const nextTotal = r.total ?? 0;
-        loadedRequestKeyRef.current = requestKey;
-        cachedListingSnapshot = {
-          key: snapshotKey,
-          page,
-          view: viewRef.current,
-          items: nextItems,
-          total: nextTotal,
-        };
-        setItems(nextItems);
-        setTotal(nextTotal);
-      })
-      .catch(() => {
-        if (active) setListingError(true);
-      })
-      .finally(() => {
-        if (active) setInitialLoading(false);
+  // 换排序/换标签是一次全新的列表，回到顶部再开始累积。平滑滚动会被虚拟
+  // 列表的行高补偿打断而停在半路，所以直接落到顶部。
+  useEffect(() => {
+    if (previousQueryKeyRef.current === queryKey) return;
+    previousQueryKeyRef.current = queryKey;
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }, [queryKey]);
+
+  const handleSortChange = useCallback(
+    (nextSort: SortKey) => {
+      setParams(
+        (current) =>
+          withListingNavigation(current, { sort: nextSort, page: 1 }),
+        { replace: true }
+      );
+    },
+    [setParams]
+  );
+
+  const handleViewChange = useCallback(
+    (nextView: ViewMode) => {
+      setParams((current) => withListingView(current, nextView), {
+        replace: true,
       });
-    return () => {
-      active = false;
-    };
-  }, [keyword, tag, pageSize, sort, snapshotKey, page]);
+    },
+    [setParams]
+  );
+
+  const { loadingMore } = listing;
 
   return (
     <AppShell>
@@ -161,50 +137,54 @@ function ListingContent({
         <SortToolbar
           sort={sort}
           view={view}
-          onSortChange={(nextSort) => {
-            onSortChange(nextSort);
-            setPage(1);
-            window.scrollTo({ top: 0, behavior: "smooth" });
-          }}
-          onViewChange={(nextView) => {
-            setView(nextView);
-            if (
-              cachedListingSnapshot?.key === snapshotKey &&
-              cachedListingSnapshot.page === page
-            ) {
-              cachedListingSnapshot = {
-                ...cachedListingSnapshot,
-                view: nextView,
-              };
-            }
-          }}
+          sortDisabled={listing.initialLoading}
+          onSortChange={handleSortChange}
+          onViewChange={handleViewChange}
         />
-        {initialLoading ? (
-          <VideoGrid videos={items} loading compact={view === "compact"} skeletonCount={12} />
-        ) : listingError && items.length === 0 ? (
-          <AdminEmptyVisual
-            variant="no-results"
-            text="视频列表加载失败，请刷新重试"
-            className="admin-empty-state admin-empty-state--plain listing-empty-state"
+
+        {showSkeleton ? (
+          <VideoGrid
+            videos={[]}
+            loading
+            compact={view === "compact"}
+            skeletonCount={pageSize}
           />
-        ) : items.length === 0 ? (
+        ) : showEmptyError ? (
+          <ListingLoadError
+            hasContent={false}
+            onRetry={listing.retry}
+            emptyClassName="admin-empty-state admin-empty-state--plain listing-empty-state"
+          />
+        ) : !hasContent ? (
           <AdminEmptyVisual
             variant={hasActiveFilter ? "no-results" : "empty"}
             text={hasActiveFilter ? "未查询到" : "当前库中没有视频"}
             className="admin-empty-state admin-empty-state--plain listing-empty-state"
           />
         ) : (
-          <VideoGrid videos={items} compact={view === "compact"} skeletonCount={12} />
+          <>
+            <VirtualVideoGrid
+              videos={items}
+              key={`${queryKey}:${listing.feedToken}`}
+              compact={view === "compact"}
+              eagerCount={eagerCount}
+              highPriorityCount={1}
+              hasMore={listing.hasMore}
+              loadingMore={loadingMore}
+              prefetchRows={PREFETCH_ROWS}
+              tailContent={
+                loadingMore ? <InfiniteFeedStatus state="loading" /> : undefined
+              }
+              onLoadMore={listing.loadMore}
+            />
+
+            {showTailError ? (
+              <ListingLoadError hasContent onRetry={listing.retry} />
+            ) : listing.exhausted ? (
+              <InfiniteFeedStatus state="end" />
+            ) : null}
+          </>
         )}
-        <Pagination
-          page={page}
-          pageSize={pageSize}
-          total={total}
-          onChange={(p) => {
-            setPage(p);
-            window.scrollTo({ top: 0, behavior: "smooth" });
-          }}
-        />
       </div>
     </AppShell>
   );

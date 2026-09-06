@@ -1,4 +1,4 @@
-import { useId, useMemo, useState } from "react";
+import { Fragment, useId, useMemo, useState } from "react";
 import { ChevronDown } from "lucide-react";
 import { PasswordInput } from "../PasswordInput";
 import { QuarkQRCodeLogin } from "./QuarkQRCodeLogin";
@@ -15,6 +15,7 @@ import {
   rootIdPlaceholder,
   usesRootDirectoryID,
 } from "./constants";
+import { ONEDRIVE_AUTH_MODE_OPENLIST_API } from "./onedriveAuth";
 
 type DriveOption = {
   kind: Kind;
@@ -51,12 +52,31 @@ export function DriveForm({
   const [step, setStep] = useState<"type" | "form">(isEdit ? "form" : "type");
   const nameId = `${idPrefix}-drive-name`;
   const rootId = `${idPrefix}-drive-root`;
+  const visibleFields = fields.filter((field) => {
+    const condition = field.visibleWhen;
+    if (!condition) return true;
+    const controllingField = fields.find(
+      (candidate) => candidate.key === condition.key
+    );
+    const controllingValue =
+      form.creds[condition.key] ?? controllingField?.defaultValue ?? "";
+    return controllingValue === condition.value;
+  });
 
   function set<K extends keyof FormState>(k: K, v: FormState[K]) {
     onChange({ ...form, [k]: v });
   }
   function setCred(k: string, v: string) {
-    onChange({ ...form, creds: { ...form.creds, [k]: v } });
+    const creds = { ...form.creds, [k]: v };
+    if (
+      form.kind === "onedrive" &&
+      k === "auth_mode" &&
+      v === ONEDRIVE_AUTH_MODE_OPENLIST_API
+    ) {
+      creds.client_id = "";
+      creds.client_secret = "";
+    }
+    onChange({ ...form, creds });
   }
   function setKind(v: Kind) {
     onChange({
@@ -196,72 +216,65 @@ export function DriveForm({
             />
           )}
 
-          {form.kind === "p123" && fields.length > 0 && (
-            <div className="admin-form__method-label">方式二</div>
-          )}
-
-          {form.kind === "p115" && fields.length > 0 && (
-            <div className="admin-form__method-label">方式二</div>
-          )}
-
-          {form.kind === "quark" && fields.length > 0 && (
-            <div className="admin-form__method-label">方式二</div>
-          )}
-
-          {fields.map((f) => (
-            <div key={f.key} className="admin-form__row">
-              {f.type === "select" ? (
-                <>
-                  <label htmlFor={`${idPrefix}-credential-${f.key}`}>
-                    {f.label}
-                  </label>
-                  <div className="admin-form-select-wrap">
-                    <select
-                      id={`${idPrefix}-credential-${f.key}`}
-                      className="admin-form-select"
-                      value={form.creds[f.key] ?? f.defaultValue ?? ""}
-                      onChange={(e) => setCred(f.key, e.target.value)}
-                    >
-                      {(f.options ?? []).map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                    <ChevronDown size={15} className="admin-form-select__icon" aria-hidden="true" />
-                  </div>
-                </>
-              ) : (
-                <>
-                  <label htmlFor={`${idPrefix}-credential-${f.key}`}>
-                    {f.label}
-                  </label>
-                  {f.multiline ? (
-                    <textarea
-                      id={`${idPrefix}-credential-${f.key}`}
-                      value={form.creds[f.key] ?? ""}
-                      onChange={(e) => setCred(f.key, e.target.value)}
-                      required={f.required && !isEdit}
-                    />
-                  ) : isSecretCredential(f.key) ? (
-                    <PasswordInput
-                      id={`${idPrefix}-credential-${f.key}`}
-                      value={form.creds[f.key] ?? ""}
-                      onChange={(e) => setCred(f.key, e.target.value)}
-                      required={f.required && !isEdit}
-                    />
-                  ) : (
-                    <input
-                      id={`${idPrefix}-credential-${f.key}`}
-                      type="text"
-                      value={form.creds[f.key] ?? ""}
-                      onChange={(e) => setCred(f.key, e.target.value)}
-                      required={f.required && !isEdit}
-                    />
-                  )}
-                </>
+          {visibleFields.map((f) => (
+            <Fragment key={f.key}>
+              {f.methodLabel && (
+                <div className="admin-form__method-label">{f.methodLabel}</div>
               )}
-            </div>
+              <div className="admin-form__row">
+                {f.type === "select" ? (
+                  <>
+                    <label htmlFor={`${idPrefix}-credential-${f.key}`}>
+                      {f.label}
+                    </label>
+                    <div className="admin-form-select-wrap">
+                      <select
+                        id={`${idPrefix}-credential-${f.key}`}
+                        className="admin-form-select"
+                        value={form.creds[f.key] ?? f.defaultValue ?? ""}
+                        onChange={(e) => setCred(f.key, e.target.value)}
+                      >
+                        {(f.options ?? []).map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                      <ChevronDown size={15} className="admin-form-select__icon" aria-hidden="true" />
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <label htmlFor={`${idPrefix}-credential-${f.key}`}>
+                      {f.label}
+                    </label>
+                    {f.multiline ? (
+                      <textarea
+                        id={`${idPrefix}-credential-${f.key}`}
+                        value={form.creds[f.key] ?? ""}
+                        onChange={(e) => setCred(f.key, e.target.value)}
+                        required={f.required && !isEdit}
+                      />
+                    ) : isSecretCredential(f.key) ? (
+                      <PasswordInput
+                        id={`${idPrefix}-credential-${f.key}`}
+                        value={form.creds[f.key] ?? ""}
+                        onChange={(e) => setCred(f.key, e.target.value)}
+                        required={f.required && !isEdit}
+                      />
+                    ) : (
+                      <input
+                        id={`${idPrefix}-credential-${f.key}`}
+                        type="text"
+                        value={form.creds[f.key] ?? ""}
+                        onChange={(e) => setCred(f.key, e.target.value)}
+                        required={f.required && !isEdit}
+                      />
+                    )}
+                  </>
+                )}
+              </div>
+            </Fragment>
           ))}
         </div>
       )}

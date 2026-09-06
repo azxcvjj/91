@@ -1,20 +1,23 @@
-import { FormEvent, useCallback, useEffect, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { memo, type FormEvent, useCallback, useEffect, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router";
 import { Search } from "lucide-react";
+import { withListingNavigation } from "@/lib/listingSearchParams";
 
 const SEARCH_DEBOUNCE_MS = 500;
 
 type SearchPanelProps = {
   value?: string;
   onSearch?: (keyword: string) => void;
+  navigationPath?: string;
   variant?: "default" | "uiverse";
   placeholder?: string;
   className?: string;
 };
 
-export function SearchPanel({
+export const SearchPanel = memo(function SearchPanel({
   value,
   onSearch,
+  navigationPath = "/list",
   variant = "default",
   placeholder = "搜索视频标题或作者",
   className,
@@ -32,11 +35,10 @@ export function SearchPanel({
       onSearch(q);
       return;
     }
-    const sp = new URLSearchParams();
-    if (q) sp.set("q", q);
-    const query = sp.toString();
-    navigate(query ? `/list?${query}` : "/list");
-  }, [navigate, onSearch]);
+    const next = withListingNavigation(params, { q, page: 1 });
+    const query = next.toString();
+    navigate(query ? `${navigationPath}?${query}` : navigationPath);
+  }, [navigate, navigationPath, onSearch, params]);
 
   useEffect(() => {
     setKeyword(committedKeyword);
@@ -133,4 +135,4 @@ export function SearchPanel({
       )}
     </form>
   );
-}
+});

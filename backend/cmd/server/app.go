@@ -13,7 +13,7 @@ import (
 	"github.com/video-site/backend/internal/nightly"
 	"github.com/video-site/backend/internal/preview"
 	"github.com/video-site/backend/internal/proxy"
-	"github.com/video-site/backend/internal/transcode"
+	"github.com/video-site/backend/internal/tasklimit"
 )
 
 type App struct {
@@ -26,7 +26,12 @@ type App struct {
 	workers            map[string]*preview.Worker
 	thumbWorkers       map[string]*preview.ThumbWorker
 	fingerprintWorkers map[string]*fingerprint.Worker
-	cancels            map[string]context.CancelFunc
+	// Shared for the lifetime of the app, including drive remounts.
+	generationLimitsOnce sync.Once
+	thumbnailLimiter     *tasklimit.Limiter
+	previewLimiter       *tasklimit.Limiter
+	fingerprintLimiter   *tasklimit.Limiter
+	cancels              map[string]context.CancelFunc
 	// scriptCrawlers 按 driveID 索引，每个脚本爬虫 drive 独立一个 Crawler。
 	scriptCrawlers map[string]*scriptcrawler.Crawler
 
@@ -34,18 +39,32 @@ type App struct {
 	// 串行化可以避免启动后台挂载和手动扫盘按需挂载同一个 drive 时重复创建 worker。
 	driveAttachMu sync.Mutex
 
+	// driveOperationGates coordinate task generations with configuration writes.
+	// Desired settings are saved immediately; active tasks keep an immutable old
+	// snapshot and the latest pending settings are applied once that generation drains.
+	driveOperationGatesMu sync.Mutex
+	driveOperationGates   map[string]*driveOperationGate
+
+	// driveCredentialStates 给每次挂载签发一代凭证写入租约。旧 driver 的请求可能
+	// 在重挂载甚至删除后才完成；租约让这些迟到回调不能覆盖新实例刚轮换的 token。
+	driveCredentialStatesMu sync.Mutex
+	driveCredentialStates   map[string]*driveCredentialState
+
 	// 全站主题（"dark" | "pink" | "sky"），从 DB 读
 	theme string
 
 	// configManager 将 config.yaml 的已校验热更新字段发布给运行时消费者；
 	// 文件本身是唯一持久化事实来源。
 	configManager *config.Manager
+	// onTagsChanged invalidates the API read cache after a config-driven tag
+	// catalog mutation. It is installed before the HTTP server starts serving.
+	onTagsChanged func()
 
 	// crawlerUploader 把脚本爬虫保存在本地的视频上传到每个爬虫配置的目标 drive。
 	crawlerUploader crawlerUploadRunner
 
 	// nightlyRunner 协调两种互斥任务：定时完整流水线，以及 admin 手动触发的
-	// “扫所有真实网盘 → 等新视频资产 → 去重”精简流水线。
+	// “扫所有真实网盘 → 等新视频资产 → 对账本地资产 → 去重”精简流水线。
 	nightlyRunner *nightly.Runner
 
 	// scanQueueMu 保护 scanQueued 和 scanProgress。
@@ -67,7 +86,7 @@ type App struct {
 	fingerprintQueueMu  sync.Mutex
 	fingerprintQueueing map[string]bool
 
-	// crawlerUploadRunning 去重"保存上传目标后检查本地未上传文件"的后台任务。
+	// crawlerUploadRunning 去重管理员手动发起的单爬虫上传任务。
 	crawlerUploadMu      sync.Mutex
 	crawlerUploadRunning map[string]bool
 
@@ -75,18 +94,14 @@ type App struct {
 	uploadProgressMu sync.Mutex
 	uploadProgress   map[string]driveUploadProgress
 
-	// transcodeMu 保护 transcodeWorkers / transcodeCancels。
-	// 浏览器兼容性转码每盘最多一个任务，且只能由管理员手动开启
-	// （不随扫盘/夜间流水线自动运行），手动停止或处理完即从 map 清除。
-	transcodeMu      sync.Mutex
-	transcodeWorkers map[string]*transcode.Worker
-	transcodeCancels map[string]context.CancelFunc
-
 	// blacklistSourceDeleteMu protects the one-at-a-time background job that
 	// removes source files for tombstoned videos. The job reads tombstones from
 	// the catalog and purges each one after a successful provider delete.
 	blacklistSourceDeleteMu    sync.Mutex
 	blacklistSourceDeleteState api.BlacklistSourceDeleteStatus
+	// blacklistVideoLocks serializes restore and source deletion for the same
+	// tombstone without making unrelated videos wait on a slow provider call.
+	blacklistVideoLocks videoOperationLocks
 
 	// tagJobMu protects the admin-visible tag job status. tagMaintenanceMu
 	// serializes bulk writes to video_tags across startup, manual, and nightly
@@ -94,6 +109,41 @@ type App struct {
 	tagJobMu         sync.Mutex
 	tagMaintenanceMu sync.Mutex
 	tagJobState      api.TagJobStatus
+}
+
+type videoOperationLocks struct {
+	mu    sync.Mutex
+	items map[string]*videoOperationLock
+}
+
+type videoOperationLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (locks *videoOperationLocks) lock(videoID string) func() {
+	locks.mu.Lock()
+	if locks.items == nil {
+		locks.items = make(map[string]*videoOperationLock)
+	}
+	item := locks.items[videoID]
+	if item == nil {
+		item = &videoOperationLock{}
+		locks.items[videoID] = item
+	}
+	item.refs++
+	locks.mu.Unlock()
+
+	item.mu.Lock()
+	return func() {
+		item.mu.Unlock()
+		locks.mu.Lock()
+		item.refs--
+		if item.refs == 0 {
+			delete(locks.items, videoID)
+		}
+		locks.mu.Unlock()
+	}
 }
 
 type driveScanProgress struct {
@@ -112,4 +162,6 @@ type driveUploadProgress struct {
 
 type crawlerUploadRunner interface {
 	RunOnce(ctx context.Context) error
+	RunDrives(ctx context.Context, driveIDs []string) error
+	StartDrive(ctx context.Context, driveID string) (<-chan error, bool)
 }

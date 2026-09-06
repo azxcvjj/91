@@ -1,13 +1,13 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,6 +22,7 @@ import (
 	"github.com/video-site/backend/internal/drives/quark"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
 	"github.com/video-site/backend/internal/drives/wopan"
+	"github.com/video-site/backend/internal/scopedproxy"
 )
 
 func isCrawlerDriveKind(kind string) bool {
@@ -40,8 +41,7 @@ func isSupportedDriveKind(kind string) bool {
 func isConfiguredCrawlerDrive(d *catalog.Drive) bool {
 	return d != nil &&
 		isCrawlerDriveKind(d.Kind) &&
-		d.Credentials != nil &&
-		strings.TrimSpace(d.Credentials["script_path"]) != ""
+		scriptcrawler.IsConfigured(d.Credentials)
 }
 
 func (a *AdminServer) removeImportedCrawlerScript(d *catalog.Drive) (bool, error) {
@@ -88,14 +88,30 @@ func strmAllowOutsideRootForDrive(d *catalog.Drive) *bool {
 }
 
 func mergeGoogleDriveCredentials(existing *catalog.Drive, incoming map[string]string) map[string]string {
-	merged := mergeNonEmptyCredentials(existing, incoming)
-	delete(merged, "use_online_api")
-	delete(merged, "api_url_address")
-	return merged
+	return googleDriveCredentialPatch(mergeNonEmptyCredentials(existing, incoming))
+}
+
+func googleDriveCredentialPatch(incoming map[string]string) map[string]string {
+	cleaned := nonEmptyCredentials(incoming)
+	delete(cleaned, "use_online_api")
+	delete(cleaned, "api_url_address")
+	return cleaned
+}
+
+// Preserve explicit empty custom-client values in an edit patch so switching
+// an existing OneDrive mount back to OpenList API also clears the old secret.
+func oneDriveCredentialPatch(incoming map[string]string) map[string]string {
+	cleaned := nonEmptyCredentials(incoming)
+	for _, key := range []string{"client_id", "client_secret"} {
+		if value, ok := incoming[key]; ok {
+			cleaned[key] = strings.TrimSpace(value)
+		}
+	}
+	return cleaned
 }
 
 // mergeNonEmptyCredentials 逐键合并凭证：incoming 里非空的键覆盖旧值，
-// 空值/缺失的键沿用旧值。googledrive、webdav、localstorage 和 guangyapan 的编辑表单都依赖
+// 空值/缺失的键沿用旧值。quark、googledrive、webdav、localstorage 和 guangyapan 的编辑表单都依赖
 // 这个语义（留空 = 不修改）。
 func mergeNonEmptyCredentials(existing *catalog.Drive, incoming map[string]string) map[string]string {
 	merged := map[string]string{}
@@ -104,6 +120,14 @@ func mergeNonEmptyCredentials(existing *catalog.Drive, incoming map[string]strin
 			merged[k] = v
 		}
 	}
+	for k, v := range nonEmptyCredentials(incoming) {
+		merged[k] = v
+	}
+	return merged
+}
+
+func nonEmptyCredentials(incoming map[string]string) map[string]string {
+	cleaned := map[string]string{}
 	for k, v := range incoming {
 		key := strings.TrimSpace(k)
 		if key == "" {
@@ -113,9 +137,9 @@ func mergeNonEmptyCredentials(existing *catalog.Drive, incoming map[string]strin
 		if value == "" {
 			continue
 		}
-		merged[key] = value
+		cleaned[key] = value
 	}
-	return merged
+	return cleaned
 }
 
 func mergeScriptCrawlerCredentials(existing *catalog.Drive, incoming map[string]string) (map[string]string, error) {
@@ -132,8 +156,12 @@ func mergeScriptCrawlerCredentials(existing *catalog.Drive, incoming map[string]
 		}
 		value := strings.TrimSpace(v)
 		switch key {
-		case "proxy":
-			proxy, err := normalizeCrawlerProxyURL(value, "脚本爬虫")
+		case "proxy", "upload_proxy":
+			label := "脚本爬虫"
+			if key == "upload_proxy" {
+				label = "脚本爬虫上传"
+			}
+			proxy, err := normalizeCrawlerProxyURL(value, label)
 			if err != nil {
 				return nil, err
 			}
@@ -170,7 +198,7 @@ func mergeScriptCrawlerCredentials(existing *catalog.Drive, incoming map[string]
 			}
 		}
 	}
-	if strings.TrimSpace(merged["script_path"]) == "" {
+	if !scriptcrawler.IsConfigured(merged) {
 		return nil, fmt.Errorf("脚本爬虫必须填写 script_path")
 	}
 	delete(merged, "builtin")
@@ -180,20 +208,14 @@ func mergeScriptCrawlerCredentials(existing *catalog.Drive, incoming map[string]
 }
 
 func normalizeCrawlerProxyURL(raw, label string) (string, error) {
-	proxy := strings.TrimSpace(raw)
-	if proxy == "" {
-		return "", nil
-	}
-	u, err := url.Parse(proxy)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return "", fmt.Errorf("%s 代理地址格式无效，请填写类似 http://127.0.0.1:7890 的地址", label)
-	}
-	switch strings.ToLower(u.Scheme) {
-	case "http", "https", "socks5", "socks5h":
+	proxy, err := scopedproxy.Normalize(raw)
+	if err == nil {
 		return proxy, nil
-	default:
+	}
+	if errors.Is(err, scopedproxy.ErrUnsupportedScheme) {
 		return "", fmt.Errorf("%s 代理地址仅支持 http://、https://、socks5:// 或 socks5h://", label)
 	}
+	return "", fmt.Errorf("%s 代理地址格式无效，请填写类似 http://127.0.0.1:7890 的地址", label)
 }
 
 // handleGetDriveCredentials returns the stored values only when an authenticated
@@ -239,6 +261,20 @@ func (a *AdminServer) handleDeleteDrive(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "drive video cleanup is not available", http.StatusInternalServerError)
 		return
 	}
+	configLease, ok := a.beginDriveConfigUpdate(w, id)
+	if !ok {
+		return
+	}
+	if configLease != nil {
+		defer configLease.Release()
+	}
+	if !authorizeDriveConfigUpdate(w, configLease, DriveConfigUpdateDestructive) {
+		return
+	}
+	if err := a.prepareDriveDelete(r.Context(), id); err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("stop drive tasks before delete: %w", err))
+		return
+	}
 	removed, err := a.OnDriveDeleteCleanup(r.Context(), id)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -253,7 +289,34 @@ func (a *AdminServer) handleDeleteDrive(w http.ResponseWriter, r *http.Request) 
 	if a.OnDriveRemoved != nil {
 		a.OnDriveRemoved(id)
 	}
+	if err := completeDriveDelete(configLease); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deletedVideos": deletedVideos})
+}
+
+func (a *AdminServer) prepareDriveDelete(ctx context.Context, driveID string) error {
+	if a.OnPrepareDriveDelete != nil {
+		return a.OnPrepareDriveDelete(ctx, driveID)
+	}
+	// Keep lightweight AdminServer users compatible while production always
+	// supplies the stop-and-drain hook.
+	if a.OnStopDriveTasks != nil {
+		a.OnStopDriveTasks(driveID)
+	}
+	return nil
+}
+
+func completeDriveDelete(lease DriveConfigUpdateLease) error {
+	deferred, err := commitDriveConfigUpdate(lease, DriveConfigUpdateDestructive, nil)
+	if err != nil {
+		return fmt.Errorf("complete drive deletion: %w", err)
+	}
+	if deferred {
+		return errors.New("complete drive deletion: destructive operation was unexpectedly deferred")
+	}
+	return nil
 }
 
 type deleteDriveReq struct {
@@ -289,35 +352,6 @@ func (a *AdminServer) handleStopDriveTasks(w http.ResponseWriter, r *http.Reques
 	stopped := false
 	if a.OnStopDriveTasks != nil {
 		stopped = a.OnStopDriveTasks(id)
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"ok":      true,
-		"stopped": stopped,
-	})
-}
-
-// handleStartDriveTranscode 手动开启某盘的浏览器兼容性转码。
-// 转码默认不开启、从不自动运行；本接口是唯一入口。
-func (a *AdminServer) handleStartDriveTranscode(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	if a.OnStartDriveTranscode == nil {
-		writeErr(w, http.StatusNotImplemented, errors.New("transcode not supported"))
-		return
-	}
-	accepted, message := a.OnStartDriveTranscode(id)
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"ok":       true,
-		"accepted": accepted,
-		"message":  message,
-	})
-}
-
-// handleStopDriveTranscode 手动停止某盘正在进行的转码任务。
-func (a *AdminServer) handleStopDriveTranscode(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	stopped := false
-	if a.OnStopDriveTranscode != nil {
-		stopped = a.OnStopDriveTranscode(id)
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"ok":      true,
@@ -584,8 +618,9 @@ type teaserEnabledReq struct {
 // handleSetDriveTeaserEnabled 切换某盘的预览视频生成开关。
 //
 // 行为：
-//   - 写 catalog.drives.teaser_enabled
-//   - 调 OnTeaserEnabledChanged（main 注入；从关到开时会重新入队 pending 预览视频）
+//   - 立即保存 catalog.drives.teaser_enabled
+//   - 空闲时立即调 OnTeaserEnabledChanged
+//   - 有任务时在当前任务代结束后调用，并返回 deferred=true
 //   - 返回切换后的新值，方便前端乐观更新但又能以服务端为准
 //
 // 与 upsertDrive 的区别：那条接口要重传 kind / name / rootId 等，开关切换不该
@@ -601,6 +636,16 @@ func (a *AdminServer) handleSetDriveTeaserEnabled(w http.ResponseWriter, r *http
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	configLease, ok := a.beginDriveConfigUpdate(w, id)
+	if !ok {
+		return
+	}
+	if configLease != nil {
+		defer configLease.Release()
+	}
+	if !authorizeDriveConfigUpdate(w, configLease, DriveConfigUpdatePreview) {
+		return
+	}
 	if err := a.Catalog.SetDriveTeaserEnabled(r.Context(), id, body.Enabled); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.Error(w, "drive not found", http.StatusNotFound)
@@ -609,10 +654,22 @@ func (a *AdminServer) handleSetDriveTeaserEnabled(w http.ResponseWriter, r *http
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	if a.OnTeaserEnabledChanged != nil {
-		a.OnTeaserEnabledChanged(id, body.Enabled)
+	deferred, applyErr := commitDriveConfigUpdate(configLease, DriveConfigUpdatePreview, func() error {
+		if a.OnTeaserEnabledChanged != nil {
+			a.OnTeaserEnabledChanged(id, body.Enabled)
+		}
+		return nil
+	})
+	if applyErr != nil {
+		writeErr(w, http.StatusInternalServerError, applyErr)
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "teaserEnabled": body.Enabled})
+	resp := map[string]any{"ok": true, "teaserEnabled": body.Enabled}
+	if deferred {
+		resp["deferred"] = true
+		resp["message"] = driveConfigDeferredMessage
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // skipDirsReq 是 POST /admin/api/drives/{id}/skip-dirs 的入参。
@@ -629,8 +686,10 @@ type skipDirsReq struct {
 // 用户保存跳过目录时不该牵连这些。所以单独走一条 PUT 风格接口。
 //
 // 行为：
-//   - 写 catalog.drives.skip_dir_ids（整体覆盖）
-//   - 不重新触发扫描；下次 nightly Phase 1 或 admin 手动重扫时生效
+//   - 立即保存 catalog.drives.skip_dir_ids（整体覆盖）
+//   - 当前网盘有任务时，旧任务继续使用原快照，结束后再切换
+//   - 不排清理任务、不重新触发扫描；下一次扫描开始时使用新列表执行策略清理
+//   - 下一次扫描前再次保存可取消刚设置的跳过目录，期间不会删除媒体库记录
 //   - 返回保存后的列表，方便前端乐观更新但又能以服务端为准
 func (a *AdminServer) handleSetDriveSkipDirs(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
@@ -647,7 +706,7 @@ func (a *AdminServer) handleSetDriveSkipDirs(w http.ResponseWriter, r *http.Requ
 	seen := map[string]struct{}{}
 	cleaned := make([]string, 0, len(body.DirIDs))
 	for _, raw := range body.DirIDs {
-		s := raw
+		s := strings.TrimSpace(raw)
 		if s == "" {
 			continue
 		}
@@ -657,6 +716,16 @@ func (a *AdminServer) handleSetDriveSkipDirs(w http.ResponseWriter, r *http.Requ
 		seen[s] = struct{}{}
 		cleaned = append(cleaned, s)
 	}
+	configLease, ok := a.beginDriveConfigUpdate(w, id)
+	if !ok {
+		return
+	}
+	if configLease != nil {
+		defer configLease.Release()
+	}
+	if !authorizeDriveConfigUpdate(w, configLease, DriveConfigUpdateScan) {
+		return
+	}
 	if err := a.Catalog.SetDriveSkipDirIDs(r.Context(), id, cleaned); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.Error(w, "drive not found", http.StatusNotFound)
@@ -665,7 +734,17 @@ func (a *AdminServer) handleSetDriveSkipDirs(w http.ResponseWriter, r *http.Requ
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "skipDirIds": cleaned})
+	deferred, applyErr := commitDriveConfigUpdate(configLease, DriveConfigUpdateScan, nil)
+	if applyErr != nil {
+		writeErr(w, http.StatusInternalServerError, applyErr)
+		return
+	}
+	resp := map[string]any{"ok": true, "skipDirIds": cleaned}
+	if deferred {
+		resp["deferred"] = true
+		resp["message"] = driveConfigDeferredMessage
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleListDriveDirTree 列出某 drive 在指定父目录下的直接子目录。

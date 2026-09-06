@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func newManagerForTest(t *testing.T, source string) (*Manager, string) {
@@ -26,14 +28,16 @@ func TestManagerMigratesLegacyValuesIntoYAMLWithoutDiscardingUnknownNodes(t *tes
 nightly:
   # legacy schedule comment
   cron_hour: 3
-dedupe:
-  duplicate_review_enabled: false
+# obsolete template placeholder
+drives: []
 future_section:
   keep_me: true
 `)
 	start := "04:25"
+	builtinTagsEnabled := false
 	changed, err := manager.MigrateLegacyRuntimeSettings(LegacyRuntimeSettings{
-		NightlyStartTime: &start,
+		NightlyStartTime:   &start,
+		BuiltinTagsEnabled: &builtinTagsEnabled,
 	})
 	if err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -54,31 +58,71 @@ future_section:
 	if strings.Contains(text, "cron_hour:") || !strings.Contains(text, "start_time: 04:25") {
 		t.Fatalf("nightly schema was not migrated:\n%s", text)
 	}
-	if strings.Contains(text, "duplicate_review_enabled") || strings.Contains(text, "dedupe:") {
-		t.Fatalf("retired duplicate-review setting remains:\n%s", text)
+	if !strings.Contains(text, "timezone: Asia/Shanghai") {
+		t.Fatalf("nightly timezone was not made explicit:\n%s", text)
 	}
-	want := LiveSettings{NightlyStartTime: "04:25"}
+	if strings.Contains(text, "drives:") || strings.Contains(text, "obsolete template placeholder") {
+		t.Fatalf("retired empty drive placeholder remains:\n%s", text)
+	}
+	if !strings.Contains(text, "builtin_pack_enabled: false") {
+		t.Fatalf("built-in tag setting was not migrated:\n%s", text)
+	}
+	want := LiveSettings{NightlyStartTime: "04:25", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: false, PreviewConcurrency: DefaultGenerationConcurrency, ThumbnailConcurrency: 1, FingerprintConcurrency: 1}
 	if got := manager.LiveSettings(); got != want {
 		t.Fatalf("live settings = %#v, want %#v", got, want)
 	}
 }
 
 func TestManagerYAMLValuesWinOverLegacySQLiteValues(t *testing.T) {
-	manager, path := newManagerForTest(t, "nightly:\n  start_time: \"02:10\"\n  cron_hour: 7\ndedupe:\n  duplicate_review_enabled: true\n")
+	manager, path := newManagerForTest(t, "nightly:\n  start_time: \"02:10\"\n  cron_hour: 7\ntags:\n  builtin_pack_enabled: true\n")
 	start := "22:45"
+	builtinTagsEnabled := false
 	_, err := manager.MigrateLegacyRuntimeSettings(LegacyRuntimeSettings{
-		NightlyStartTime: &start,
+		NightlyStartTime:   &start,
+		BuiltinTagsEnabled: &builtinTagsEnabled,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := LiveSettings{NightlyStartTime: "02:10"}
+	want := LiveSettings{NightlyStartTime: "02:10", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: true, PreviewConcurrency: DefaultGenerationConcurrency, ThumbnailConcurrency: 1, FingerprintConcurrency: 1}
 	if got := manager.LiveSettings(); got != want {
 		t.Fatalf("live settings = %#v, want YAML %#v", got, want)
 	}
 	data, _ := os.ReadFile(path)
-	if strings.Contains(string(data), "cron_hour:") || strings.Contains(string(data), "duplicate_review_enabled") {
+	if strings.Contains(string(data), "cron_hour:") {
 		t.Fatalf("retired fields remain:\n%s", data)
+	}
+}
+
+func TestManagerRemovesNonEmptyLegacyDriveDefinitions(t *testing.T) {
+	source := `nightly:
+  start_time: "01:00"
+  timezone: "Etc/UTC"
+tags:
+  builtin_pack_enabled: true
+drives:
+  - id: "operator-copy"
+    kind: "webdav"
+    params:
+      base_url: "https://example.com/dav"
+`
+	manager, path := newManagerForTest(t, source)
+	changed, err := manager.MigrateLegacyRuntimeSettings(LegacyRuntimeSettings{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("non-empty legacy drive data was not removed")
+	}
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(written)
+	for _, removed := range []string{"drives:", "operator-copy", "base_url", "example.com/dav"} {
+		if strings.Contains(text, removed) {
+			t.Fatalf("retired drive data %q remains:\n%s", removed, written)
+		}
 	}
 }
 
@@ -98,15 +142,20 @@ func TestManagerRejectsStaleVersionWithoutChangingFile(t *testing.T) {
 func TestManagerReloadPublishesExternalValidChangeAndKeepsLastGoodOnError(t *testing.T) {
 	manager, path := newManagerForTest(t, "nightly:\n  start_time: \"01:00\"\n")
 	var applied []LiveSettings
-	manager.SetApply(func(settings LiveSettings) { applied = append(applied, settings) })
-	if err := os.WriteFile(path, []byte("nightly:\n  start_time: \"06:30\"\n"), 0o640); err != nil {
+	if err := manager.SetApply(func(settings LiveSettings) error {
+		applied = append(applied, settings)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("nightly:\n  disabled: true\n  start_time: \"06:30\"\n"), 0o640); err != nil {
 		t.Fatal(err)
 	}
 	changed, err := manager.Reload()
 	if err != nil || !changed {
 		t.Fatalf("reload changed=%v err=%v", changed, err)
 	}
-	want := LiveSettings{NightlyStartTime: "06:30"}
+	want := LiveSettings{NightlyDisabled: true, NightlyStartTime: "06:30", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: true, PreviewConcurrency: DefaultGenerationConcurrency, ThumbnailConcurrency: 1, FingerprintConcurrency: 1}
 	if got := manager.LiveSettings(); got != want {
 		t.Fatalf("settings = %#v, want %#v", got, want)
 	}
@@ -126,12 +175,96 @@ func TestManagerReloadPublishesExternalValidChangeAndKeepsLastGoodOnError(t *tes
 
 func TestRestartRequiredComparisonIgnoresOnlyLivePaths(t *testing.T) {
 	before := []byte("nightly:\n  start_time: \"01:00\"\nfuture:\n  value: one\n")
-	liveOnly := []byte("nightly:\n  start_time: \"03:15\"\nfuture:\n  value: one\n")
+	liveOnly := []byte("nightly:\n  disabled: true\n  start_time: \"03:15\"\n  timezone: Asia/Shanghai\ntags:\n  builtin_pack_enabled: false\ngeneration:\n  thumbnail_concurrency: 2\n  preview_concurrency: 4\n  fingerprint_concurrency: 3\nfuture:\n  value: one\n")
 	if hasRestartRequiredChange(before, liveOnly) {
 		t.Fatal("live-only values were reported as restart-required")
 	}
 	nonLive := []byte("nightly:\n  start_time: \"03:15\"\nfuture:\n  value: two\n")
 	if !hasRestartRequiredChange(before, nonLive) {
 		t.Fatal("unknown non-live value should require restart")
+	}
+}
+
+func TestManagerRestoresYAMLAndLiveSnapshotWhenLiveApplyFails(t *testing.T) {
+	manager, path := newManagerForTest(t, "nightly:\n  start_time: \"01:00\"\ntags:\n  builtin_pack_enabled: true\n")
+	var applied []LiveSettings
+	if err := manager.SetApply(func(settings LiveSettings) error {
+		applied = append(applied, settings)
+		if !settings.BuiltinTagsEnabled {
+			return errors.New("catalog unavailable")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	original, version, err := manager.ReadYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = manager.ReplaceYAML([]byte("nightly:\n  start_time: \"01:00\"\ntags:\n  builtin_pack_enabled: false\n"), version)
+	if err == nil || !strings.Contains(err.Error(), "catalog unavailable") {
+		t.Fatalf("replace error = %v, want live apply failure", err)
+	}
+	written, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(written) != string(original) {
+		t.Fatalf("failed live apply changed YAML:\n%s", written)
+	}
+	if got := manager.LiveSettings(); !got.BuiltinTagsEnabled {
+		t.Fatalf("failed live apply changed snapshot: %#v", got)
+	}
+	if len(applied) != 3 || !applied[0].BuiltinTagsEnabled || applied[1].BuiltinTagsEnabled || !applied[2].BuiltinTagsEnabled {
+		t.Fatalf("apply sequence = %#v, want current, rejected candidate, rollback", applied)
+	}
+}
+
+func TestManagerRemovesRetiredGenerationLimitsAndPreservesIndependentLimits(t *testing.T) {
+	manager, path := newManagerForTest(t, `nightly:
+  start_time: "01:00"
+  timezone: Asia/Shanghai
+tags:
+  builtin_pack_enabled: true
+preview:
+  # keep ffmpeg settings
+  ffmpeg_path: /usr/bin/ffmpeg
+  concurrency: 5
+generation:
+  media_concurrency: 4
+  thumbnail_concurrency: 2
+  preview_concurrency: 3
+  fingerprint_concurrency: 4
+  future_option: keep
+`)
+	changed, err := manager.MigrateLegacyRuntimeSettings(LegacyRuntimeSettings{})
+	if err != nil || !changed {
+		t.Fatalf("migration changed=%v err=%v", changed, err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]map[string]any
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := document["preview"]["concurrency"]; exists {
+		t.Fatal("retained obsolete per-drive limit")
+	}
+	if _, exists := document["generation"]["media_concurrency"]; exists {
+		t.Fatal("retained obsolete combined limit")
+	}
+	if document["generation"]["future_option"] != "keep" || !strings.Contains(string(data), "# keep ffmpeg settings") {
+		t.Fatal("discarded unrelated config")
+	}
+	settings := manager.LiveSettings()
+	if settings.ThumbnailConcurrency != 2 || settings.PreviewConcurrency != 3 || settings.FingerprintConcurrency != 4 {
+		t.Fatalf("changed explicit global limits: %+v", settings)
+	}
+	changed, err = manager.MigrateLegacyRuntimeSettings(LegacyRuntimeSettings{})
+	if err != nil || changed {
+		t.Fatalf("migration was not idempotent: changed=%v err=%v", changed, err)
 	}
 }

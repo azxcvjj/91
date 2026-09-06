@@ -47,6 +47,27 @@ func TestVideoSourceUsesDirectStreamForAvi(t *testing.T) {
 	}
 }
 
+func TestHandleVideoDetailReturnsServiceUnavailableWhenCatalogFails(t *testing.T) {
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	if err := cat.Close(); err != nil {
+		t.Fatalf("close catalog: %v", err)
+	}
+
+	req := requestWithVideoID(http.MethodGet, "/api/video/video-1", "video-1", strings.NewReader(""))
+	rr := httptest.NewRecorder()
+	(&Server{Catalog: cat}).handleVideoDetail(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body = %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "database") || strings.Contains(rr.Body.String(), "interrupted") {
+		t.Fatalf("response exposed the catalog error: %q", rr.Body.String())
+	}
+}
+
 func TestVideoSourceUsesDirectStreamForMkv(t *testing.T) {
 	v := &catalog.Video{
 		ID:      "video-1",
@@ -77,6 +98,12 @@ func TestVideoSourceKeepsDirectStreamForMp4(t *testing.T) {
 	}
 }
 
+func TestDriveKindLabelUsesCompactP115Name(t *testing.T) {
+	if got := driveKindLabel("p115"); got != "115网盘" {
+		t.Fatalf("p115 source label = %q, want 115网盘", got)
+	}
+}
+
 func TestPlaybackMediaTypeDescribesSelectedResource(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -94,16 +121,7 @@ func TestPlaybackMediaTypeDescribesSelectedResource(t *testing.T) {
 			want:  "video/mp4",
 		},
 		{
-			name: "ready transcode",
-			video: &catalog.Video{
-				Ext:              "mkv",
-				TranscodeStatus:  "ready",
-				TranscodedFileID: "transcoded.mp4",
-			},
-			want: "video/mp4",
-		},
-		{
-			name:  "untranscoded mkv",
+			name:  "mkv",
 			video: &catalog.Video{Ext: "mkv"},
 			want:  "",
 		},
@@ -124,11 +142,14 @@ func TestPlaybackMediaTypeDescribesSelectedResource(t *testing.T) {
 func TestVideoURLsEscapePathSegments(t *testing.T) {
 	updated := time.UnixMilli(1778863000123)
 	v := &catalog.Video{
-		ID:        "wopan-drive-fid/with space",
-		DriveID:   "drive-1",
-		FileID:    "fid/with space",
-		Title:     "Video",
-		UpdatedAt: updated,
+		ID:                 "wopan-drive-fid/with space",
+		DriveID:            "drive-1",
+		FileID:             "fid/with space",
+		Title:              "Video",
+		ThumbnailURL:       "/p/thumb/wopan-drive-fid/with space",
+		ThumbnailUpdatedAt: updated,
+		PreviewUpdatedAt:   updated,
+		UpdatedAt:          updated,
 	}
 
 	dto := mapVideo(v)
@@ -146,11 +167,24 @@ func TestVideoURLsEscapePathSegments(t *testing.T) {
 	}
 }
 
+func TestVideoDTOOmitsRetiredQualityMetadata(t *testing.T) {
+	encoded, err := json.Marshal(mapVideo(&catalog.Video{
+		ID:    "video-1",
+		Title: "Video",
+	}))
+	if err != nil {
+		t.Fatalf("marshal video DTO: %v", err)
+	}
+	if bytes.Contains(encoded, []byte(`"quality"`)) {
+		t.Fatalf("video DTO still contains retired quality metadata: %s", encoded)
+	}
+}
+
 func TestThumbnailURLRewritesStoredLocalURLForUnsafeVideoID(t *testing.T) {
 	got := thumbnailURL(&catalog.Video{
-		ID:           "wopan-drive-fid/with space",
-		ThumbnailURL: "/p/thumb/wopan-drive-fid/with space",
-		UpdatedAt:    time.UnixMilli(1778863000123),
+		ID:                 "wopan-drive-fid/with space",
+		ThumbnailURL:       "/p/thumb/wopan-drive-fid/with space",
+		ThumbnailUpdatedAt: time.UnixMilli(1778863000123),
 	})
 
 	if got != "/p/thumb/wopan-drive-fid%2Fwith%20space?v=1778863000123" {
@@ -540,10 +574,10 @@ func TestVideoSourceUsesLocalUploadRoute(t *testing.T) {
 	}
 }
 
-func TestPreviewURLIncludesUpdatedAtVersion(t *testing.T) {
+func TestPreviewURLIncludesPreviewRevision(t *testing.T) {
 	got := previewURL(&catalog.Video{
-		ID:        "video-1",
-		UpdatedAt: time.UnixMilli(1778863000123),
+		ID:               "video-1",
+		PreviewUpdatedAt: time.UnixMilli(1778863000123),
 	})
 
 	if got != "/p/preview/video-1?v=1778863000123" {
@@ -551,7 +585,7 @@ func TestPreviewURLIncludesUpdatedAtVersion(t *testing.T) {
 	}
 }
 
-func TestPreviewURLFallsBackWithoutUpdatedAt(t *testing.T) {
+func TestPreviewURLFallsBackWithoutPreviewRevision(t *testing.T) {
 	got := previewURL(&catalog.Video{ID: "video-1"})
 
 	if got != "/p/preview/video-1" {
@@ -640,9 +674,10 @@ func TestHandleVideoDetailDecodesEscapedVideoID(t *testing.T) {
 
 func TestThumbnailURLVersionsLocalGeneratedThumbnails(t *testing.T) {
 	got := thumbnailURL(&catalog.Video{
-		ID:           "video-1",
-		ThumbnailURL: "/p/thumb/video-1",
-		UpdatedAt:    time.UnixMilli(1778863000123),
+		ID:                 "video-1",
+		ThumbnailURL:       "/p/thumb/video-1",
+		ThumbnailUpdatedAt: time.UnixMilli(1778863000123),
+		UpdatedAt:          time.UnixMilli(1779999999999),
 	})
 	if got != "/p/thumb/video-1?v=1778863000123" {
 		t.Fatalf("thumbnail URL = %q, want versioned local URL", got)
@@ -650,12 +685,20 @@ func TestThumbnailURLVersionsLocalGeneratedThumbnails(t *testing.T) {
 
 	remote := "https://thumb.example/video-1.jpg"
 	got = thumbnailURL(&catalog.Video{
-		ID:           "video-1",
-		ThumbnailURL: remote,
-		UpdatedAt:    time.UnixMilli(1778863000123),
+		ID:                 "video-1",
+		ThumbnailURL:       remote,
+		ThumbnailUpdatedAt: time.UnixMilli(1778863000123),
 	})
 	if got != remote {
 		t.Fatalf("remote thumbnail URL = %q, want unchanged %q", got, remote)
+	}
+
+	got = thumbnailURL(&catalog.Video{
+		ID:                 "video-pending",
+		ThumbnailUpdatedAt: time.UnixMilli(1778863000123),
+	})
+	if got != "" {
+		t.Fatalf("pending thumbnail URL = %q, want no advertised asset", got)
 	}
 }
 
@@ -801,6 +844,22 @@ func requestHomeRecommendationBatch(t *testing.T, handler http.Handler, token st
 	return got
 }
 
+func requestHomeLatestBatch(t *testing.T, handler http.Handler, token string, count int) []VideoDTO {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/home/latest?count="+strconv.Itoa(count), nil)
+	req.AddCookie(&http.Cookie{Name: "vs_admin", Value: token})
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("latest count %d status = %d, body = %s", count, rr.Code, rr.Body.String())
+	}
+	var got []VideoDTO
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode latest count %d response: %v", count, err)
+	}
+	return got
+}
+
 func assertUniqueHomeBatch(t *testing.T, got []VideoDTO) {
 	t.Helper()
 	seen := make(map[string]struct{}, len(got))
@@ -809,6 +868,34 @@ func assertUniqueHomeBatch(t *testing.T, got []VideoDTO) {
 			t.Fatalf("home batch returned duplicate video %q; items=%#v", item.ID, got)
 		}
 		seen[item.ID] = struct{}{}
+	}
+}
+
+func TestNextHomeSnapshotBatchStopsAfterUnavailableFreshRound(t *testing.T) {
+	server, _, _ := newHomeRecommendationTestRoute(t, 0, 0)
+	loadCalls := 0
+
+	items, roundVideoIDs, roundCursor, err := server.nextHomeSnapshotBatch(
+		context.Background(),
+		[]string{"removed-from-current-round"},
+		0,
+		8,
+		func() ([]string, error) {
+			loadCalls++
+			return []string{"removed-from-fresh-round"}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("load unavailable snapshots: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("items = %d, want 0", len(items))
+	}
+	if loadCalls != 1 {
+		t.Fatalf("fresh round loads = %d, want 1", loadCalls)
+	}
+	if len(roundVideoIDs) != 1 || roundVideoIDs[0] != "removed-from-fresh-round" || roundCursor != 1 {
+		t.Fatalf("fresh round state = %#v at %d, want exhausted unavailable round", roundVideoIDs, roundCursor)
 	}
 }
 
@@ -848,6 +935,130 @@ func TestHomeRouteCompletesWholeLibraryBeforeRepeating(t *testing.T) {
 		t.Fatalf("next round returned %d items, want 8", len(nextRound))
 	}
 	assertUniqueHomeBatch(t, nextRound)
+}
+
+func TestHomeLatestRouteRotatesOneBoundedSnapshotWithMixedGridSizes(t *testing.T) {
+	server, router, token := newHomeRecommendationTestRoute(t, 110, 110)
+	seen := make(map[string]struct{}, 28)
+	for _, count := range []int{8, 12, 8} {
+		batch := requestHomeLatestBatch(t, router, token, count)
+		if len(batch) != count {
+			t.Fatalf("latest count %d returned %d items", count, len(batch))
+		}
+		assertUniqueHomeBatch(t, batch)
+		for _, item := range batch {
+			if _, duplicate := seen[item.ID]; duplicate {
+				t.Fatalf("latest video %q repeated before the snapshot completed", item.ID)
+			}
+			seen[item.ID] = struct{}{}
+		}
+	}
+	if len(seen) != 28 {
+		t.Fatalf("latest mixed batches contained %d unique videos, want 28", len(seen))
+	}
+
+	if len(server.homeRecommendationSessions) != 1 {
+		t.Fatalf("server session records = %d, want 1", len(server.homeRecommendationSessions))
+	}
+	for _, session := range server.homeRecommendationSessions {
+		if len(session.latestVideoIDs) != homeLatestSnapshotSize {
+			t.Fatalf("latest snapshot size = %d, want %d", len(session.latestVideoIDs), homeLatestSnapshotSize)
+		}
+		if session.latestCursor != 28 {
+			t.Fatalf("latest cursor = %d, want 28", session.latestCursor)
+		}
+	}
+}
+
+func TestHomeLatestRouteRefreshesSharedSnapshotAfterTTLWithoutRepeatingConsumedCards(t *testing.T) {
+	server, router, token := newHomeRecommendationTestRoute(t, 20, 20)
+	clock := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	server.homeRecommendationNow = func() time.Time { return clock }
+	first := requestHomeLatestBatch(t, router, token, 8)
+	firstIDs := make(map[string]struct{}, len(first))
+	for _, item := range first {
+		firstIDs[item.ID] = struct{}{}
+	}
+
+	now := time.Now().Add(24 * time.Hour)
+	if err := server.Catalog.UpsertVideo(context.Background(), &catalog.Video{
+		ID:           "new-latest-video",
+		DriveID:      "drive",
+		FileID:       "new-latest-video",
+		Title:        "New latest video",
+		ThumbnailURL: "https://thumb.example/new-latest-video.jpg",
+		PublishedAt:  now,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}); err != nil {
+		t.Fatalf("seed new latest video: %v", err)
+	}
+
+	withinTTL := requestHomeLatestBatch(t, router, token, 8)
+	if len(withinTTL) != 8 {
+		t.Fatalf("cached latest batch returned %d items, want 8", len(withinTTL))
+	}
+	for _, item := range withinTTL {
+		if item.ID == "new-latest-video" {
+			t.Fatal("new video appeared before the shared latest snapshot TTL expired")
+		}
+	}
+
+	clock = clock.Add(homeLatestSnapshotTTL)
+	afterTTL := requestHomeLatestBatch(t, router, token, 4)
+	if len(afterTTL) != 4 {
+		t.Fatalf("refreshed latest batch returned %d items, want 4", len(afterTTL))
+	}
+	if afterTTL[0].ID != "new-latest-video" {
+		t.Fatalf("first card after snapshot refresh = %q, want new latest video", afterTTL[0].ID)
+	}
+	for _, item := range append(withinTTL, afterTTL...) {
+		if _, duplicate := firstIDs[item.ID]; duplicate {
+			t.Fatalf("catalog refresh repeated consumed latest video %q", item.ID)
+		}
+	}
+}
+
+func TestHomeLatestRouteSerializesConcurrentRefreshesWithinOneSession(t *testing.T) {
+	_, router, token := newHomeRecommendationTestRoute(t, 24, 24)
+	type batchResult struct {
+		items  []VideoDTO
+		status int
+		body   string
+		err    error
+	}
+	start := make(chan struct{})
+	results := make(chan batchResult, 2)
+	for range 2 {
+		go func() {
+			<-start
+			req := httptest.NewRequest(http.MethodGet, "/api/home/latest?count=12", nil)
+			req.AddCookie(&http.Cookie{Name: "vs_admin", Value: token})
+			rr := httptest.NewRecorder()
+			router.ServeHTTP(rr, req)
+			var items []VideoDTO
+			err := json.NewDecoder(rr.Body).Decode(&items)
+			results <- batchResult{items: items, status: rr.Code, body: rr.Body.String(), err: err}
+		}()
+	}
+	close(start)
+
+	seen := make(map[string]struct{}, 24)
+	for range 2 {
+		result := <-results
+		if result.status != http.StatusOK || result.err != nil {
+			t.Fatalf("concurrent latest response status=%d decode=%v body=%s", result.status, result.err, result.body)
+		}
+		if len(result.items) != 12 {
+			t.Fatalf("concurrent latest batch returned %d items, want 12", len(result.items))
+		}
+		for _, item := range result.items {
+			if _, duplicate := seen[item.ID]; duplicate {
+				t.Fatalf("concurrent latest refreshes returned the same video %q", item.ID)
+			}
+			seen[item.ID] = struct{}{}
+		}
+	}
 }
 
 func TestHomeRouteSerializesConcurrentRefreshesWithinOneSession(t *testing.T) {
@@ -1376,17 +1587,19 @@ func TestHandlePreviewIgnoresRemotePreviewFileIDAndServesLocalFile(t *testing.T)
 		t.Fatalf("write local preview: %v", err)
 	}
 	now := time.Now()
+	previewRevision := time.UnixMilli(1778863000123)
 	if err := cat.UpsertVideo(ctx, &catalog.Video{
-		ID:            "video-1",
-		DriveID:       "drive-1",
-		FileID:        "file-1",
-		Title:         "Video",
-		PreviewStatus: "ready",
-		PreviewFileID: "remote-preview-file",
-		PreviewLocal:  localPreview,
-		PublishedAt:   now,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		ID:               "video-1",
+		DriveID:          "drive-1",
+		FileID:           "file-1",
+		Title:            "Video",
+		PreviewStatus:    "ready",
+		PreviewFileID:    "remote-preview-file",
+		PreviewLocal:     localPreview,
+		PreviewUpdatedAt: previewRevision,
+		PublishedAt:      now,
+		CreatedAt:        now,
+		UpdatedAt:        now,
 	}); err != nil {
 		t.Fatalf("seed video: %v", err)
 	}
@@ -1408,6 +1621,35 @@ func TestHandlePreviewIgnoresRemotePreviewFileIDAndServesLocalFile(t *testing.T)
 	}
 	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+
+	versionedReq := requestWithRouteParam(
+		http.MethodGet,
+		"/p/preview/video-1?v=1778863000123",
+		"videoID",
+		"video-1",
+		strings.NewReader(``),
+	)
+	versionedRR := httptest.NewRecorder()
+	server.handlePreview(versionedRR, versionedReq)
+	if versionedRR.Code != http.StatusOK {
+		t.Fatalf("versioned status = %d, body = %s", versionedRR.Code, versionedRR.Body.String())
+	}
+	if got := versionedRR.Header().Get("Cache-Control"); got != "private, max-age=31536000, immutable" {
+		t.Fatalf("versioned Cache-Control = %q, want immutable private cache", got)
+	}
+
+	staleReq := requestWithRouteParam(
+		http.MethodGet,
+		"/p/preview/video-1?v=stale",
+		"videoID",
+		"video-1",
+		strings.NewReader(``),
+	)
+	staleRR := httptest.NewRecorder()
+	server.handlePreview(staleRR, staleReq)
+	if got := staleRR.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("stale Cache-Control = %q, want no-store", got)
 	}
 }
 
@@ -1495,6 +1737,25 @@ func TestHandleThumbServesHashedPathForLongVideoID(t *testing.T) {
 	}
 	if rr.Body.String() != "thumb-bytes" {
 		t.Fatalf("body = %q, want thumb bytes", rr.Body.String())
+	}
+	if got := rr.Header().Get("Cache-Control"); got != "private, max-age=86400" {
+		t.Fatalf("unversioned Cache-Control = %q", got)
+	}
+
+	versionedReq := requestWithRouteParam(
+		http.MethodGet,
+		"/p/thumb/"+longID+"?v=1778863000123",
+		"videoID",
+		longID,
+		strings.NewReader(``),
+	)
+	versionedRR := httptest.NewRecorder()
+	server.handleThumb(versionedRR, versionedReq)
+	if versionedRR.Code != http.StatusOK {
+		t.Fatalf("versioned status = %d, body = %s", versionedRR.Code, versionedRR.Body.String())
+	}
+	if got := versionedRR.Header().Get("Cache-Control"); got != "private, max-age=31536000, immutable" {
+		t.Fatalf("versioned Cache-Control = %q", got)
 	}
 }
 
@@ -1833,17 +2094,7 @@ func TestHandleShortsNextCarriesBitrateMetadata(t *testing.T) {
 	seed("unsized", 0, 0)
 	seed("size-only", 100<<20, 0)
 	seed("duration-only", 0, 120)
-	seed("transcoded", 300<<20, 300)
-	if err := cat.UpdateVideoTranscode(
-		ctx,
-		"transcoded",
-		"ready",
-		"",
-		"file-transcoded-output",
-		30<<20,
-	); err != nil {
-		t.Fatalf("mark transcoded video ready: %v", err)
-	}
+	seed("original", 300<<20, 300)
 
 	server := &Server{Catalog: cat}
 	req := httptest.NewRequest(http.MethodGet, "/api/shorts/next?count=5", nil)
@@ -1871,18 +2122,18 @@ func TestHandleShortsNextCarriesBitrateMetadata(t *testing.T) {
 		t.Fatalf("sized item = %d bytes / %ds, want 314572800 / 388", sized.SizeBytes, sized.DurationSeconds)
 	}
 
-	transcoded, ok := byID["transcoded"]
+	original, ok := byID["original"]
 	if !ok {
-		t.Fatalf("feed did not return the transcoded video: %s", body)
+		t.Fatalf("feed did not return the original video: %s", body)
 	}
-	if transcoded.VideoSrc != "/p/stream/drive/file-transcoded-output" {
-		t.Fatalf("transcoded video source = %q, want the transcoded asset", transcoded.VideoSrc)
+	if original.VideoSrc != "/p/stream/drive/file-original" {
+		t.Fatalf("original video source = %q, want the catalog source", original.VideoSrc)
 	}
-	if transcoded.SizeBytes != 30<<20 || transcoded.DurationSeconds != 300 {
+	if original.SizeBytes != 300<<20 || original.DurationSeconds != 300 {
 		t.Fatalf(
-			"transcoded item = %d bytes / %ds, want the 31457280-byte playback asset / 300s",
-			transcoded.SizeBytes,
-			transcoded.DurationSeconds,
+			"original item = %d bytes / %ds, want the 314572800-byte source / 300s",
+			original.SizeBytes,
+			original.DurationSeconds,
 		)
 	}
 
@@ -1920,7 +2171,7 @@ func TestHandleShortsNextCarriesBitrateMetadata(t *testing.T) {
 		}
 	}
 	assertMetadataKeys("sized", true)
-	assertMetadataKeys("transcoded", true)
+	assertMetadataKeys("original", true)
 	for _, id := range []string{"unsized", "size-only", "duration-only"} {
 		assertMetadataKeys(id, false)
 	}
@@ -1932,13 +2183,7 @@ func TestPrewarmShortsStreamLinksUsesFirstTwoPlaybackTargetsAndUserAgent(t *test
 	registry.Set("drive", drive)
 	server := &Server{Proxy: proxy.New(registry)}
 	videos := []*catalog.Video{
-		{
-			ID:               "transcoded",
-			DriveID:          "drive",
-			FileID:           "original-1",
-			TranscodeStatus:  "ready",
-			TranscodedFileID: "transcoded-1",
-		},
+		{ID: "first", DriveID: "drive", FileID: "original-1"},
 		{ID: "original", DriveID: "drive", FileID: "original-2"},
 		{ID: "third", DriveID: "drive", FileID: "original-3"},
 		{ID: "upload", DriveID: localUploadDriveID, FileID: "upload.mp4"},
@@ -1962,7 +2207,7 @@ func TestPrewarmShortsStreamLinksUsesFirstTwoPlaybackTargetsAndUserAgent(t *test
 	for _, call := range got {
 		targets[call.fileID] = true
 	}
-	if !targets["transcoded-1"] || !targets["original-2"] || len(targets) != 2 {
+	if !targets["original-1"] || !targets["original-2"] || len(targets) != 2 {
 		t.Fatalf("prewarm calls = %#v, want the first two playback targets", got)
 	}
 	for _, call := range got {
@@ -2341,7 +2586,48 @@ func TestHandleVideoDetailIncludesDriveKindLabel(t *testing.T) {
 	}
 }
 
-func TestHandleVideoDetailRecommendationsPreferReadyThumbnails(t *testing.T) {
+func TestHandleVideoDetailResolvesDuplicatePublicID(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	duplicate := &catalog.Video{ID: "old-public-id", DriveID: "drive", FileID: "old", Title: "Old", PublishedAt: now, CreatedAt: now}
+	canonical := &catalog.Video{ID: "canonical-id", DriveID: "drive", FileID: "canonical", Title: "Canonical", PublishedAt: now, CreatedAt: now.Add(time.Second)}
+	for _, video := range []*catalog.Video{duplicate, canonical} {
+		if err := cat.UpsertVideo(ctx, video); err != nil {
+			t.Fatalf("seed %s: %v", video.ID, err)
+		}
+	}
+	if err := cat.ApplyDuplicateVideoDeletions(ctx, []catalog.DuplicateVideoDeletion{{
+		VideoID:                    duplicate.ID,
+		CanonicalVideoID:           canonical.ID,
+		ExpectedUpdatedAt:          duplicate.UpdatedAt.UnixMilli(),
+		CanonicalExpectedUpdatedAt: canonical.UpdatedAt.UnixMilli(),
+	}}); err != nil {
+		t.Fatalf("merge duplicate: %v", err)
+	}
+
+	req := requestWithVideoID(http.MethodGet, "/api/video/old-public-id", duplicate.ID, strings.NewReader(``))
+	rr := httptest.NewRecorder()
+	(&Server{Catalog: cat}).handleVideoDetail(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got VideoDetailDTO
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.ID != canonical.ID || got.Href != "/video/canonical-id" {
+		t.Fatalf("resolved video = id:%q href:%q", got.ID, got.Href)
+	}
+}
+
+func TestHandleVideoRecommendationsAreIndependentAndPreferReadyThumbnails(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -2399,26 +2685,53 @@ func TestHandleVideoDetailRecommendationsPreferReadyThumbnails(t *testing.T) {
 		}
 	}
 
-	req := requestWithVideoID(http.MethodGet, "/api/video/current-video", "current-video", strings.NewReader(``))
+	server := &Server{Catalog: cat}
+	detailReq := requestWithVideoID(http.MethodGet, "/api/video/current-video", "current-video", strings.NewReader(``))
+	detailRR := httptest.NewRecorder()
+	server.handleVideoDetail(detailRR, detailReq)
+	if detailRR.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, body = %s", detailRR.Code, detailRR.Body.String())
+	}
+	var detailPayload map[string]json.RawMessage
+	if err := json.NewDecoder(detailRR.Body).Decode(&detailPayload); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if _, found := detailPayload["relatedVideos"]; found {
+		t.Fatal("core detail response still contains relatedVideos")
+	}
+
+	req := requestWithVideoID(http.MethodGet, "/api/video/current-video/recommendations", "current-video", strings.NewReader(``))
 	rr := httptest.NewRecorder()
-	(&Server{Catalog: cat}).handleVideoDetail(rr, req)
+	server.handleVideoRecommendations(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 	}
-	var got VideoDetailDTO
-	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+	responseBody := rr.Body.Bytes()
+	var got []VideoCardDTO
+	if err := json.Unmarshal(responseBody, &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(got.RelatedVideos) != 6 {
-		t.Fatalf("related videos = %d, want 6; items=%#v", len(got.RelatedVideos), got.RelatedVideos)
+	if len(got) != 6 {
+		t.Fatalf("related videos = %d, want 6; items=%#v", len(got), got)
 	}
-	for _, item := range got.RelatedVideos {
+	for _, item := range got {
 		if !strings.HasPrefix(item.ID, "ready-related-") {
-			t.Fatalf("related returned %q before ready thumbnails; items=%#v", item.ID, got.RelatedVideos)
+			t.Fatalf("related returned %q before ready thumbnails; items=%#v", item.ID, got)
 		}
 		if !strings.HasPrefix(item.Thumbnail, "https://thumb.example/") {
 			t.Fatalf("thumbnail for %q = %q, want ready thumbnail URL", item.ID, item.Thumbnail)
+		}
+	}
+	var compactPayload []map[string]json.RawMessage
+	if err := json.Unmarshal(responseBody, &compactPayload); err != nil {
+		t.Fatalf("decode compact payload: %v", err)
+	}
+	for _, item := range compactPayload {
+		for _, unusedField := range []string{"tags", "favorites", "comments", "likes", "dislikes"} {
+			if _, found := item[unusedField]; found {
+				t.Fatalf("recommendation card still contains unused field %q", unusedField)
+			}
 		}
 	}
 }
